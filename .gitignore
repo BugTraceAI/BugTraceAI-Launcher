@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.flakes/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project Specific
+logs/
+*.log
+bugtrace.db
+reports/
+*.sqlite
+.env
+.claude/
+playwright-report/
+test-results/
+
+# Nested git folders (for monorepo backup)
+# We might want to keep them if we use submodules, but for a flat backup we might ignore them
+# However, if we want a COMPLETE backup, we should decide.
+# For now, let's just do a flat backup.
+# .git/ 
+.trash/
