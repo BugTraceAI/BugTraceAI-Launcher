@@ -13,7 +13,7 @@
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <img src="https://img.shields.io/badge/Version-2.0.0-blue" />
   <img src="https://img.shields.io/badge/License-MIT-green.svg" />
-  <img src="https://img.shields.io/badge/Bash-5+-4EAA25?logo=gnu-bash&logoColor=white" />
+  <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
 </p>
 
@@ -45,14 +45,15 @@ The wizard will guide you step by step: choose deployment mode, enter your OpenR
 
 | Requirement | Details |
 |-------------|---------|
-| **Docker** | 24.0+ with Docker Compose v2 or standalone |
+| **OS** | Linux (x86_64) or macOS (Intel / Apple Silicon) |
+| **Docker** | 24.0+ with Docker Compose v2 — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS |
 | **Git** | Any recent version |
 | **curl** | For the one-liner installer |
 | **RAM** | 4 GB minimum (8 GB recommended) |
 | **Disk** | 10 GB free space |
 | **OpenRouter API Key** | [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`) |
 
-### Auto-Installation
+### Auto-Installation (Linux)
 
 **The installer will automatically detect and offer to install missing dependencies** (on Ubuntu/Debian systems):
 
@@ -61,6 +62,10 @@ The wizard will guide you step by step: choose deployment mode, enter your OpenR
 - ℹ️ **Docker Engine** → If missing, the installer provides clear instructions and a quick-install command
 
 You'll be prompted for confirmation before anything is installed. If you're on a non-Debian system, the installer will provide manual installation instructions.
+
+### macOS
+
+Install [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/) before running the launcher. The script automatically detects Docker Desktop's install location (`~/.docker/bin`, `/usr/local/bin`, Homebrew) and adds it to the PATH if needed. Git and curl are included with Xcode Command Line Tools (`xcode-select --install`).
 
 ## Deployment Modes
 
@@ -89,7 +94,7 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
 ./launcher.sh help         # Show usage
 ```
 
-> No `sudo` required. The launcher only needs your user to have Docker permissions (`sudo usermod -aG docker $USER`).
+> No `sudo` required. On Linux, your user needs Docker permissions (`sudo usermod -aG docker $USER`). On macOS, Docker Desktop handles permissions automatically.
 
 ## Architecture
 
@@ -206,7 +211,9 @@ docker ps -a | grep bugtraceai     # Raw container status
 
 **API key issues:** Verify your key at [openrouter.ai/keys](https://openrouter.ai/keys). It should start with `sk-or-`. The wizard warns you if it doesn't match this pattern but lets you continue anyway.
 
-**Permission issues:** Your user needs Docker permissions. Run `sudo usermod -aG docker $USER` and re-login.
+**Permission issues (Linux):** Your user needs Docker permissions. Run `sudo usermod -aG docker $USER` and re-login.
+
+**Docker not found (macOS):** Make sure Docker Desktop is installed and running. The launcher auto-detects common install paths, but if Docker still isn't found, open Docker Desktop first and try again.
 
 **Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (pull + rebuild).
 

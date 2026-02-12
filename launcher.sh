@@ -26,6 +26,10 @@ CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
 WEB_REPO="https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 CLI_REPO="https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 
+# Platform detection
+IS_MACOS=false
+[[ "$(uname)" == "Darwin" ]] && IS_MACOS=true
+
 # Wizard state
 DEPLOY_MODE=""
 WEB_PORT=""
@@ -72,7 +76,11 @@ BANNER
 # ── Utility Functions ────────────────────────────────────────────────────────
 
 port_available() {
-    ! (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":$1 "
+    if $IS_MACOS; then
+        ! lsof -i ":$1" -sTCP:LISTEN &>/dev/null
+    else
+        ! (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":$1 "
+    fi
 }
 
 find_free_port() {
@@ -92,6 +100,27 @@ generate_password() {
     tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-24}"
 }
 
+# Portable lowercase (macOS ships Bash 3.2 which lacks ${var,,})
+to_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Portable ISO-8601 date (macOS date lacks -Iseconds)
+iso_date() {
+    if $IS_MACOS; then
+        date -u '+%Y-%m-%dT%H:%M:%S+00:00'
+    else
+        date -Iseconds
+    fi
+}
+
+# Portable sed -i (macOS sed requires '' after -i)
+sed_inplace() {
+    if $IS_MACOS; then
+        sed -i '' "$@"
+    else
+        sed -i "$@"
+    fi
+}
+
 # Propose port with max 3 attempts. Exits if none accepted.
 # Usage: propose_port "Label" default_port RESULT_VAR
 propose_port() {
@@ -106,7 +135,7 @@ propose_port() {
         echo -e "  ${BOLD}$label${NC}: ${CYAN}$port${NC}"
         read -rp "$(echo -e "  ${YELLOW}Accept? [Y] / n=next / or type a port: ${NC}")" answer
 
-        case "${answer,,}" in
+        case "$(to_lower "$answer")" in
             ""|y|yes)
                 printf -v "$result_var" '%s' "$port"
                 return 0
@@ -212,6 +241,16 @@ select_option() {
 
 # ── Pre-flight Checks ───────────────────────────────────────────────────────
 
+# On macOS, Docker Desktop may not be in PATH by default
+if $IS_MACOS && ! command -v docker &>/dev/null; then
+    for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
+        if [[ -x "$p/docker" ]]; then
+            export PATH="$p:$PATH"
+            break
+        fi
+    done
+fi
+
 # Detect docker compose command
 COMPOSE_CMD=""
 if docker compose version &>/dev/null; then
@@ -233,7 +272,7 @@ check_deps() {
     fi
 
     if [[ -n "$COMPOSE_CMD" ]]; then
-        version=$($COMPOSE_CMD version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+        version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         echo -e "  ${OK} Docker Compose $version"
     else
         echo -e "  ${FAIL} Docker Compose v2 not found"
@@ -255,7 +294,11 @@ check_deps() {
     fi
 
     local total_ram
-    total_ram=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
+    if $IS_MACOS; then
+        total_ram=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 ))
+    else
+        total_ram=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
+    fi
     if [[ "$total_ram" -ge 4096 ]]; then
         echo -e "  ${OK} RAM: ${total_ram}MB"
     else
@@ -263,7 +306,11 @@ check_deps() {
     fi
 
     local disk
-    disk=$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || echo "0")
+    if $IS_MACOS; then
+        disk=$(df -g / 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+    else
+        disk=$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4}' || echo "0")
+    fi
     if [[ "$disk" -ge 10 ]]; then
         echo -e "  ${OK} Disk: ${disk}GB free"
     else
@@ -275,8 +322,13 @@ check_deps() {
     if [[ "$ok" == false ]]; then
         error "Missing required dependencies."
         echo ""
-        echo -e "  Install Docker:  ${CYAN}https://docs.docker.com/engine/install/${NC}"
-        echo -e "  Install Git:     ${DIM}sudo apt install git curl${NC}"
+        if $IS_MACOS; then
+            echo -e "  Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+            echo -e "  Install Git & curl:     ${DIM}xcode-select --install${NC}  or  ${DIM}brew install git curl${NC}"
+        else
+            echo -e "  Install Docker:  ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            echo -e "  Install Git:     ${DIM}sudo apt install git curl${NC}"
+        fi
         exit 1
     fi
 
@@ -320,7 +372,7 @@ wizard_ask_api_key() {
         if [[ ! "$API_KEY" =~ ^sk-or- ]]; then
             warn "Key doesn't look like an OpenRouter key (expected sk-or-...)"
             read -rp "$(echo -e "  ${YELLOW}Continue anyway? [y/N]: ${NC}")" confirm
-            [[ "${confirm,,}" != "y" ]] && continue
+            [[ "$(to_lower "$confirm")" != "y" ]] && continue
         fi
 
         break
@@ -372,7 +424,7 @@ wizard_show_summary() {
     echo ""
 
     read -rp "$(echo -e "${YELLOW}Proceed with installation? [Y/n]: ${NC}")" confirm
-    if [[ "${confirm,,}" == "n" ]]; then
+    if [[ "$(to_lower "$confirm")" == "n" ]]; then
         warn "Installation cancelled."
         exit 0
     fi
@@ -466,7 +518,7 @@ generate_env() {
         [[ "$DEPLOY_MODE" == "full" ]] && cli_url="http://localhost:${CLI_PORT}"
 
         cat > "$WEB_DIR/.env.docker" << EOF
-# BugTraceAI-WEB — Generated by Launcher v${VERSION} ($(date -Iseconds))
+# BugTraceAI-WEB — Generated by Launcher v${VERSION} ($(iso_date))
 POSTGRES_USER=bugtraceai
 POSTGRES_PASSWORD=$(generate_password 24)
 POSTGRES_DB=bugtraceai_web
@@ -481,7 +533,7 @@ EOF
         [[ "$DEPLOY_MODE" == "full" ]] && cors="http://localhost:${WEB_PORT}"
 
         cat > "$CLI_DIR/.env" << EOF
-# BugTraceAI-CLI — Generated by Launcher v${VERSION} ($(date -Iseconds))
+# BugTraceAI-CLI — Generated by Launcher v${VERSION} ($(iso_date))
 OPENROUTER_API_KEY=${API_KEY}
 BUGTRACE_CORS_ORIGINS=${cors}
 EOF
@@ -497,12 +549,12 @@ patch_compose() {
 
         # Remove entire environment section (CORS is loaded from .env via env_file)
         # This avoids leaving an empty "environment:" key which breaks Docker Compose
-        sed -i '/^    environment:/d' "$compose"
-        sed -i '/BUGTRACE_CORS_ORIGINS/d' "$compose"
+        sed_inplace '/^    environment:/d' "$compose"
+        sed_inplace '/BUGTRACE_CORS_ORIGINS/d' "$compose"
 
         # Patch port mapping if non-default
         if [[ -n "$CLI_PORT" && "$CLI_PORT" != "8000" ]]; then
-            sed -i "s/\"8000:8000\"/\"${CLI_PORT}:8000\"/" "$compose"
+            sed_inplace "s/\"8000:8000\"/\"${CLI_PORT}:8000\"/" "$compose"
         fi
     fi
 }
@@ -584,7 +636,7 @@ save_state() {
   "web_port": "${WEB_PORT}",
   "cli_port": "${CLI_PORT}",
   "install_dir": "${INSTALL_DIR}",
-  "deployed_at": "$(date -Iseconds)"
+  "deployed_at": "$(iso_date)"
 }
 EOF
     chmod 600 "$STATE_FILE"
@@ -628,9 +680,9 @@ load_state() {
         error "BugTraceAI not installed. Run: ./launcher.sh"
         exit 1
     fi
-    DEPLOY_MODE=$(grep -oP '"mode":\s*"\K[^"]+' "$STATE_FILE")
-    WEB_PORT=$(grep -oP '"web_port":\s*"\K[^"]+' "$STATE_FILE" 2>/dev/null || echo "")
-    CLI_PORT=$(grep -oP '"cli_port":\s*"\K[^"]+' "$STATE_FILE" 2>/dev/null || echo "")
+    DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
+    WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
 }
 
 cmd_status() {
@@ -765,7 +817,7 @@ cmd_uninstall() {
     echo -e "  ${DIM}Install directory: $INSTALL_DIR${NC}"
     echo ""
     read -rp "$(echo -e "${YELLOW}Are you sure? [y/N]: ${NC}")" confirm
-    [[ "${confirm,,}" != "y" ]] && { info "Cancelled."; exit 0; }
+    [[ "$(to_lower "$confirm")" != "y" ]] && { info "Cancelled."; exit 0; }
 
     _teardown_all
 
@@ -789,9 +841,23 @@ _teardown_all() {
 # ── Docker Check ─────────────────────────────────────────────────────────────
 
 check_docker() {
+    if ! command -v docker &>/dev/null; then
+        error "Docker not found."
+        if $IS_MACOS; then
+            echo -e "  Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+        else
+            echo -e "  Install Docker: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+        fi
+        exit 1
+    fi
+
     if ! docker info &>/dev/null 2>&1; then
         error "Docker is not running or current user lacks permission."
-        echo -e "  ${DIM}Add your user to the docker group: sudo usermod -aG docker \$USER${NC}"
+        if $IS_MACOS; then
+            echo -e "  ${DIM}Open Docker Desktop and make sure it is running.${NC}"
+        else
+            echo -e "  ${DIM}Add your user to the docker group: sudo usermod -aG docker \$USER${NC}"
+        fi
         exit 1
     fi
 }
