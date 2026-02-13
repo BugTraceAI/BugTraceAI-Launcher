@@ -18,7 +18,7 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.0.3"
+VERSION="2.0.4"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -277,13 +277,21 @@ check_deps() {
     else
         # Try auto-installing Docker Compose v2 plugin (Linux only)
         if ! $IS_MACOS && command -v apt-get &>/dev/null; then
-            echo -e "  ${YELLOW}⚠${NC}  Docker Compose not found — installing docker-compose-plugin..."
-            if sudo apt-get install -y docker-compose-plugin &>/dev/null; then
-                COMPOSE_CMD="docker compose"
-                version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-                echo -e "  ${OK} Docker Compose $version (auto-installed)"
+            echo -e "  ${YELLOW}⚠${NC}  Docker Compose not found — attempting auto-install..."
+            # Try apt install first; if package not in sources, add Docker's repo
+            if sudo apt-get install -y docker-compose-plugin 2>&1 | tail -5; then
+                if docker compose version &>/dev/null; then
+                    COMPOSE_CMD="docker compose"
+                    version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                    echo -e "  ${OK} Docker Compose $version (auto-installed)"
+                else
+                    echo -e "  ${FAIL} docker-compose-plugin installed but 'docker compose' still not working"
+                    ok=false
+                fi
             else
                 echo -e "  ${FAIL} Failed to install docker-compose-plugin"
+                echo -e "       ${DIM}Try: sudo apt-get update && sudo apt-get install docker-compose-plugin${NC}"
+                echo -e "       ${DIM}If unavailable, add Docker's repo: https://docs.docker.com/engine/install/${NC}"
                 ok=false
             fi
         else
