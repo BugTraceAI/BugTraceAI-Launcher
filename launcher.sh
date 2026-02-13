@@ -18,7 +18,7 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.0.1"
+VERSION="2.0.2"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -275,7 +275,10 @@ check_deps() {
         version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         echo -e "  ${OK} Docker Compose $version"
     else
-        echo -e "  ${FAIL} Docker Compose v2 not found"
+        echo -e "  ${FAIL} Docker Compose not found"
+        if command -v docker-compose &>/dev/null; then
+            echo -e "       ${DIM}Found docker-compose v1 (deprecated). Install v2: sudo apt install docker-compose-plugin${NC}"
+        fi
         ok=false
     fi
 
@@ -326,8 +329,9 @@ check_deps() {
             echo -e "  Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
             echo -e "  Install Git & curl:     ${DIM}xcode-select --install${NC}  or  ${DIM}brew install git curl${NC}"
         else
-            echo -e "  Install Docker:  ${CYAN}https://docs.docker.com/engine/install/${NC}"
-            echo -e "  Install Git:     ${DIM}sudo apt install git curl${NC}"
+            echo -e "  Install Docker:          ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            echo -e "  Install Docker Compose:  ${DIM}sudo apt install docker-compose-plugin${NC}"
+            echo -e "  Install Git & curl:      ${DIM}sudo apt install git curl${NC}"
         fi
         exit 1
     fi
