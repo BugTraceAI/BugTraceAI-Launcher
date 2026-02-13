@@ -18,7 +18,7 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -490,10 +490,18 @@ clone_repos() {
     if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
         if [[ -d "$WEB_DIR/.git" ]]; then
             step "Updating BugTraceAI-WEB..."
-            (cd "$WEB_DIR" && git pull --quiet) 2>/dev/null
+            if ! (cd "$WEB_DIR" && git pull --quiet) 2>/dev/null; then
+                warn "Failed to update WEB repo (will use existing version)"
+            fi
         else
             step "Cloning BugTraceAI-WEB..."
-            git clone --depth 1 "$WEB_REPO" "$WEB_DIR" 2>/dev/null
+            # Clean partial directory from failed previous attempt
+            [[ -d "$WEB_DIR" && ! -d "$WEB_DIR/.git" ]] && rm -rf "$WEB_DIR"
+            if ! git clone --depth 1 "$WEB_REPO" "$WEB_DIR"; then
+                error "Failed to clone BugTraceAI-WEB from $WEB_REPO"
+                error "Check your internet connection and try again."
+                exit 1
+            fi
         fi
         echo -e "    ${OK} BugTraceAI-WEB"
     fi
@@ -501,10 +509,18 @@ clone_repos() {
     if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
         if [[ -d "$CLI_DIR/.git" ]]; then
             step "Updating BugTraceAI-CLI..."
-            (cd "$CLI_DIR" && git pull --quiet) 2>/dev/null
+            if ! (cd "$CLI_DIR" && git pull --quiet) 2>/dev/null; then
+                warn "Failed to update CLI repo (will use existing version)"
+            fi
         else
             step "Cloning BugTraceAI-CLI..."
-            git clone --depth 1 "$CLI_REPO" "$CLI_DIR" 2>/dev/null
+            # Clean partial directory from failed previous attempt
+            [[ -d "$CLI_DIR" && ! -d "$CLI_DIR/.git" ]] && rm -rf "$CLI_DIR"
+            if ! git clone --depth 1 "$CLI_REPO" "$CLI_DIR"; then
+                error "Failed to clone BugTraceAI-CLI from $CLI_REPO"
+                error "Check your internet connection and try again."
+                exit 1
+            fi
         fi
         echo -e "    ${OK} BugTraceAI-CLI"
     fi
@@ -570,18 +586,32 @@ _cli_compose() {
 
 start_services() {
     if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
+        if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
+            error "WEB docker-compose.yml not found — clone may have failed."
+            exit 1
+        fi
         echo ""
         step "Building & starting WEB services..."
         echo -e "    ${DIM}(postgres + backend + frontend — may take 5-10 min on first run)${NC}"
-        _web_compose up -d --build
+        if ! _web_compose up -d --build; then
+            error "Failed to start WEB services. Run: ./launcher.sh logs web"
+            exit 1
+        fi
         echo -e "    ${OK} WEB services started"
     fi
 
     if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+        if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
+            error "CLI docker-compose.yml not found — clone may have failed."
+            exit 1
+        fi
         echo ""
         step "Building & starting CLI service..."
         echo -e "    ${DIM}(compiles Go tools + installs browser — may take 10-15 min on first run)${NC}"
-        _cli_compose up -d --build
+        if ! _cli_compose up -d --build; then
+            error "Failed to start CLI service. Run: ./launcher.sh logs cli"
+            exit 1
+        fi
         echo -e "    ${OK} CLI service started"
     fi
 }
@@ -729,9 +759,14 @@ _print_container_status() {
 cmd_start() {
     load_state
     info "Starting services..."
-    [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]] && _web_compose up -d
-    [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]] && _cli_compose up -d
-    success "Services started"
+    local ok=true
+    if [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]]; then
+        _web_compose up -d || { error "Failed to start WEB services"; ok=false; }
+    fi
+    if [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]]; then
+        _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
+    fi
+    $ok && success "Services started" || warn "Some services failed to start. Run: ./launcher.sh logs"
 }
 
 cmd_stop() {
@@ -789,21 +824,31 @@ cmd_update() {
 
     if [[ -d "$WEB_DIR/.git" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]]; then
         step "Pulling WEB updates..."
-        (cd "$WEB_DIR" && git pull --quiet)
+        if ! (cd "$WEB_DIR" && git pull --quiet); then
+            warn "Failed to pull WEB updates"
+        fi
         step "Rebuilding WEB..."
-        _web_compose up -d --build
-        echo -e "    ${OK} WEB updated"
+        if ! _web_compose up -d --build; then
+            error "Failed to rebuild WEB services"
+        else
+            echo -e "    ${OK} WEB updated"
+        fi
     fi
 
     if [[ -d "$CLI_DIR/.git" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]]; then
         step "Pulling CLI updates..."
         # Reset patched files before pull, then re-patch
         (cd "$CLI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
-        (cd "$CLI_DIR" && git pull --quiet)
+        if ! (cd "$CLI_DIR" && git pull --quiet); then
+            warn "Failed to pull CLI updates"
+        fi
         patch_compose
         step "Rebuilding CLI..."
-        _cli_compose up -d --build
-        echo -e "    ${OK} CLI updated"
+        if ! _cli_compose up -d --build; then
+            error "Failed to rebuild CLI service"
+        else
+            echo -e "    ${OK} CLI updated"
+        fi
     fi
 
     echo ""
