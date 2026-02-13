@@ -18,7 +18,7 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.0.5"
+VERSION="2.1.0"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -275,27 +275,61 @@ check_deps() {
         version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         echo -e "  ${OK} Docker Compose $version"
     else
-        # Try auto-installing Docker Compose v2 plugin (Linux only)
-        if ! $IS_MACOS && command -v apt-get &>/dev/null; then
+        # Try auto-installing Docker Compose v2 plugin
+        if ! $IS_MACOS; then
             echo -e "  ${YELLOW}⚠${NC}  Docker Compose not found — attempting auto-install..."
-            install_output=$(sudo apt-get install -y docker-compose-plugin 2>&1)
-            install_rc=$?
-            if [[ $install_rc -eq 0 ]] && docker compose version &>/dev/null; then
+            local compose_installed=false
+
+            # Method 1: apt package (works if Docker's official repo is configured)
+            if command -v apt-get &>/dev/null; then
+                install_output=$(sudo apt-get install -y docker-compose-plugin 2>&1)
+                if [[ $? -eq 0 ]] && docker compose version &>/dev/null; then
+                    compose_installed=true
+                else
+                    echo -e "       ${DIM}apt package not available, trying direct download...${NC}"
+                fi
+            fi
+
+            # Method 2: Download binary from GitHub (universal fallback)
+            if ! $compose_installed; then
+                local arch
+                arch=$(uname -m)
+                case "$arch" in
+                    x86_64)  arch="x86_64" ;;
+                    aarch64) arch="aarch64" ;;
+                    armv7l)  arch="armv7" ;;
+                    *) arch="" ;;
+                esac
+
+                if [[ -n "$arch" ]]; then
+                    local plugin_dir="/usr/local/lib/docker/cli-plugins"
+                    local plugin_path="$plugin_dir/docker-compose"
+                    local download_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}"
+
+                    echo -e "       ${DIM}Downloading from github.com/docker/compose...${NC}"
+                    if sudo mkdir -p "$plugin_dir" && \
+                       sudo curl -fsSL "$download_url" -o "$plugin_path" && \
+                       sudo chmod +x "$plugin_path" && \
+                       docker compose version &>/dev/null; then
+                        compose_installed=true
+                    else
+                        sudo rm -f "$plugin_path" 2>/dev/null
+                    fi
+                fi
+            fi
+
+            if $compose_installed; then
                 COMPOSE_CMD="docker compose"
                 version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
                 echo -e "  ${OK} Docker Compose $version (auto-installed)"
             else
-                echo -e "  ${FAIL} Failed to install docker-compose-plugin"
-                echo "$install_output" | tail -5
-                echo -e "       ${DIM}Try: sudo apt-get update && sudo apt-get install docker-compose-plugin${NC}"
-                echo -e "       ${DIM}If unavailable, add Docker's repo: https://docs.docker.com/engine/install/${NC}"
+                echo -e "  ${FAIL} Failed to install Docker Compose"
+                echo -e "       ${DIM}Manual install: https://docs.docker.com/compose/install/linux/${NC}"
                 ok=false
             fi
         else
             echo -e "  ${FAIL} Docker Compose not found"
-            if command -v docker-compose &>/dev/null; then
-                echo -e "       ${DIM}Found docker-compose v1 (deprecated). Install v2: sudo apt install docker-compose-plugin${NC}"
-            fi
+            echo -e "       ${DIM}Install Docker Desktop: https://docs.docker.com/desktop/install/mac-install/${NC}"
             ok=false
         fi
     fi
