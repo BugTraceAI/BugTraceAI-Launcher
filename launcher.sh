@@ -18,7 +18,7 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.0.2"
+VERSION="2.0.3"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -275,11 +275,24 @@ check_deps() {
         version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         echo -e "  ${OK} Docker Compose $version"
     else
-        echo -e "  ${FAIL} Docker Compose not found"
-        if command -v docker-compose &>/dev/null; then
-            echo -e "       ${DIM}Found docker-compose v1 (deprecated). Install v2: sudo apt install docker-compose-plugin${NC}"
+        # Try auto-installing Docker Compose v2 plugin (Linux only)
+        if ! $IS_MACOS && command -v apt-get &>/dev/null; then
+            echo -e "  ${YELLOW}⚠${NC}  Docker Compose not found — installing docker-compose-plugin..."
+            if sudo apt-get install -y docker-compose-plugin &>/dev/null; then
+                COMPOSE_CMD="docker compose"
+                version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+                echo -e "  ${OK} Docker Compose $version (auto-installed)"
+            else
+                echo -e "  ${FAIL} Failed to install docker-compose-plugin"
+                ok=false
+            fi
+        else
+            echo -e "  ${FAIL} Docker Compose not found"
+            if command -v docker-compose &>/dev/null; then
+                echo -e "       ${DIM}Found docker-compose v1 (deprecated). Install v2: sudo apt install docker-compose-plugin${NC}"
+            fi
+            ok=false
         fi
-        ok=false
     fi
 
     if command -v git &>/dev/null; then
