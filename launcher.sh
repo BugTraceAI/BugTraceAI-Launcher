@@ -26,6 +26,14 @@ CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
 WEB_REPO="https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 CLI_REPO="https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 
+# GitHub repos for version checks
+GITHUB_API_BASE="https://api.github.com/repos/BugTraceAI"
+REPOS_CLI="BugTraceAI-CLI"
+REPOS_WEB="BugTraceAI-WEB"
+REPOS_LAUNCHER="BugTraceAI-Launcher"
+VERSION_CACHE="$INSTALL_DIR/.version_cache"
+VERSION_CACHE_TTL=86400  # 24 hours in seconds
+
 # Platform detection
 IS_MACOS=false
 [[ "$(uname)" == "Darwin" ]] && IS_MACOS=true
@@ -237,6 +245,122 @@ select_option() {
     trap - INT TERM
 
     MENU_SELECTION=$selected
+}
+
+# ── Version Check ──────────────────────────────────────────────────────────
+
+# Compare two semver strings. Returns 0 (true) if $2 > $1.
+_version_is_newer() {
+    local current="$1" latest="$2"
+    [[ -z "$current" || -z "$latest" ]] && return 1
+    # Strip leading 'v' and any pre-release suffix (-beta, -alpha, -rc.N)
+    current="${current#v}"; current="${current%%-*}"
+    latest="${latest#v}";   latest="${latest%%-*}"
+    [[ "$current" == "$latest" ]] && return 1
+    local higher
+    higher=$(printf '%s\n%s' "$current" "$latest" | sort -V | tail -1)
+    [[ "$higher" == "$latest" ]]
+}
+
+# Fetch latest version for a repo from GitHub Releases API (cached).
+# Uses one cache file per repo: $VERSION_CACHE.<repo-name>
+# Each file contains: <unix_timestamp> <version>
+# Usage: _get_latest_version "BugTraceAI-CLI" → prints version or empty
+_get_latest_version() {
+    local repo="$1" now cached_time cached_ver cache_file
+
+    cache_file="${VERSION_CACHE}.${repo}"
+    now=$(date +%s)
+
+    # Read cache if it exists
+    if [[ -f "$cache_file" ]]; then
+        cached_time=$(awk '{print $1}' "$cache_file" 2>/dev/null)
+        cached_ver=$(awk '{print $2}' "$cache_file" 2>/dev/null)
+
+        if [[ -n "$cached_time" ]] && (( now - cached_time < VERSION_CACHE_TTL )); then
+            echo "$cached_ver"
+            return
+        fi
+    fi
+
+    # Fetch from GitHub (5s timeout, silent fail)
+    local tag
+    tag=$(curl -sf --max-time 5 \
+        -H "User-Agent: BugTraceAI-Launcher/${VERSION}" \
+        "${GITHUB_API_BASE}/${repo}/releases/latest" 2>/dev/null \
+        | awk -F'"' '/"tag_name"/{print $4}')
+
+    if [[ -n "$tag" ]]; then
+        local clean="${tag#v}"
+        mkdir -p "$(dirname "$cache_file")" 2>/dev/null
+        echo "$now $clean" > "$cache_file" 2>/dev/null
+        echo "$clean"
+    else
+        # Return cached value even if expired (better than nothing)
+        echo "${cached_ver:-}"
+    fi
+}
+
+# Check all repos for updates and display a summary banner.
+# Silent on network failure. Skips if curl is not available.
+check_for_updates() {
+    command -v curl &>/dev/null || return 0
+
+    local has_update=false
+    local lines=()
+
+    # Check Launcher version
+    local latest_launcher
+    latest_launcher=$(_get_latest_version "$REPOS_LAUNCHER")
+    if _version_is_newer "$VERSION" "$latest_launcher"; then
+        has_update=true
+        lines+=("     Launcher: ${VERSION} → ${latest_launcher}")
+    fi
+
+    # Check CLI version (read from deployed repo if available)
+    if [[ -d "$CLI_DIR" ]]; then
+        local cli_ver=""
+        # Try to read VERSION from config.py (portable: no grep -P on macOS)
+        if [[ -f "$CLI_DIR/bugtrace/core/config.py" ]]; then
+            cli_ver=$(awk -F'"' '/VERSION.*=/{for(i=1;i<=NF;i++){if($i~/^[0-9]+\.[0-9]+\.[0-9]+/){print $i; exit}}}' "$CLI_DIR/bugtrace/core/config.py" 2>/dev/null)
+        fi
+        if [[ -n "$cli_ver" ]]; then
+            local latest_cli
+            latest_cli=$(_get_latest_version "$REPOS_CLI")
+            if _version_is_newer "$cli_ver" "$latest_cli"; then
+                has_update=true
+                lines+=("     CLI:      ${cli_ver} → ${latest_cli}")
+            fi
+        fi
+    fi
+
+    # Check WEB version (read from package.json if available)
+    if [[ -d "$WEB_DIR" ]]; then
+        local web_ver=""
+        if [[ -f "$WEB_DIR/package.json" ]]; then
+            web_ver=$(awk -F'"' '/"version"/{print $4; exit}' "$WEB_DIR/package.json" 2>/dev/null)
+            web_ver="${web_ver%%-*}"  # Strip -beta, -alpha, etc.
+        fi
+        if [[ -n "$web_ver" ]]; then
+            local latest_web
+            latest_web=$(_get_latest_version "$REPOS_WEB")
+            if _version_is_newer "$web_ver" "$latest_web"; then
+                has_update=true
+                lines+=("     WEB:      ${web_ver} → ${latest_web}")
+            fi
+        fi
+    fi
+
+    # Display banner if any updates found
+    if $has_update; then
+        echo ""
+        echo -e "  ${YELLOW}⚡ Updates available:${NC}"
+        for line in "${lines[@]}"; do
+            echo -e "  ${YELLOW}${line}${NC}"
+        done
+        echo -e "  ${DIM}Run: ./launcher.sh update${NC}"
+        echo ""
+    fi
 }
 
 # ── Pre-flight Checks ───────────────────────────────────────────────────────
@@ -516,6 +640,7 @@ run_wizard() {
         echo ""
     fi
 
+    check_for_updates
     check_deps
     wizard_select_mode
     wizard_ask_api_key
@@ -777,6 +902,8 @@ cmd_status() {
     echo -e "${BOLD}BugTraceAI Status${NC}  (mode: ${CYAN}$DEPLOY_MODE${NC})"
     echo "──────────────────────────────────────────"
 
+    check_for_updates
+
     if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
         echo -e "\n  ${BOLD}WEB Stack${NC} (port ${WEB_PORT})"
         for c in bugtraceai-web-db bugtraceai-web-backend bugtraceai-web-frontend; do
@@ -907,6 +1034,9 @@ cmd_update() {
         fi
     fi
 
+    # Clear version cache so next status check fetches fresh data
+    rm -f "${VERSION_CACHE}".* 2>/dev/null
+
     echo ""
     success "Update complete!"
 }
@@ -982,7 +1112,8 @@ show_help() {
     echo "  uninstall       Remove everything"
     echo ""
     echo "Docs: https://docs.bugtraceai.com"
-    echo ""
+
+    check_for_updates
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
