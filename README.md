@@ -105,21 +105,21 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
           │                                │
           │ http://localhost:6869          │ http://localhost:8000
           │                                │
-┌─────────▼────────────────┐     ┌────────▼──────────────────┐
-│   WEB Stack (Docker)      │     │   CLI Stack (Docker)       │
-│                           │     │                            │
-│  ┌─────────────────────┐  │     │  ┌────────────────────┐   │
-│  │ Nginx (Frontend)    │  │     │  │ FastAPI + AI Agents │   │
-│  │ React SPA           │  │     │  │ Go Fuzzers          │   │
-│  └────────┬────────────┘  │     │  │ Playwright Browser  │   │
-│  ┌────────▼────────────┐  │     │  └────────┬───────────┘   │
+┌─────────▼─────────────────┐     ┌────────▼──────────────────┐
+│   WEB Stack (Docker)      │     │   CLI Stack (Docker)      │
+│                           │     │                           │
+│  ┌─────────────────────┐  │     │  ┌─────────────────────┐  │
+│  │ Nginx (Frontend)    │  │     │  │ FastAPI + AI Agents │  │
+│  │ React SPA           │  │     │  │ Go Fuzzers          │  │
+│  └────────┬────────────┘  │     │  │ Playwright Browser  │  │
+│  ┌────────▼────────────┐  │     │  └────────┬────────────┘  │
 │  │ Express + Prisma    │  │     │  ┌────────▼───────────┐   │
 │  │ REST API + WebSocket│  │     │  │ SQLite + LanceDB   │   │
 │  └────────┬────────────┘  │     │  └────────────────────┘   │
-│  ┌────────▼────────────┐  │     │                            │
-│  │ PostgreSQL          │  │     │                            │
-│  └─────────────────────┘  │     │                            │
-└───────────────────────────┘     └────────────────────────────┘
+│  ┌────────▼────────────┐  │     │                           │
+│  │ PostgreSQL          │  │     │                           │
+│  └─────────────────────┘  │     │                           │
+└───────────────────────────┘     └───────────────────────────┘
 ```
 
 Each stack runs its own independent Docker Compose project. In **Full** mode, the WEB frontend sends scan requests to the CLI API endpoint.
