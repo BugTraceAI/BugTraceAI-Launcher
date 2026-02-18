@@ -549,6 +549,8 @@ wizard_ask_api_key() {
             continue
         fi
 
+        echo -e "  ${DIM}Key: ${API_KEY:0:6}...${API_KEY: -4}${NC}"
+
         if [[ ! "$API_KEY" =~ ^sk-or- ]]; then
             warn "Key doesn't look like an OpenRouter key (expected sk-or-...)"
             read -rp "$(echo -e "  ${YELLOW}Continue anyway? [y/N]: ${NC}")" confirm
