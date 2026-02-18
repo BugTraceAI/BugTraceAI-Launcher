@@ -645,6 +645,24 @@ run_wizard() {
                 ;;
         esac
         echo ""
+    elif [[ -d "$INSTALL_DIR" ]]; then
+        warn "Directory $INSTALL_DIR already exists (no previous launcher state found)."
+        echo ""
+        select_option "What would you like to do?" \
+            "Replace (remove folder and install fresh)" \
+            "Cancel"
+
+        case $MENU_SELECTION in
+            0)
+                info "Removing $INSTALL_DIR..."
+                rm -rf "$INSTALL_DIR"
+                ;;
+            1)
+                info "Cancelled."
+                exit 0
+                ;;
+        esac
+        echo ""
     fi
 
     check_for_updates
