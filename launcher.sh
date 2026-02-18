@@ -16,6 +16,11 @@
 #   uninstall     Remove everything
 #
 
+# ── Restore stdin if piped (e.g. curl | bash) ───────────────────────────────
+if [ ! -t 0 ]; then
+    exec </dev/tty
+fi
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 VERSION="2.1.0"
