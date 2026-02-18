@@ -1108,13 +1108,34 @@ check_docker() {
     fi
 
     if ! docker info &>/dev/null 2>&1; then
-        error "Docker is not running or current user lacks permission."
         if $IS_MACOS; then
+            error "Docker is not running."
             echo -e "  ${DIM}Open Docker Desktop and make sure it is running.${NC}"
+            exit 1
         else
-            echo -e "  ${DIM}Add your user to the docker group: sudo usermod -aG docker \$USER${NC}"
+            warn "Docker is not accessible for the current user."
+            echo ""
+            echo -e "  ${DIM}Your user needs to be in the 'docker' group to run containers.${NC}"
+            echo ""
+            read -rp "  Add $USER to the docker group now? [Y/n] " add_docker
+            if [[ "${add_docker,,}" != "n" ]]; then
+                sudo usermod -aG docker "$USER"
+                echo ""
+                info "User $USER added to docker group."
+                warn "You must log out and log back in (or run: newgrp docker) for the change to take effect."
+                echo ""
+                read -rp "  Run 'newgrp docker' now and continue? [Y/n] " do_newgrp
+                if [[ "${do_newgrp,,}" != "n" ]]; then
+                    exec sg docker "$0 $*"
+                else
+                    info "Please log out, log back in, and re-run the launcher."
+                    exit 0
+                fi
+            else
+                error "Cannot proceed without Docker access."
+                exit 1
+            fi
         fi
-        exit 1
     fi
 }
 
