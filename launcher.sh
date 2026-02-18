@@ -1112,12 +1112,20 @@ check_docker() {
             error "Docker is not running."
             echo -e "  ${DIM}Open Docker Desktop and make sure it is running.${NC}"
             exit 1
-        else
-            info "Adding $USER to the docker group..."
-            sudo usermod -aG docker "$USER"
-            info "Restarting with docker group permissions..."
-            exec sg docker "$0 $*"
         fi
+
+        # Check if Docker daemon is running at all
+        if ! sudo docker info &>/dev/null 2>&1; then
+            error "Docker daemon is not running."
+            echo -e "  ${DIM}Start Docker first: sudo systemctl start docker${NC}"
+            exit 1
+        fi
+
+        # Daemon runs but current user lacks permission — fix it
+        info "Adding $USER to the docker group..."
+        sudo usermod -aG docker "$USER"
+        info "Applying new group, restarting launcher..."
+        exec sg docker "$0 $*"
     fi
 }
 
