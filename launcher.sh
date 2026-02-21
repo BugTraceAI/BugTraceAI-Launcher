@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BugTraceAI Launcher v2.0
+# BugTraceAI Launcher v2.2
 # One-command deployment for the BugTraceAI security platform
 #
 # Usage: ./launcher.sh [command]
@@ -11,7 +11,7 @@
 #   start         Start all services
 #   stop          Stop all services
 #   restart       Restart all services
-#   logs [web|cli] View logs
+#   logs [web|cli|mcp] View logs
 #   update        Pull latest & rebuild
 #   uninstall     Remove everything
 #
@@ -23,7 +23,7 @@ fi
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -47,6 +47,7 @@ IS_MACOS=false
 DEPLOY_MODE=""
 WEB_PORT=""
 CLI_PORT=""
+MCP_PORT=""
 API_KEY=""
 MENU_SELECTION=0
 
@@ -527,12 +528,14 @@ wizard_select_mode() {
     select_option "What would you like to install?" \
         "Full Platform (WEB + CLI) — Recommended" \
         "Standalone WEB — Browser-based analysis" \
-        "Standalone CLI — Autonomous scanner"
+        "Standalone CLI — Autonomous scanner" \
+        "CLI + AI Assistant — Control via Telegram/AI"
 
     case $MENU_SELECTION in
         0) DEPLOY_MODE="full" ;;
         1) DEPLOY_MODE="web" ;;
         2) DEPLOY_MODE="cli" ;;
+        3) DEPLOY_MODE="mcp" ;;
     esac
 
     echo ""
@@ -576,8 +579,12 @@ wizard_configure_ports() {
         propose_port "WEB frontend port" 6869 WEB_PORT
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         propose_port "CLI API port" 8000 CLI_PORT
+    fi
+
+    if [[ "$DEPLOY_MODE" == "mcp" ]]; then
+        propose_port "MCP server port (AI assistants)" 8001 MCP_PORT
     fi
 
     echo ""
@@ -601,6 +608,10 @@ wizard_show_summary() {
         full)
             echo -e "  WEB:        ${CYAN}http://localhost:$WEB_PORT${NC}"
             echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
+            ;;
+        mcp)
+            echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
+            echo -e "  MCP SSE:    ${CYAN}http://localhost:$MCP_PORT/sse${NC}"
             ;;
     esac
 
@@ -712,7 +723,7 @@ clone_repos() {
         echo -e "    ${OK} BugTraceAI-WEB"
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         if [[ -d "$CLI_DIR/.git" ]]; then
             step "Updating BugTraceAI-CLI..."
             if ! (cd "$CLI_DIR" && git pull --quiet) 2>/dev/null; then
@@ -750,7 +761,7 @@ EOF
         echo -e "    ${OK} WEB config (.env.docker)"
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         local cors="*"
         [[ "$DEPLOY_MODE" == "full" ]] && cors="http://localhost:${WEB_PORT}"
 
@@ -765,7 +776,7 @@ EOF
 
 # Patch CLI docker-compose to use .env values instead of hardcoded ones
 patch_compose() {
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         local compose="$CLI_DIR/docker-compose.yml"
         [[ ! -f "$compose" ]] && return
 
@@ -777,6 +788,16 @@ patch_compose() {
         # Patch port mapping if non-default
         if [[ -n "$CLI_PORT" && "$CLI_PORT" != "8000" ]]; then
             sed_inplace "s/\"8000:8000\"/\"${CLI_PORT}:8000\"/" "$compose"
+        fi
+
+        # Remove MCP service block when not in MCP mode
+        if [[ "$DEPLOY_MODE" != "mcp" ]]; then
+            sed_inplace '/^  mcp:/,/^  [^ ]/{ /^  mcp:/d; /^  [^ ]/!d; }' "$compose"
+        else
+            # Patch MCP port if non-default
+            if [[ -n "$MCP_PORT" && "$MCP_PORT" != "8001" ]]; then
+                sed_inplace "s/\"8001:8001\"/\"${MCP_PORT}:8001\"/" "$compose"
+            fi
         fi
     fi
 }
@@ -806,19 +827,21 @@ start_services() {
         echo -e "    ${OK} WEB services started"
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
             error "CLI docker-compose.yml not found — clone may have failed."
             exit 1
         fi
         echo ""
-        step "Building & starting CLI service..."
+        local cli_label="CLI service"
+        [[ "$DEPLOY_MODE" == "mcp" ]] && cli_label="CLI + MCP services"
+        step "Building & starting ${cli_label}..."
         echo -e "    ${DIM}(compiles Go tools + installs browser — may take 10-15 min on first run)${NC}"
         if ! _cli_compose up -d --build; then
-            error "Failed to start CLI service. Run: ./launcher.sh logs cli"
+            error "Failed to start ${cli_label}. Run: ./launcher.sh logs cli"
             exit 1
         fi
-        echo -e "    ${OK} CLI service started"
+        echo -e "    ${OK} ${cli_label} started"
     fi
 }
 
@@ -852,8 +875,12 @@ health_checks() {
         wait_for_url "http://localhost:${WEB_PORT}" "WEB (port ${WEB_PORT})" 120 || all_ok=false
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         wait_for_url "http://localhost:${CLI_PORT}/health" "CLI (port ${CLI_PORT})" 120 || all_ok=false
+    fi
+
+    if [[ "$DEPLOY_MODE" == "mcp" ]]; then
+        wait_for_url "http://localhost:${MCP_PORT}/sse" "MCP (port ${MCP_PORT})" 120 || all_ok=false
     fi
 
     echo ""
@@ -871,6 +898,7 @@ save_state() {
   "mode": "${DEPLOY_MODE}",
   "web_port": "${WEB_PORT}",
   "cli_port": "${CLI_PORT}",
+  "mcp_port": "${MCP_PORT}",
   "install_dir": "${INSTALL_DIR}",
   "deployed_at": "$(iso_date)"
 }
@@ -898,6 +926,23 @@ show_success() {
             echo -e "  ${ARROW} CLI API:        ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
             echo -e "  ${ARROW} CLI is connected to WEB automatically"
             ;;
+        mcp)
+            echo -e "  ${ARROW} CLI API: ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
+            echo -e "  ${ARROW} MCP SSE: ${BOLD}${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
+            echo ""
+            echo -e "  ${BOLD}Connect your AI assistant:${NC}"
+            echo ""
+            echo -e "  ${DIM}Add to your mcporter config (~/.mcporter/mcporter.json):${NC}"
+            echo ""
+            echo -e "    ${CYAN}{${NC}"
+            echo -e "    ${CYAN}  \"mcpServers\": {${NC}"
+            echo -e "    ${CYAN}    \"bugtraceai\": {${NC}"
+            echo -e "    ${CYAN}      \"baseUrl\": \"http://localhost:${MCP_PORT}/sse\",${NC}"
+            echo -e "    ${CYAN}      \"description\": \"BugTraceAI Security Scanner\"${NC}"
+            echo -e "    ${CYAN}    }${NC}"
+            echo -e "    ${CYAN}  }${NC}"
+            echo -e "    ${CYAN}}${NC}"
+            ;;
     esac
 
     echo ""
@@ -919,6 +964,7 @@ load_state() {
     DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
     WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    MCP_PORT=$(awk -F'"' '/"mcp_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
 }
 
 cmd_status() {
@@ -936,9 +982,12 @@ cmd_status() {
         done
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
         echo -e "\n  ${BOLD}CLI Stack${NC} (port ${CLI_PORT})"
         _print_container_status "bugtrace_api"
+        if [[ "$DEPLOY_MODE" == "mcp" ]]; then
+            _print_container_status "bugtrace_mcp"
+        fi
     fi
 
     echo ""
@@ -947,6 +996,7 @@ cmd_status() {
     echo -e "  ${BOLD}Endpoints:${NC}"
     [[ -n "$WEB_PORT" ]] && echo -e "    WEB:  ${CYAN}http://localhost:${WEB_PORT}${NC}"
     [[ -n "$CLI_PORT" ]] && echo -e "    CLI:  ${CYAN}http://localhost:${CLI_PORT}${NC}"
+    [[ -n "$MCP_PORT" ]] && echo -e "    MCP:  ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
     echo ""
 }
 
@@ -971,7 +1021,7 @@ cmd_start() {
     if [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]]; then
         _web_compose up -d || { error "Failed to start WEB services"; ok=false; }
     fi
-    if [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]]; then
+    if [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp") ]]; then
         _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
     fi
     $ok && success "Services started" || warn "Some services failed to start. Run: ./launcher.sh logs"
@@ -980,7 +1030,7 @@ cmd_start() {
 cmd_stop() {
     load_state
     info "Stopping services..."
-    [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]] && _cli_compose stop
+    [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp") ]] && _cli_compose stop
     [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]] && _web_compose stop
     success "Services stopped"
 }
@@ -1018,8 +1068,15 @@ cmd_logs() {
                 error "CLI not installed"
             fi
             ;;
+        mcp)
+            if [[ -d "$CLI_DIR" ]]; then
+                _cli_compose logs -f --tail=100 mcp
+            else
+                error "CLI not installed"
+            fi
+            ;;
         *)
-            error "Unknown target: $target (use 'web' or 'cli')"
+            error "Unknown target: $target (use 'web', 'cli', or 'mcp')"
             exit 1
             ;;
     esac
@@ -1043,7 +1100,7 @@ cmd_update() {
         fi
     fi
 
-    if [[ -d "$CLI_DIR/.git" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full") ]]; then
+    if [[ -d "$CLI_DIR/.git" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp") ]]; then
         step "Pulling CLI updates..."
         # Reset patched files before pull, then re-patch
         (cd "$CLI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
@@ -1143,7 +1200,7 @@ show_help() {
     echo "  start           Start all services"
     echo "  stop            Stop all services"
     echo "  restart         Restart all services"
-    echo "  logs [web|cli]  View logs"
+    echo "  logs [web|cli|mcp] View logs"
     echo "  update          Pull latest & rebuild"
     echo "  uninstall       Remove everything"
     echo ""
