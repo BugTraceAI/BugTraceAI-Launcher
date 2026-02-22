@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <img src="https://img.shields.io/badge/Version-2.0.0-blue" />
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" />
+  <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
 </p>
@@ -228,7 +228,7 @@ The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the inte
 
 ## License
 
-MIT License. See the [LICENSE](LICENSE) file for details.
+AGPL-3.0 License. See the [LICENSE](LICENSE) file for details.
 
 ## Links
 
