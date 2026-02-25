@@ -23,7 +23,7 @@ fi
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -1142,6 +1142,8 @@ cmd_update() {
         if ! (cd "$WEB_DIR" && git pull --quiet); then
             warn "Failed to pull WEB updates"
         fi
+        # Patch .env.docker: ensure VITE_CLI_API_URL uses proxy path (safe: preserves passwords)
+        _patch_env_docker
         step "Rebuilding WEB..."
         if ! _web_compose up -d --build; then
             error "Failed to rebuild WEB services"
@@ -1171,6 +1173,20 @@ cmd_update() {
 
     echo ""
     success "Update complete!"
+}
+
+# Patch .env.docker in-place: fix config values without regenerating passwords.
+_patch_env_docker() {
+    local envfile="$WEB_DIR/.env.docker"
+    [[ ! -f "$envfile" ]] && return
+
+    # In full mode, VITE_CLI_API_URL must be /cli-api (nginx proxy) for remote access
+    if [[ "$DEPLOY_MODE" == "full" ]]; then
+        if grep -q 'VITE_CLI_API_URL=http://localhost' "$envfile" 2>/dev/null; then
+            sed -i 's|VITE_CLI_API_URL=http://localhost[^[:space:]]*|VITE_CLI_API_URL=/cli-api|' "$envfile"
+            echo -e "    ${OK} Fixed VITE_CLI_API_URL → /cli-api"
+        fi
+    fi
 }
 
 cmd_uninstall() {
