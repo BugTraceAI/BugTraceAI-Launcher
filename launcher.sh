@@ -23,7 +23,7 @@ fi
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.2.1"
+VERSION="2.3.0"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
