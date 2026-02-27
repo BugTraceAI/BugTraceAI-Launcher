@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BugTraceAI Launcher v2.3.0
+# BugTraceAI Launcher v2.5.0
 # One-command deployment for the BugTraceAI security platform
 #
 # Usage: ./launcher.sh [command]
