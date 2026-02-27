@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BugTraceAI Launcher v2.2
+# BugTraceAI Launcher v2.3.0
 # One-command deployment for the BugTraceAI security platform
 #
 # Usage: ./launcher.sh [command]
@@ -23,18 +23,21 @@ fi
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.3.0"
+VERSION="2.5.0"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
 CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
+RECON_DIR="$INSTALL_DIR/reconftw-mcp"
 WEB_REPO="https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 CLI_REPO="https://github.com/BugTraceAI/BugTraceAI-CLI.git"
+RECON_REPO="https://github.com/BugTraceAI/reconftw-mcp.git"
 
 # GitHub repos for version checks
 GITHUB_API_BASE="https://api.github.com/repos/BugTraceAI"
 REPOS_CLI="BugTraceAI-CLI"
 REPOS_WEB="BugTraceAI-WEB"
+REPOS_RECON="reconftw-mcp"
 REPOS_LAUNCHER="BugTraceAI-Launcher"
 VERSION_CACHE="$INSTALL_DIR/.version_cache"
 VERSION_CACHE_TTL=86400  # 24 hours in seconds
@@ -52,6 +55,14 @@ API_KEY=""
 API_KEY_ENV_VAR=""
 LLM_PROVIDER="openrouter"
 MENU_SELECTION=0
+
+# MCP Selection state
+MCP_CLI_ENABLED=false
+MCP_RECON_ENABLED=false
+MCP_KALI_ENABLED=false
+RECON_PORT=""
+KALI_PORT=""
+SELECTED_INDICES=()
 
 # ── Colors & Symbols ────────────────────────────────────────────────────────
 
@@ -255,6 +266,119 @@ select_option() {
     MENU_SELECTION=$selected
 }
 
+# MCP Descriptions for multi-select menu
+MCP_DESCRIPTIONS=(
+    "BugTraceAI Scanner: Core vulnerability scanning engine with AI-powered analysis"
+    "reconFTW: Automated subdomain enumeration, OSINT gathering, and vulnerability detection"
+    "Kali Linux: Full penetration testing toolkit (nmap, nuclei, sqlmap, ffuf, etc.) - 3GB+ download"
+)
+
+# Multi-select menu with SPACE to toggle, ENTER to confirm
+# Returns SELECTED_INDICES array with indices of selected options
+select_multi() {
+    local question=$1
+    shift
+    local -a options=("$@")
+    local -a selected=()
+    local current=0
+    local total=${#options[@]}
+    
+    # Initialize all as unselected (false)
+    for i in "${!options[@]}"; do
+        selected[$i]=false
+    done
+
+    # Apply pre-selections from global PRE_SELECTED array
+    for idx in "${PRE_SELECTED[@]}"; do
+        if [[ $idx -ge 0 && $idx -lt $total ]]; then
+            selected[$idx]=true
+        fi
+    done
+
+    # Fallback: numbered menu if tput unavailable
+    if ! command -v tput &>/dev/null || ! tput lines &>/dev/null 2>&1; then
+        echo -e "\n${YELLOW}$question${NC}\n"
+        for i in "${!options[@]}"; do
+            echo -e "  ${CYAN}$((i + 1)))${NC} ${options[$i]}"
+        done
+        echo ""
+        echo -e "  ${DIM}Enter numbers separated by spaces (e.g., 1 3 4) or press ENTER for none:${NC}"
+        read -rp "$(echo -e "${YELLOW}Selection: ${NC}")" choices
+        
+        SELECTED_INDICES=()
+        for num in $choices; do
+            if [[ "$num" =~ ^[0-9]+$ ]] && [[ "$num" -ge 1 ]] && [[ "$num" -le "$total" ]]; then
+                SELECTED_INDICES+=($((num - 1)))
+            fi
+        done
+        return 0
+    fi
+
+    # Interactive multi-select with arrow keys + space
+    local total_lines=$((total + 7))
+    local first_draw=true
+
+    trap 'tput cnorm 2>/dev/null' INT TERM
+    tput civis
+
+    while true; do
+        if [[ "$first_draw" == true ]]; then
+            first_draw=false
+        else
+            tput cuu "$total_lines" 2>/dev/null
+        fi
+
+        echo -e "\033[K${YELLOW}$question${NC}"
+        echo -e "\033[K  ${DIM}Use ↑/↓ to navigate, SPACE to select, ENTER to confirm${NC}"
+        echo -e "\033[K"
+
+        for i in "${!options[@]}"; do
+            local checkbox="◯"
+            ${selected[$i]} && checkbox="◉"
+
+            if [[ $i -eq $current ]]; then
+                echo -e "\033[K  ${CYAN}❯${NC} ${BOLD}${checkbox} ${options[$i]}${NC}"
+            else
+                echo -e "\033[K    ${DIM}${checkbox} ${options[$i]}${NC}"
+            fi
+        done
+
+        # Show description for current item
+        echo -e "\033[K"
+        echo -e "\033[K  ${DIM}└─ ${MCP_DESCRIPTIONS[$current]:-""}${NC}"
+
+        read -rsn1 key
+        case "$key" in
+            $'\x1b')
+                read -rsn2 -t 0.1 k2
+                case "$k2" in
+                    "[A") ((current > 0)) && ((current--)) || current=$((total - 1)) ;;
+                    "[B") ((current < total - 1)) && ((current++)) || current=0 ;;
+                esac
+                ;;
+            k) ((current > 0)) && ((current--)) || current=$((total - 1)) ;;
+            j) ((current < total - 1)) && ((current++)) || current=0 ;;
+            " ")  # SPACE - toggle selection
+                if ${selected[$current]}; then
+                    selected[$current]=false
+                else
+                    selected[$current]=true
+                fi
+                ;;
+            "") break ;;
+        esac
+    done
+
+    tput cnorm
+    trap - INT TERM
+
+    # Return selected indices
+    SELECTED_INDICES=()
+    for i in "${!selected[@]}"; do
+        ${selected[$i]} && SELECTED_INDICES+=($i)
+    done
+}
+
 # ── Version Check ──────────────────────────────────────────────────────────
 
 # Compare two semver strings. Returns 0 (true) if $2 > $1.
@@ -356,6 +480,19 @@ check_for_updates() {
                 has_update=true
                 lines+=("     WEB:      ${web_ver} → ${latest_web}")
             fi
+        fi
+    fi
+
+    # Check Recon version
+    if [[ -d "$RECON_DIR" ]]; then
+        local latest_recon
+        latest_recon=$(_get_latest_version "$REPOS_RECON")
+        # Since recon repo doesn't have a fixed version file we can easily parse yet,
+        # we just check for new releases/tags on GitHub
+        # For now, we'll just show the update is available if it exists
+        if [[ -n "$latest_recon" ]]; then
+            has_update=true
+            lines+=("     Recon:    latest release ${latest_recon}")
         fi
     fi
 
@@ -528,16 +665,18 @@ check_deps() {
 
 wizard_select_mode() {
     select_option "What would you like to install?" \
-        "Full Platform (WEB + CLI) — Recommended" \
+        "Full Platform (WEB + CLI + MCP) — Recommended" \
         "Standalone WEB — Browser-based analysis" \
         "Standalone CLI — Autonomous scanner" \
-        "CLI + AI Assistant — Control via Telegram/AI"
+        "reconFTW MCP — Reconnaissance automation" \
+        "Custom Setup — Choose MCP agents manually"
 
     case $MENU_SELECTION in
         0) DEPLOY_MODE="full" ;;
         1) DEPLOY_MODE="web" ;;
         2) DEPLOY_MODE="cli" ;;
-        3) DEPLOY_MODE="mcp" ;;
+        3) DEPLOY_MODE="recon" ;;
+        4) DEPLOY_MODE="custom" ;;
     esac
 
     echo ""
@@ -617,19 +756,82 @@ wizard_ask_api_key() {
     echo ""
 }
 
+# ── MCP Selection Wizard ───────────────────────────────────────────────────────
+
+wizard_select_mcps() {
+    echo -e "${BOLD}MCP Agent Selection${NC}"
+    echo -e "  ${DIM}Select AI-powered security agents to install:${NC}"
+    echo ""
+
+    # Build options list with port info
+    local -a mcp_options=()
+    mcp_options+=("BugTraceAI Scanner     Port 8001   (Core vulnerability scanner)")
+    mcp_options+=("reconFTW Reconnaissance Port 8002   (Subdomain & OSINT automation by @six2dez)")
+    mcp_options+=("Kali Linux Tools       Port 8003   (Full pentest toolkit - 3GB+)")
+
+    # Pre-select based on mode (via global PRE_SELECTED for select_multi)
+    PRE_SELECTED=()
+    if [[ "$DEPLOY_MODE" != "web" && "$DEPLOY_MODE" != "recon" ]]; then
+        PRE_SELECTED+=(0)
+    fi
+    if [[ "$DEPLOY_MODE" == "recon" ]]; then
+        PRE_SELECTED+=(1)
+    fi
+
+    select_multi "Which MCP agents would you like to install?" "${mcp_options[@]}"
+
+    # Process selections
+    MCP_CLI_ENABLED=false
+    MCP_RECON_ENABLED=false
+    MCP_KALI_ENABLED=false
+
+    for idx in "${SELECTED_INDICES[@]}"; do
+        case $idx in
+            0) MCP_CLI_ENABLED=true ;;
+            1) MCP_RECON_ENABLED=true ;;
+            2) MCP_KALI_ENABLED=true ;;
+        esac
+    done
+
+    echo ""
+    
+    # Show what was selected
+    local selected_count=0
+    $MCP_CLI_ENABLED && { echo -e "  ${OK} BugTraceAI Scanner selected"; ((selected_count++)); }
+    $MCP_RECON_ENABLED && { echo -e "  ${OK} reconFTW Reconnaissance selected"; ((selected_count++)); }
+    $MCP_KALI_ENABLED && { echo -e "  ${OK} Kali Linux Tools selected"; ((selected_count++)); }
+    
+    if [[ $selected_count -eq 0 ]]; then
+        echo -e "  ${DIM}No MCP agents selected${NC}"
+    fi
+    
+    echo ""
+    success "MCP agents configured"
+    echo ""
+}
+
 wizard_configure_ports() {
     echo -e "${BOLD}Port Configuration${NC}"
 
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
+    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
         propose_port "WEB frontend port" 6869 WEB_PORT
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
         propose_port "CLI API port" 8000 CLI_PORT
     fi
 
-    if [[ "$DEPLOY_MODE" == "mcp" ]]; then
-        propose_port "MCP server port (AI assistants)" 8001 MCP_PORT
+    # MCP ports based on selection
+    if $MCP_CLI_ENABLED; then
+        propose_port "BugTraceAI MCP port" 8001 MCP_PORT
+    fi
+
+    if $MCP_RECON_ENABLED; then
+        propose_port "reconFTW MCP port" 8002 RECON_PORT
+    fi
+
+    if $MCP_KALI_ENABLED; then
+        propose_port "Kali MCP port" 8003 KALI_PORT
     fi
 
     echo ""
@@ -644,22 +846,27 @@ wizard_show_summary() {
     echo -e "  Mode:       ${CYAN}$DEPLOY_MODE${NC}"
     echo -e "  Provider:   ${CYAN}$LLM_PROVIDER${NC}"
 
-    case "$DEPLOY_MODE" in
-        web)
-            echo -e "  WEB:        ${CYAN}http://localhost:$WEB_PORT${NC}"
-            ;;
-        cli)
-            echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
-            ;;
-        full)
-            echo -e "  WEB:        ${CYAN}http://localhost:$WEB_PORT${NC}"
-            echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
-            ;;
-        mcp)
-            echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
-            echo -e "  MCP SSE:    ${CYAN}http://localhost:$MCP_PORT/sse${NC}"
-            ;;
-    esac
+    # Show endpoints based on mode and selections
+    if [[ -n "$WEB_PORT" ]]; then
+        echo -e "  WEB:        ${CYAN}http://localhost:$WEB_PORT${NC}"
+    fi
+    if [[ -n "$CLI_PORT" ]]; then
+        echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
+    fi
+
+    # Show MCP agents
+    local has_mcps=false
+    $MCP_CLI_ENABLED && has_mcps=true
+    $MCP_RECON_ENABLED && has_mcps=true
+    $MCP_KALI_ENABLED && has_mcps=true
+
+    if $has_mcps; then
+        echo ""
+        echo -e "  ${BOLD}MCP Agents:${NC}"
+        $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
+        $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
+        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali:      ${CYAN}http://localhost:${KALI_PORT}${NC}"
+    fi
 
     echo -e "  API Key:    ${DIM}...${API_KEY: -4} (${API_KEY_ENV_VAR})${NC}"
     echo -e "  Install at: ${DIM}$INSTALL_DIR${NC}"
@@ -725,6 +932,7 @@ run_wizard() {
     check_for_updates
     check_deps
     wizard_select_mode
+    wizard_select_mcps
     wizard_select_provider
     wizard_ask_api_key
     wizard_configure_ports
@@ -751,26 +959,30 @@ deploy() {
 }
 
 clone_repos() {
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
-        if [[ -d "$WEB_DIR/.git" ]]; then
-            step "Updating BugTraceAI-WEB..."
-            if ! (cd "$WEB_DIR" && git pull --quiet) 2>/dev/null; then
-                warn "Failed to update WEB repo (will use existing version)"
+    # Clone WEB repo if needed
+    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+        if [[ -n "$WEB_PORT" ]]; then
+            if [[ -d "$WEB_DIR/.git" ]]; then
+                step "Updating BugTraceAI-WEB..."
+                if ! (cd "$WEB_DIR" && git pull --quiet) 2>/dev/null; then
+                    warn "Failed to update WEB repo (will use existing version)"
+                fi
+            else
+                step "Cloning BugTraceAI-WEB..."
+                # Clean partial directory from failed previous attempt
+                [[ -d "$WEB_DIR" && ! -d "$WEB_DIR/.git" ]] && rm -rf "$WEB_DIR"
+                if ! git clone --depth 1 "$WEB_REPO" "$WEB_DIR"; then
+                    error "Failed to clone BugTraceAI-WEB from $WEB_REPO"
+                    error "Check your internet connection and try again."
+                    exit 1
+                fi
             fi
-        else
-            step "Cloning BugTraceAI-WEB..."
-            # Clean partial directory from failed previous attempt
-            [[ -d "$WEB_DIR" && ! -d "$WEB_DIR/.git" ]] && rm -rf "$WEB_DIR"
-            if ! git clone --depth 1 "$WEB_REPO" "$WEB_DIR"; then
-                error "Failed to clone BugTraceAI-WEB from $WEB_REPO"
-                error "Check your internet connection and try again."
-                exit 1
-            fi
+            echo -e "    ${OK} BugTraceAI-WEB"
         fi
-        echo -e "    ${OK} BugTraceAI-WEB"
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # Clone CLI repo if any MCP is enabled or CLI mode
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
         if [[ -d "$CLI_DIR/.git" ]]; then
             step "Updating BugTraceAI-CLI..."
             if ! (cd "$CLI_DIR" && git pull --quiet) 2>/dev/null; then
@@ -788,18 +1000,37 @@ clone_repos() {
         fi
         echo -e "    ${OK} BugTraceAI-CLI"
     fi
+
+    # Clone Recon repo if needed
+    if [[ "$DEPLOY_MODE" == "recon" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" ]] || $MCP_RECON_ENABLED; then
+        if [[ -d "$RECON_DIR/.git" ]]; then
+            step "Updating reconftw-mcp..."
+            if ! (cd "$RECON_DIR" && git pull --quiet) 2>/dev/null; then
+                warn "Failed to update Recon repo (will use existing version)"
+            fi
+        else
+            step "Cloning reconftw-mcp..."
+            [[ -d "$RECON_DIR" && ! -d "$RECON_DIR/.git" ]] && rm -rf "$RECON_DIR"
+            if ! git clone --depth 1 "$RECON_REPO" "$RECON_DIR"; then
+                error "Failed to clone reconftw-mcp from $RECON_REPO"
+                exit 1
+            fi
+        fi
+        echo -e "    ${OK} reconftw-mcp"
+    fi
 }
 
 generate_env() {
     step "Generating configuration..."
 
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
-        # In full mode, use nginx proxy path so the UI works from any device on the network.
-        # The WEB frontend's nginx.conf proxies /cli-api/ → host.docker.internal:CLI_PORT.
-        local cli_url=""
-        [[ "$DEPLOY_MODE" == "full" ]] && cli_url="/cli-api"
+    # WEB configuration
+    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+        if [[ -n "$WEB_PORT" ]]; then
+            # In full/custom mode, use nginx proxy path so the UI works from any device on the network.
+            local cli_url=""
+            [[ -n "$CLI_PORT" ]] && cli_url="/cli-api"
 
-        cat > "$WEB_DIR/.env.docker" << EOF
+            cat > "$WEB_DIR/.env.docker" << EOF
 # BugTraceAI-WEB — Generated by Launcher v${VERSION} ($(iso_date))
 POSTGRES_USER=bugtraceai
 POSTGRES_PASSWORD=$(generate_password 24)
@@ -807,12 +1038,26 @@ POSTGRES_DB=bugtraceai_web
 FRONTEND_PORT=${WEB_PORT}
 VITE_CLI_API_URL=${cli_url}
 EOF
-        echo -e "    ${OK} WEB config (.env.docker)"
+
+            # Add MCP ports if enabled
+            if $MCP_RECON_ENABLED || $MCP_CLI_ENABLED || $MCP_KALI_ENABLED; then
+                cat >> "$WEB_DIR/.env.docker" << EOF
+
+# MCP Agent Configuration
+COMPOSE_PROFILES=${COMPOSE_PROFILES:-}
+RECON_MCP_PORT=${RECON_PORT:-8002}
+CLI_MCP_PORT=${MCP_PORT:-8001}
+EOF
+            fi
+
+            echo -e "    ${OK} WEB config (.env.docker)"
+        fi
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # CLI configuration
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
         local cors="*"
-        [[ "$DEPLOY_MODE" == "full" ]] && cors="http://localhost:${WEB_PORT}"
+        [[ -n "$WEB_PORT" ]] && cors="http://localhost:${WEB_PORT}"
 
         cat > "$CLI_DIR/.env" << EOF
 # BugTraceAI-CLI — Generated by Launcher v${VERSION} ($(iso_date))
@@ -822,16 +1067,76 @@ BUGTRACE_CORS_ORIGINS=${cors}
 EOF
         echo -e "    ${OK} CLI config (.env)"
     fi
+
+    # Generate MCP config for AI assistants
+    generate_mcp_config
 }
 
-# Patch CLI docker-compose to use .env values instead of hardcoded ones
+# Generate MCP configuration file for AI assistants (mcporter, claude, etc.)
+generate_mcp_config() {
+    local has_mcps=false
+    $MCP_CLI_ENABLED && has_mcps=true
+    $MCP_RECON_ENABLED && has_mcps=true
+    $MCP_KALI_ENABLED && has_mcps=true
+
+    if ! $has_mcps; then
+        return
+    fi
+
+    step "Generating MCP configuration..."
+    local config_file="$INSTALL_DIR/mcp-config.json"
+    local servers=""
+
+    if $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]]; then
+        servers+="    \"bugtraceai\": {\n"
+        servers+="      \"baseUrl\": \"http://localhost:${MCP_PORT}/sse\",\n"
+        servers+="      \"description\": \"BugTraceAI Security Scanner\"\n"
+        servers+="    },\n"
+    fi
+
+    if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]]; then
+        servers+="    \"reconftw\": {\n"
+        servers+="      \"baseUrl\": \"http://localhost:${RECON_PORT}/sse\",\n"
+        servers+="      \"description\": \"reconFTW Reconnaissance Agent\"\n"
+        servers+="    },\n"
+    fi
+
+    if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" ]]; then
+        servers+="    \"kali\": {\n"
+        servers+="      \"baseUrl\": \"http://localhost:${KALI_PORT}\",\n"
+        servers+="      \"description\": \"Kali Linux Security Tools\"\n"
+        servers+="    },\n"
+    fi
+
+    # Remove trailing comma
+    servers="${servers%,*}"
+
+    cat > "$config_file" << EOF
+{
+  "mcpServers": {
+${servers}
+  }
+}
+EOF
+    echo -e "    ${OK} MCP config (mcp-config.json)"
+}
+
+# Patch docker-compose files to use .env values and enable MCP profiles
 patch_compose() {
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # Build COMPOSE_PROFILES based on MCP selection
+    local profiles=""
+    $MCP_CLI_ENABLED && profiles="$profiles,cli"
+    $MCP_RECON_ENABLED && profiles="$profiles,recon"
+    $MCP_KALI_ENABLED && profiles="$profiles,kali"
+    # Remove leading comma
+    profiles="${profiles#,}"
+    export COMPOSE_PROFILES="$profiles"
+
+    # Patch CLI docker-compose if CLI or any MCP is enabled
+    if [[ -f "$CLI_DIR/docker-compose.yml" ]] && { [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; }; then
         local compose="$CLI_DIR/docker-compose.yml"
-        [[ ! -f "$compose" ]] && return
 
         # Remove entire environment section (CORS is loaded from .env via env_file)
-        # This avoids leaving an empty "environment:" key which breaks Docker Compose
         sed_inplace '/^    environment:/d' "$compose"
         sed_inplace '/BUGTRACE_CORS_ORIGINS/d' "$compose"
 
@@ -839,15 +1144,26 @@ patch_compose() {
         if [[ -n "$CLI_PORT" && "$CLI_PORT" != "8000" ]]; then
             sed_inplace "s/\"8000:8000\"/\"${CLI_PORT}:8000\"/" "$compose"
         fi
+    fi
 
-        # Remove MCP service block when not in MCP mode
-        if [[ "$DEPLOY_MODE" != "mcp" ]]; then
-            sed_inplace '/^  mcp:/,/^  [^ ]/{ /^  mcp:/d; /^  [^ ]/!d; }' "$compose"
-        else
-            # Patch MCP port if non-default
-            if [[ -n "$MCP_PORT" && "$MCP_PORT" != "8001" ]]; then
-                sed_inplace "s/\"8001:8001\"/\"${MCP_PORT}:8001\"/" "$compose"
-            fi
+    # Patch WEB docker-compose for MCP agents
+    if [[ -f "$WEB_DIR/docker-compose.yml" ]] && [[ -n "$profiles" ]]; then
+        local web_compose="$WEB_DIR/docker-compose.yml"
+
+        # Patch reconFTW port if non-default
+        if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" && "$RECON_PORT" != "8002" ]]; then
+            sed_inplace "s/\"8002:8002\"/\"${RECON_PORT}:8002\"/" "$web_compose"
+        fi
+
+        # Patch CLI MCP port if non-default
+        if $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" && "$MCP_PORT" != "8001" ]]; then
+            sed_inplace "s/\"8001:8001\"/\"${MCP_PORT}:8001\"/" "$web_compose"
+        fi
+
+        # Patch Kali port if non-default
+        if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" && "$KALI_PORT" != "8003" ]]; then
+            # Kali doesn't have a default port mapping, add if needed
+            :
         fi
     fi
 }
@@ -862,36 +1178,68 @@ _cli_compose() {
 }
 
 start_services() {
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
-        if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
-            error "WEB docker-compose.yml not found — clone may have failed."
-            exit 1
+    # Start WEB services
+    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+        if [[ -n "$WEB_PORT" ]]; then
+            if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
+                error "WEB docker-compose.yml not found — clone may have failed."
+                exit 1
+            fi
+            echo ""
+            step "Building & starting WEB services..."
+            echo -e "    ${DIM}(postgres + backend + frontend — may take 5-10 min on first run)${NC}"
+            if ! _web_compose up -d --build; then
+                error "Failed to start WEB services. Run: ./launcher.sh logs web"
+                exit 1
+            fi
+            echo -e "    ${OK} WEB services started"
         fi
-        echo ""
-        step "Building & starting WEB services..."
-        echo -e "    ${DIM}(postgres + backend + frontend — may take 5-10 min on first run)${NC}"
-        if ! _web_compose up -d --build; then
-            error "Failed to start WEB services. Run: ./launcher.sh logs web"
-            exit 1
-        fi
-        echo -e "    ${OK} WEB services started"
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # Start CLI service
+    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
         if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
             error "CLI docker-compose.yml not found — clone may have failed."
             exit 1
         fi
         echo ""
-        local cli_label="CLI service"
-        [[ "$DEPLOY_MODE" == "mcp" ]] && cli_label="CLI + MCP services"
-        step "Building & starting ${cli_label}..."
+        step "Building & starting CLI service..."
         echo -e "    ${DIM}(compiles Go tools + installs browser — may take 10-15 min on first run)${NC}"
         if ! _cli_compose up -d --build; then
-            error "Failed to start ${cli_label}. Run: ./launcher.sh logs cli"
+            error "Failed to start CLI service. Run: ./launcher.sh logs cli"
             exit 1
         fi
-        echo -e "    ${OK} ${cli_label} started"
+        echo -e "    ${OK} CLI service started"
+    fi
+
+    # Start MCP agents via WEB docker-compose profiles
+    if [[ -n "$COMPOSE_PROFILES" ]] && [[ -f "$WEB_DIR/docker-compose.yml" ]]; then
+        echo ""
+        step "Starting MCP agents (profiles: ${COMPOSE_PROFILES})..."
+        
+        if $MCP_CLI_ENABLED; then
+            echo -e "    ${DIM}Starting BugTraceAI MCP...${NC}"
+        fi
+        if $MCP_RECON_ENABLED; then
+            echo -e "    ${DIM}Starting reconFTW MCP...${NC}"
+        fi
+        if $MCP_KALI_ENABLED; then
+            echo -e "    ${DIM}Starting Kali Linux MCP (this may take a while)...${NC}"
+        fi
+
+        if ! _web_compose --profile all-agents up -d --build 2>/dev/null; then
+            # Fallback: try individual profiles
+            for profile in cli recon kali; do
+                if [[ "$COMPOSE_PROFILES" == *"$profile"* ]]; then
+                    _web_compose --profile "$profile" up -d --build 2>/dev/null || \
+                        warn "Failed to start $profile MCP agent"
+                fi
+            done
+        fi
+        
+        $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI MCP started"
+        $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW MCP started"
+        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali Linux MCP started"
     fi
 }
 
@@ -921,16 +1269,35 @@ health_checks() {
 
     local all_ok=true
 
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
+    # WEB health check
+    if [[ -n "$WEB_PORT" ]]; then
         wait_for_url "http://localhost:${WEB_PORT}" "WEB (port ${WEB_PORT})" 120 || all_ok=false
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # CLI health check
+    if [[ -n "$CLI_PORT" ]]; then
         wait_for_url "http://localhost:${CLI_PORT}/health" "CLI (port ${CLI_PORT})" 120 || all_ok=false
     fi
 
-    if [[ "$DEPLOY_MODE" == "mcp" ]]; then
-        wait_for_url "http://localhost:${MCP_PORT}/sse" "MCP (port ${MCP_PORT})" 120 || all_ok=false
+    # MCP agents health checks
+    if $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]]; then
+        wait_for_url "http://localhost:${MCP_PORT}/sse" "BugTraceAI MCP (port ${MCP_PORT})" 120 || all_ok=false
+    fi
+
+    if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]]; then
+        wait_for_url "http://localhost:${RECON_PORT}/sse" "reconFTW MCP (port ${RECON_PORT})" 120 || all_ok=false
+    fi
+
+    if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" ]]; then
+        # Kali doesn't have HTTP endpoint, just check container
+        local kali_status
+        kali_status=$(docker ps --format '{{.Status}}' --filter "name=^kali-mcp-server$" 2>/dev/null | head -1)
+        if [[ -n "$kali_status" ]] && echo "$kali_status" | grep -q "Up"; then
+            echo -e "    ${OK} Kali MCP (running)"
+        else
+            echo -e "    ${FAIL} Kali MCP (not running)"
+            all_ok=false
+        fi
     fi
 
     echo ""
@@ -949,6 +1316,11 @@ save_state() {
   "web_port": "${WEB_PORT}",
   "cli_port": "${CLI_PORT}",
   "mcp_port": "${MCP_PORT}",
+  "recon_port": "${RECON_PORT}",
+  "kali_port": "${KALI_PORT}",
+  "mcp_cli_enabled": ${MCP_CLI_ENABLED},
+  "mcp_recon_enabled": ${MCP_RECON_ENABLED},
+  "mcp_kali_enabled": ${MCP_KALI_ENABLED},
   "install_dir": "${INSTALL_DIR}",
   "deployed_at": "$(iso_date)"
 }
@@ -963,39 +1335,53 @@ show_success() {
     echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    case "$DEPLOY_MODE" in
-        web)
-            echo -e "  ${ARROW} Open: ${BOLD}${CYAN}http://localhost:${WEB_PORT}${NC}"
-            ;;
-        cli)
-            echo -e "  ${ARROW} CLI API: ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
-            echo -e "  ${ARROW} API Docs: ${BOLD}${CYAN}http://localhost:${CLI_PORT}/docs${NC}"
-            ;;
-        full)
-            echo -e "  ${ARROW} WEB Interface: ${BOLD}${CYAN}http://localhost:${WEB_PORT}${NC}"
-            echo -e "  ${ARROW} CLI API:        ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
-            echo -e "  ${ARROW} CLI is connected to WEB automatically"
-            ;;
-        mcp)
-            echo -e "  ${ARROW} CLI API: ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
-            echo -e "  ${ARROW} MCP SSE: ${BOLD}${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
-            echo ""
-            echo -e "  ${BOLD}Connect your AI assistant:${NC}"
-            echo ""
-            echo -e "  ${DIM}Add to your mcporter config (~/.mcporter/mcporter.json):${NC}"
-            echo ""
-            echo -e "    ${CYAN}{${NC}"
-            echo -e "    ${CYAN}  \"mcpServers\": {${NC}"
-            echo -e "    ${CYAN}    \"bugtraceai\": {${NC}"
-            echo -e "    ${CYAN}      \"baseUrl\": \"http://localhost:${MCP_PORT}/sse\",${NC}"
-            echo -e "    ${CYAN}      \"description\": \"BugTraceAI Security Scanner\"${NC}"
-            echo -e "    ${CYAN}    }${NC}"
-            echo -e "    ${CYAN}  }${NC}"
-            echo -e "    ${CYAN}}${NC}"
-            ;;
-    esac
+    # Show main endpoints
+    if [[ -n "$WEB_PORT" ]]; then
+        echo -e "  ${ARROW} WEB Interface: ${BOLD}${CYAN}http://localhost:${WEB_PORT}${NC}"
+    fi
+    if [[ -n "$CLI_PORT" ]]; then
+        echo -e "  ${ARROW} CLI API:       ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
+        echo -e "  ${ARROW} API Docs:      ${BOLD}${CYAN}http://localhost:${CLI_PORT}/docs${NC}"
+    fi
 
-    echo ""
+    # Show MCP agents
+    local has_mcps=false
+    $MCP_CLI_ENABLED && has_mcps=true
+    $MCP_RECON_ENABLED && has_mcps=true
+    $MCP_KALI_ENABLED && has_mcps=true
+
+    if $has_mcps; then
+        echo ""
+        echo -e "  ${BOLD}MCP Agents:${NC}"
+        $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
+        $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC} (by @six2dez)"
+        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali Linux: ${CYAN}(interactive container)${NC}"
+
+        echo ""
+        echo -e "  ${BOLD}Connect your AI assistant:${NC}"
+        echo -e "  ${DIM}Config file: ${INSTALL_DIR}/mcp-config.json${NC}"
+        echo ""
+        echo -e "  ${DIM}Or add to ~/.mcporter/mcporter.json:${NC}"
+        echo ""
+
+        if $MCP_CLI_ENABLED; then
+            echo -e "    ${CYAN}\"bugtraceai\": {${NC}"
+            echo -e "    ${CYAN}  \"baseUrl\": \"http://localhost:${MCP_PORT}/sse\"${NC}"
+            echo -e "    ${CYAN}}${NC}"
+        fi
+        if $MCP_RECON_ENABLED; then
+            echo -e "    ${CYAN}\"reconftw\": {${NC}"
+            echo -e "    ${CYAN}  \"baseUrl\": \"http://localhost:${RECON_PORT}/sse\"${NC}"
+            echo -e "    ${CYAN}}${NC}"
+        fi
+    fi
+
+    if $MCP_KALI_ENABLED; then
+        echo -e "  ${YELLOW}💡 Kali Tip:${NC} To scan this machine from Kali, use:"
+        echo -e "     ${BOLD}${DIM}nmap -Pn host.docker.internal${NC}"
+        echo ""
+    fi
+
     echo -e "  ${BOLD}Commands:${NC}"
     echo -e "    ${DIM}./launcher.sh status${NC}       Service dashboard"
     echo -e "    ${DIM}./launcher.sh logs${NC}         View logs"
@@ -1015,6 +1401,18 @@ load_state() {
     WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     MCP_PORT=$(awk -F'"' '/"mcp_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    RECON_PORT=$(awk -F'"' '/"recon_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    KALI_PORT=$(awk -F'"' '/"kali_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    
+    # Load MCP enabled states (handle both boolean and string)
+    local mcp_cli mcp_recon mcp_kali
+    mcp_cli=$(grep -o '"mcp_cli_enabled": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    mcp_recon=$(grep -o '"mcp_recon_enabled": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    mcp_kali=$(grep -o '"mcp_kali_enabled": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    
+    [[ "$mcp_cli" == "true" ]] && MCP_CLI_ENABLED=true || MCP_CLI_ENABLED=false
+    [[ "$mcp_recon" == "true" ]] && MCP_RECON_ENABLED=true || MCP_RECON_ENABLED=false
+    [[ "$mcp_kali" == "true" ]] && MCP_KALI_ENABLED=true || MCP_KALI_ENABLED=false
 }
 
 cmd_status() {
@@ -1025,19 +1423,26 @@ cmd_status() {
 
     check_for_updates
 
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" ]]; then
+    # WEB Stack
+    if [[ -n "$WEB_PORT" ]]; then
         echo -e "\n  ${BOLD}WEB Stack${NC} (port ${WEB_PORT})"
         for c in bugtraceai-web-db bugtraceai-web-backend bugtraceai-web-frontend; do
             _print_container_status "$c"
         done
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp" ]]; then
+    # CLI Stack
+    if [[ -n "$CLI_PORT" ]]; then
         echo -e "\n  ${BOLD}CLI Stack${NC} (port ${CLI_PORT})"
         _print_container_status "bugtrace_api"
-        if [[ "$DEPLOY_MODE" == "mcp" ]]; then
-            _print_container_status "bugtrace_mcp"
-        fi
+    fi
+
+    # MCP Agents
+    if $MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
+        echo -e "\n  ${BOLD}MCP Agents${NC}"
+        $MCP_CLI_ENABLED && _print_container_status "bugtrace-cli-mcp"
+        $MCP_RECON_ENABLED && _print_container_status "reconftw-mcp"
+        $MCP_KALI_ENABLED && _print_container_status "kali-mcp-server"
     fi
 
     echo ""
@@ -1046,7 +1451,8 @@ cmd_status() {
     echo -e "  ${BOLD}Endpoints:${NC}"
     [[ -n "$WEB_PORT" ]] && echo -e "    WEB:  ${CYAN}http://localhost:${WEB_PORT}${NC}"
     [[ -n "$CLI_PORT" ]] && echo -e "    CLI:  ${CYAN}http://localhost:${CLI_PORT}${NC}"
-    [[ -n "$MCP_PORT" ]] && echo -e "    MCP:  ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
+    $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]] && echo -e "    BugTraceAI MCP: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
+    $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]] && echo -e "    reconFTW MCP:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
     echo ""
 }
 
@@ -1068,20 +1474,47 @@ cmd_start() {
     load_state
     info "Starting services..."
     local ok=true
-    if [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]]; then
+    
+    # Start WEB services
+    if [[ -d "$WEB_DIR" ]] && [[ -n "$WEB_PORT" ]]; then
         _web_compose up -d || { error "Failed to start WEB services"; ok=false; }
     fi
-    if [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp") ]]; then
+    
+    # Start CLI services
+    if [[ -d "$CLI_DIR" ]] && [[ -n "$CLI_PORT" ]]; then
         _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
     fi
+    
+    # Start MCP agents
+    if [[ -d "$WEB_DIR" ]] && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
+        # Build profiles string
+        local profiles=""
+        $MCP_CLI_ENABLED && profiles="$profiles,cli"
+        $MCP_RECON_ENABLED && profiles="$profiles,recon"
+        $MCP_KALI_ENABLED && profiles="$profiles,kali"
+        profiles="${profiles#,}"
+        
+        COMPOSE_PROFILES="$profiles" _web_compose up -d || { error "Failed to start MCP agents"; ok=false; }
+    fi
+    
     $ok && success "Services started" || warn "Some services failed to start. Run: ./launcher.sh logs"
 }
 
 cmd_stop() {
     load_state
     info "Stopping services..."
-    [[ -d "$CLI_DIR" && ("$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "mcp") ]] && _cli_compose stop
-    [[ -d "$WEB_DIR" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]] && _web_compose stop
+    
+    # Stop MCP agents first
+    if [[ -d "$WEB_DIR" ]] && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
+        _web_compose --profile all-agents stop 2>/dev/null || true
+    fi
+    
+    # Stop CLI
+    [[ -d "$CLI_DIR" ]] && [[ -n "$CLI_PORT" ]] && _cli_compose stop
+    
+    # Stop WEB
+    [[ -d "$WEB_DIR" ]] && [[ -n "$WEB_PORT" ]] && _web_compose stop
+    
     success "Services stopped"
 }
 
@@ -1137,7 +1570,7 @@ cmd_update() {
     info "Updating BugTraceAI..."
     echo ""
 
-    if [[ -d "$WEB_DIR/.git" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full") ]]; then
+    if [[ -d "$WEB_DIR/.git" && ("$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon") ]]; then
         step "Pulling WEB updates..."
         if ! (cd "$WEB_DIR" && git pull --quiet); then
             warn "Failed to pull WEB updates"
@@ -1166,6 +1599,14 @@ cmd_update() {
         else
             echo -e "    ${OK} CLI updated"
         fi
+    fi
+
+    if [[ -d "$RECON_DIR/.git" && ("$DEPLOY_MODE" == "recon" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || $MCP_RECON_ENABLED == true) ]]; then
+        step "Pulling Recon updates..."
+        if ! (cd "$RECON_DIR" && git pull --quiet); then
+            warn "Failed to pull Recon updates"
+        fi
+        echo -e "    ${OK} Recon updated"
     fi
 
     # Clear version cache so next status check fetches fresh data
