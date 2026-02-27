@@ -569,80 +569,73 @@ check_deps() {
 # ── Wizard ───────────────────────────────────────────────────────────────────
 
 wizard_select_components() {
-    # Single multi-select: pick everything you want
-    local -a component_options=()
-    component_options+=("WEB Dashboard           Port 6869   (Browser-based analysis platform)")
-    component_options+=("CLI Scanner             Port 8000   (Autonomous vulnerability scanner)")
-    component_options+=("BugTraceAI MCP          Port 8001   (Core scanner AI agent)")
-    component_options+=("reconFTW MCP            Port 8002   (Reconnaissance by @six2dez)")
-    component_options+=("Kali Linux MCP          Port 8003   (Full pentest toolkit - 3GB+)")
+    # Step 1: Select Base Installation Mode
+    select_option "What would you like to install?" \
+        "BugTraceAI Web + CLI (Full Platform - Recommended)" \
+        "Solo BugTraceAI CLI (Engine Only - Standalone)" \
+        "Solo BugTraceAI WEB (UI Only)"
 
-    # Pre-select WEB + CLI by default
-    PRE_SELECTED=(0 1)
-
-    # Update descriptions for the component menu
-    MCP_DESCRIPTIONS=(
-        "WEB Dashboard: Browser UI for managing scans, reports, and AI agent chat"
-        "CLI Scanner: Headless autonomous scanner with REST API"
-        "BugTraceAI MCP: AI agent for the CLI scanner via MCP protocol"
-        "reconFTW MCP: Automated recon and OSINT — powered by six2dez/reconftw"
-        "Kali Linux MCP: Full pentest toolkit (nmap, nuclei, sqlmap, ffuf) — 3GB+"
-    )
-
-    select_multi "What would you like to install? (SPACE=select, ENTER=confirm)" "${component_options[@]}"
-
-    # Process selections
     INSTALL_WEB=false
     INSTALL_CLI=false
     MCP_CLI_ENABLED=false
     MCP_RECON_ENABLED=false
     MCP_KALI_ENABLED=false
 
-    for idx in "${SELECTED_INDICES[@]}"; do
-        case $idx in
-            0) INSTALL_WEB=true ;;
-            1) INSTALL_CLI=true ;;
-            2) MCP_CLI_ENABLED=true ;;
-            3) MCP_RECON_ENABLED=true ;;
-            4) MCP_KALI_ENABLED=true ;;
-        esac
-    done
+    case $MENU_SELECTION in
+        0) # Web + CLI
+            INSTALL_WEB=true
+            INSTALL_CLI=true
+            MCP_CLI_ENABLED=true
+            DEPLOY_MODE="full"
+            ;;
+        1) # Solo CLI
+            INSTALL_CLI=true
+            DEPLOY_MODE="cli"
+            ;;
+        2) # Solo WEB
+            INSTALL_WEB=true
+            MCP_CLI_ENABLED=true # Needed to talk to a remote CLI
+            DEPLOY_MODE="web"
+            ;;
+    esac
 
-    # Derive DEPLOY_MODE from selections
-    if $INSTALL_WEB && $INSTALL_CLI; then
-        DEPLOY_MODE="full"
-    elif $INSTALL_WEB; then
-        DEPLOY_MODE="web"
-    elif $INSTALL_CLI; then
-        DEPLOY_MODE="cli"
-    else
-        DEPLOY_MODE="custom"
-    fi
-
-    # MCPs are defined in WEB compose, so we need WEB if any MCP is selected
-    if ! $INSTALL_WEB && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
-        INSTALL_WEB=true
-        DEPLOY_MODE="custom"
+    # Step 2: Select Extras (only for Web+CLI or Solo WEB)
+    if $INSTALL_WEB; then
+        echo -e "\n${BOLD}Additional AI Agents (Extras)${NC}"
+        echo -e "  ${DIM}Optional: Add specialized reconnaissance or testing tools to the Chat Agent.${NC}"
+        
+        local -a extra_options=()
+        extra_options+=("reconFTW MCP  (Automated Recon by @six2dez)")
+        extra_options+=("Kali Linux MCP (Full Pentest Toolkit - 3GB+)")
+        
+        # We don't pre-select any extras
+        PRE_SELECTED=()
+        
+        select_multi "Would you like to add any of these extra agents?" "${extra_options[@]}"
+        
+        for idx in "${SELECTED_INDICES[@]}"; do
+            case $idx in
+                0) MCP_RECON_ENABLED=true ;;
+                1) MCP_KALI_ENABLED=true ;;
+            esac
+        done
+        
+        # If any specialized MCP is enabled, we ensure the core CLI agent is also there
+        if $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
+            MCP_CLI_ENABLED=true
+        fi
     fi
 
     echo ""
-
-    # Show what was selected
-    local selected_count=0
-    $INSTALL_WEB && { echo -e "  ${OK} WEB Dashboard"; ((selected_count++)); }
-    $INSTALL_CLI && { echo -e "  ${OK} CLI Scanner"; ((selected_count++)); }
-    $MCP_CLI_ENABLED && { echo -e "  ${OK} BugTraceAI MCP"; ((selected_count++)); }
-    $MCP_RECON_ENABLED && { echo -e "  ${OK} reconFTW MCP (by @six2dez)"; ((selected_count++)); }
-    $MCP_KALI_ENABLED && { echo -e "  ${OK} Kali Linux MCP"; ((selected_count++)); }
-
-    if [[ $selected_count -eq 0 ]]; then
-        warn "Nothing selected! Please select at least one component."
-        wizard_select_components
-        return
-    fi
+    echo -e "${BOLD}Selected Components:${NC}"
+    $INSTALL_WEB && echo -e "  ${OK} WEB Dashboard"
+    $INSTALL_CLI && echo -e "  ${OK} CLI Scanner"
+    $MCP_CLI_ENABLED && echo -e "  ${OK} BugTraceAI MCP (Core Agent)"
+    $MCP_RECON_ENABLED && echo -e "  ${OK} reconFTW MCP (by @six2dez)"
+    $MCP_KALI_ENABLED && echo -e "  ${OK} Kali Linux MCP"
 
     echo ""
-    success "Components configured (mode: $DEPLOY_MODE)"
+    success "Configuration set to $DEPLOY_MODE mode"
     echo ""
 }
 
