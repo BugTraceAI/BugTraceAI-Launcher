@@ -3,7 +3,7 @@
 # BugTraceAI One-Liner Installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/master/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh | sudo bash
 #
 
 set -e
@@ -162,7 +162,7 @@ else
     else
         info "Git clone failed, trying tarball..."
         tmpfile=$(mktemp)
-        if curl -fsSL "https://github.com/BugTraceAI/BugTraceAI-Launcher/archive/refs/heads/master.tar.gz" -o "$tmpfile"; then
+        if curl -fsSL "https://github.com/BugTraceAI/BugTraceAI-Launcher/archive/refs/heads/main.tar.gz" -o "$tmpfile"; then
             mkdir -p "$LAUNCHER_DIR"
             tar xzf "$tmpfile" -C "$LAUNCHER_DIR" --strip-components=1
             rm -f "$tmpfile"
