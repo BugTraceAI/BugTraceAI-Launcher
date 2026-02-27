@@ -197,76 +197,27 @@ propose_port() {
     exit 1
 }
 
-# Interactive arrow-key menu. Sets MENU_SELECTION to chosen index.
+# Numbered selection menu. Sets MENU_SELECTION to chosen index.
 select_option() {
     local question=$1
     shift
     local options=("$@")
-    local selected=0
     local total=${#options[@]}
 
-    # Fallback: numbered menu if tput unavailable
-    if ! command -v tput &>/dev/null || ! tput lines &>/dev/null 2>&1; then
-        echo -e "\n${YELLOW}$question${NC}\n"
-        for i in "${!options[@]}"; do
-            echo -e "  ${CYAN}$((i + 1)))${NC} ${options[$i]}"
-        done
-        echo ""
-        while true; do
-            read -rp "$(echo -e "${YELLOW}Choice [1-$total]: ${NC}")" choice
-            if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$total" ]]; then
-                MENU_SELECTION=$((choice - 1))
-                return 0
-            fi
-            error "Enter a number between 1 and $total"
-        done
-    fi
-
-    # Interactive menu with arrow keys
-    local total_lines=$((total + 2))
-    local first_draw=true
-
-    trap 'tput cnorm 2>/dev/null' INT TERM
-    tput civis
+    echo -e "\n${YELLOW}$question${NC}\n"
+    for i in "${!options[@]}"; do
+        echo -e "  ${CYAN}$((i + 1)))${NC} ${options[$i]}"
+    done
+    echo ""
 
     while true; do
-        if [[ "$first_draw" == true ]]; then
-            first_draw=false
-        else
-            tput cuu "$total_lines" 2>/dev/null
+        read -rp "$(echo -e "${YELLOW}Choice [1-$total]: ${NC}")" choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$total" ]]; then
+            MENU_SELECTION=$((choice - 1))
+            return 0
         fi
-
-        echo -e "\033[K${YELLOW}$question${NC}"
-        echo -e "\033[K"
-
-        for i in "${!options[@]}"; do
-            if [[ $i -eq $selected ]]; then
-                echo -e "\033[K  ${CYAN}❯${NC} ${BOLD}${options[$i]}${NC}"
-            else
-                echo -e "\033[K    ${DIM}${options[$i]}${NC}"
-            fi
-        done
-
-        read -rsn1 key
-        case "$key" in
-            $'\x1b')
-                read -rsn1 -t 0.5 k1
-                read -rsn1 -t 0.5 k2
-                case "${k1}${k2}" in
-                    "[A") ((selected > 0)) && ((selected--)) || selected=$((total - 1)) ;;
-                    "[B") ((selected < total - 1)) && ((selected++)) || selected=0 ;;
-                esac
-                ;;
-            k) ((selected > 0)) && ((selected--)) || selected=$((total - 1)) ;;
-            j) ((selected < total - 1)) && ((selected++)) || selected=0 ;;
-            "") break ;;
-        esac
+        error "Please enter a number between 1 and $total"
     done
-
-    tput cnorm
-    trap - INT TERM
-
-    MENU_SELECTION=$selected
 }
 
 # MCP Descriptions for multi-select menu
@@ -278,14 +229,14 @@ MCP_DESCRIPTIONS=(
 
 # Multi-select menu with SPACE to toggle, ENTER to confirm
 # Returns SELECTED_INDICES array with indices of selected options
+# Numbered multi-select menu. Returns SELECTED_INDICES array.
 select_multi() {
     local question=$1
     shift
     local -a options=("$@")
-    local -a selected=()
-    local current=0
     local total=${#options[@]}
-    
+    local -a selected=()
+
     # Initialize all as unselected (false)
     for i in "${!options[@]}"; do
         selected[$i]=false
@@ -298,85 +249,35 @@ select_multi() {
         fi
     done
 
-    # Fallback: numbered menu if tput unavailable
-    if ! command -v tput &>/dev/null || ! tput lines &>/dev/null 2>&1; then
+    while true; do
         echo -e "\n${YELLOW}$question${NC}\n"
         for i in "${!options[@]}"; do
-            echo -e "  ${CYAN}$((i + 1)))${NC} ${options[$i]}"
+            local mark="◯"
+            ${selected[$i]} && mark="◉"
+            echo -e "  ${CYAN}$((i + 1)))${NC} [${mark}] ${options[$i]}"
         done
         echo ""
-        echo -e "  ${DIM}Enter numbers separated by spaces (e.g., 1 3 4) or press ENTER for none:${NC}"
+        echo -e "  ${DIM}Enter numbers to toggle selections (e.g., '1 3'), or press ENTER to confirm current setup.${NC}"
         read -rp "$(echo -e "${YELLOW}Selection: ${NC}")" choices
-        
-        SELECTED_INDICES=()
-        for num in $choices; do
-            if [[ "$num" =~ ^[0-9]+$ ]] && [[ "$num" -ge 1 ]] && [[ "$num" -le "$total" ]]; then
-                SELECTED_INDICES+=($((num - 1)))
-            fi
-        done
-        return 0
-    fi
 
-    # Interactive multi-select with arrow keys + space
-    local total_lines=$((total + 7))
-    local first_draw=true
-
-    trap 'tput cnorm 2>/dev/null' INT TERM
-    tput civis
-
-    while true; do
-        if [[ "$first_draw" == true ]]; then
-            first_draw=false
-        else
-            tput cuu "$total_lines" 2>/dev/null
+        if [[ -z "$choices" ]]; then
+            break
         fi
 
-        echo -e "\033[K${YELLOW}$question${NC}"
-        echo -e "\033[K  ${DIM}Use ↑/↓ to navigate, SPACE to select, ENTER to confirm${NC}"
-        echo -e "\033[K"
-
-        for i in "${!options[@]}"; do
-            local checkbox="◯"
-            ${selected[$i]} && checkbox="◉"
-
-            if [[ $i -eq $current ]]; then
-                echo -e "\033[K  ${CYAN}❯${NC} ${BOLD}${checkbox} ${options[$i]}${NC}"
+        for num in $choices; do
+            if [[ "$num" =~ ^[0-9]+$ ]] && [[ "$num" -ge 1 ]] && [[ "$num" -le "$total" ]]; then
+                local idx=$((num - 1))
+                if ${selected[$idx]}; then
+                    selected[$idx]=false
+                else
+                    selected[$idx]=true
+                fi
             else
-                echo -e "\033[K    ${DIM}${checkbox} ${options[$i]}${NC}"
+                warn "Ignoring invalid choice: $num"
             fi
         done
-
-        # Show description for current item
-        echo -e "\033[K"
-        echo -e "\033[K  ${DIM}└─ ${MCP_DESCRIPTIONS[$current]:-""}${NC}"
-
-        read -rsn1 key
-        case "$key" in
-            $'\x1b')
-                read -rsn1 -t 0.5 k1
-                read -rsn1 -t 0.5 k2
-                case "${k1}${k2}" in
-                    "[A") ((current > 0)) && ((current--)) || current=$((total - 1)) ;;
-                    "[B") ((current < total - 1)) && ((current++)) || current=0 ;;
-                esac
-                ;;
-            k) ((current > 0)) && ((current--)) || current=$((total - 1)) ;;
-            j) ((current < total - 1)) && ((current++)) || current=0 ;;
-            " ")  # SPACE - toggle selection
-                if ${selected[$current]}; then
-                    selected[$current]=false
-                else
-                    selected[$current]=true
-                fi
-                ;;
-            "") break ;;
-        esac
     done
 
-    tput cnorm
-    trap - INT TERM
-
-    # Return selected indices
     SELECTED_INDICES=()
     for i in "${!selected[@]}"; do
         ${selected[$i]} && SELECTED_INDICES+=($i)
