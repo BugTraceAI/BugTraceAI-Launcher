@@ -105,10 +105,18 @@ BANNER
 # ── Utility Functions ────────────────────────────────────────────────────────
 
 port_available() {
+    local port=$1
+    # Check if port was already selected in THIS session
+    [[ "$port" == "$WEB_PORT" ]] && return 1
+    [[ "$port" == "$CLI_PORT" ]] && return 1
+    [[ "$port" == "$MCP_PORT" ]] && return 1
+    [[ "$port" == "$RECON_PORT" ]] && return 1
+    [[ "$port" == "$KALI_PORT" ]] && return 1
+
     if $IS_MACOS; then
-        ! lsof -i ":$1" -sTCP:LISTEN &>/dev/null
+        ! lsof -i ":$port" -sTCP:LISTEN &>/dev/null
     else
-        ! (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":$1 "
+        ! (ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null) | grep -q ":$port "
     fi
 }
 
@@ -1118,24 +1126,15 @@ start_services() {
         echo ""
         step "Starting MCP agents (profiles: ${COMPOSE_PROFILES})..."
         
-        if $MCP_CLI_ENABLED; then
-            echo -e "    ${DIM}Starting BugTraceAI MCP...${NC}"
-        fi
-        if $MCP_RECON_ENABLED; then
-            echo -e "    ${DIM}Starting reconFTW MCP...${NC}"
-        fi
-        if $MCP_KALI_ENABLED; then
-            echo -e "    ${DIM}Starting Kali Linux MCP (this may take a while)...${NC}"
-        fi
+        # Convert comma-separated profiles to individual --profile flags
+        local profile_flags=""
+        IFS=',' read -ra ADDR <<< "$COMPOSE_PROFILES"
+        for profile in "${ADDR[@]}"; do
+            profile_flags="$profile_flags --profile $profile"
+        done
 
-        if ! _web_compose --profile all-agents up -d --build 2>/dev/null; then
-            # Fallback: try individual profiles
-            for profile in cli recon kali; do
-                if [[ "$COMPOSE_PROFILES" == *"$profile"* ]]; then
-                    _web_compose --profile "$profile" up -d --build 2>/dev/null || \
-                        warn "Failed to start $profile MCP agent"
-                fi
-            done
+        if ! _web_compose $profile_flags up -d --build; then
+            error "Failed to start MCP agents"
         fi
         
         $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI MCP started"
