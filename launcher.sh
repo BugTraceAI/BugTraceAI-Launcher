@@ -1036,7 +1036,11 @@ EOF
 patch_compose() {
     # Build COMPOSE_PROFILES based on MCP selection
     local profiles=""
-    $MCP_CLI_ENABLED && profiles="$profiles,cli"
+    # If the user is installing the CLI standalone/full mode, the CLI's own docker-compose
+    # runs the MCP. We only want the WEB to run the 'cli' mcp profile if we are in "Solo WEB" mode.
+    if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
+        profiles="$profiles,cli"
+    fi
     $MCP_RECON_ENABLED && profiles="$profiles,recon"
     $MCP_KALI_ENABLED && profiles="$profiles,kali"
     # Remove leading comma
@@ -1149,7 +1153,11 @@ wait_for_url() {
     local elapsed=0 interval=3
 
     while [[ $elapsed -lt $timeout ]]; do
-        if curl -sf "$url" &>/dev/null; then
+        # Use --max-time 2 so it doesn't hang forever on SSE streams.
+        # Exit code 28 means it successfully connected but timed out (which is expected for SSE endpoints).
+        curl -sf --max-time 2 "$url" &>/dev/null
+        local res=$?
+        if [[ $res -eq 0 || $res -eq 28 ]]; then
             printf "\r    ${OK} %-30s\n" "$label"
             return 0
         fi
