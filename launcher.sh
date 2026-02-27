@@ -57,6 +57,8 @@ LLM_PROVIDER="openrouter"
 MENU_SELECTION=0
 
 # MCP Selection state
+INSTALL_WEB=false
+INSTALL_CLI=false
 MCP_CLI_ENABLED=false
 MCP_RECON_ENABLED=false
 MCP_KALI_ENABLED=false
@@ -248,8 +250,9 @@ select_option() {
         read -rsn1 key
         case "$key" in
             $'\x1b')
-                read -rsn2 -t 0.1 key
-                case "$key" in
+                read -rsn1 -t 0.5 k1
+                read -rsn1 -t 0.5 k2
+                case "${k1}${k2}" in
                     "[A") ((selected > 0)) && ((selected--)) || selected=$((total - 1)) ;;
                     "[B") ((selected < total - 1)) && ((selected++)) || selected=0 ;;
                 esac
@@ -350,8 +353,9 @@ select_multi() {
         read -rsn1 key
         case "$key" in
             $'\x1b')
-                read -rsn2 -t 0.1 k2
-                case "$k2" in
+                read -rsn1 -t 0.5 k1
+                read -rsn1 -t 0.5 k2
+                case "${k1}${k2}" in
                     "[A") ((current > 0)) && ((current--)) || current=$((total - 1)) ;;
                     "[B") ((current < total - 1)) && ((current++)) || current=0 ;;
                 esac
@@ -663,24 +667,81 @@ check_deps() {
 
 # ── Wizard ───────────────────────────────────────────────────────────────────
 
-wizard_select_mode() {
-    select_option "What would you like to install?" \
-        "Full Platform (WEB + CLI + MCP) — Recommended" \
-        "Standalone WEB — Browser-based analysis" \
-        "Standalone CLI — Autonomous scanner" \
-        "reconFTW MCP — Reconnaissance automation" \
-        "Custom Setup — Choose MCP agents manually"
+wizard_select_components() {
+    # Single multi-select: pick everything you want
+    local -a component_options=()
+    component_options+=("WEB Dashboard           Port 6869   (Browser-based analysis platform)")
+    component_options+=("CLI Scanner             Port 8000   (Autonomous vulnerability scanner)")
+    component_options+=("BugTraceAI MCP          Port 8001   (Core scanner AI agent)")
+    component_options+=("reconFTW MCP            Port 8002   (Reconnaissance by @six2dez)")
+    component_options+=("Kali Linux MCP          Port 8003   (Full pentest toolkit - 3GB+)")
 
-    case $MENU_SELECTION in
-        0) DEPLOY_MODE="full" ;;
-        1) DEPLOY_MODE="web" ;;
-        2) DEPLOY_MODE="cli" ;;
-        3) DEPLOY_MODE="recon" ;;
-        4) DEPLOY_MODE="custom" ;;
-    esac
+    # Pre-select WEB + CLI by default
+    PRE_SELECTED=(0 1)
+
+    # Update descriptions for the component menu
+    MCP_DESCRIPTIONS=(
+        "WEB Dashboard: Browser UI for managing scans, reports, and AI agent chat"
+        "CLI Scanner: Headless autonomous scanner with REST API"
+        "BugTraceAI MCP: AI agent for the CLI scanner via MCP protocol"
+        "reconFTW MCP: Automated recon and OSINT — powered by six2dez/reconftw"
+        "Kali Linux MCP: Full pentest toolkit (nmap, nuclei, sqlmap, ffuf) — 3GB+"
+    )
+
+    select_multi "What would you like to install? (SPACE=select, ENTER=confirm)" "${component_options[@]}"
+
+    # Process selections
+    INSTALL_WEB=false
+    INSTALL_CLI=false
+    MCP_CLI_ENABLED=false
+    MCP_RECON_ENABLED=false
+    MCP_KALI_ENABLED=false
+
+    for idx in "${SELECTED_INDICES[@]}"; do
+        case $idx in
+            0) INSTALL_WEB=true ;;
+            1) INSTALL_CLI=true ;;
+            2) MCP_CLI_ENABLED=true ;;
+            3) MCP_RECON_ENABLED=true ;;
+            4) MCP_KALI_ENABLED=true ;;
+        esac
+    done
+
+    # Derive DEPLOY_MODE from selections
+    if $INSTALL_WEB && $INSTALL_CLI; then
+        DEPLOY_MODE="full"
+    elif $INSTALL_WEB; then
+        DEPLOY_MODE="web"
+    elif $INSTALL_CLI; then
+        DEPLOY_MODE="cli"
+    else
+        DEPLOY_MODE="custom"
+    fi
+
+    # MCPs are defined in WEB compose, so we need WEB if any MCP is selected
+    if ! $INSTALL_WEB && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
+        INSTALL_WEB=true
+        DEPLOY_MODE="custom"
+    fi
 
     echo ""
-    success "Mode: $DEPLOY_MODE"
+
+    # Show what was selected
+    local selected_count=0
+    $INSTALL_WEB && { echo -e "  ${OK} WEB Dashboard"; ((selected_count++)); }
+    $INSTALL_CLI && { echo -e "  ${OK} CLI Scanner"; ((selected_count++)); }
+    $MCP_CLI_ENABLED && { echo -e "  ${OK} BugTraceAI MCP"; ((selected_count++)); }
+    $MCP_RECON_ENABLED && { echo -e "  ${OK} reconFTW MCP (by @six2dez)"; ((selected_count++)); }
+    $MCP_KALI_ENABLED && { echo -e "  ${OK} Kali Linux MCP"; ((selected_count++)); }
+
+    if [[ $selected_count -eq 0 ]]; then
+        warn "Nothing selected! Please select at least one component."
+        wizard_select_components
+        return
+    fi
+
+    echo ""
+    success "Components configured (mode: $DEPLOY_MODE)"
     echo ""
 }
 
@@ -756,68 +817,15 @@ wizard_ask_api_key() {
     echo ""
 }
 
-# ── MCP Selection Wizard ───────────────────────────────────────────────────────
-
-wizard_select_mcps() {
-    echo -e "${BOLD}MCP Agent Selection${NC}"
-    echo -e "  ${DIM}Select AI-powered security agents to install:${NC}"
-    echo ""
-
-    # Build options list with port info
-    local -a mcp_options=()
-    mcp_options+=("BugTraceAI Scanner     Port 8001   (Core vulnerability scanner)")
-    mcp_options+=("reconFTW Reconnaissance Port 8002   (Subdomain & OSINT automation by @six2dez)")
-    mcp_options+=("Kali Linux Tools       Port 8003   (Full pentest toolkit - 3GB+)")
-
-    # Pre-select based on mode (via global PRE_SELECTED for select_multi)
-    PRE_SELECTED=()
-    if [[ "$DEPLOY_MODE" != "web" && "$DEPLOY_MODE" != "recon" ]]; then
-        PRE_SELECTED+=(0)
-    fi
-    if [[ "$DEPLOY_MODE" == "recon" ]]; then
-        PRE_SELECTED+=(1)
-    fi
-
-    select_multi "Which MCP agents would you like to install?" "${mcp_options[@]}"
-
-    # Process selections
-    MCP_CLI_ENABLED=false
-    MCP_RECON_ENABLED=false
-    MCP_KALI_ENABLED=false
-
-    for idx in "${SELECTED_INDICES[@]}"; do
-        case $idx in
-            0) MCP_CLI_ENABLED=true ;;
-            1) MCP_RECON_ENABLED=true ;;
-            2) MCP_KALI_ENABLED=true ;;
-        esac
-    done
-
-    echo ""
-    
-    # Show what was selected
-    local selected_count=0
-    $MCP_CLI_ENABLED && { echo -e "  ${OK} BugTraceAI Scanner selected"; ((selected_count++)); }
-    $MCP_RECON_ENABLED && { echo -e "  ${OK} reconFTW Reconnaissance selected"; ((selected_count++)); }
-    $MCP_KALI_ENABLED && { echo -e "  ${OK} Kali Linux Tools selected"; ((selected_count++)); }
-    
-    if [[ $selected_count -eq 0 ]]; then
-        echo -e "  ${DIM}No MCP agents selected${NC}"
-    fi
-    
-    echo ""
-    success "MCP agents configured"
-    echo ""
-}
 
 wizard_configure_ports() {
     echo -e "${BOLD}Port Configuration${NC}"
 
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+    if $INSTALL_WEB; then
         propose_port "WEB frontend port" 6869 WEB_PORT
     fi
 
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
+    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
         propose_port "CLI API port" 8000 CLI_PORT
     fi
 
@@ -931,8 +939,7 @@ run_wizard() {
 
     check_for_updates
     check_deps
-    wizard_select_mode
-    wizard_select_mcps
+    wizard_select_components
     wizard_select_provider
     wizard_ask_api_key
     wizard_configure_ports
@@ -960,7 +967,7 @@ deploy() {
 
 clone_repos() {
     # Clone WEB repo if needed
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+    if $INSTALL_WEB; then
         if [[ -n "$WEB_PORT" ]]; then
             if [[ -d "$WEB_DIR/.git" ]]; then
                 step "Updating BugTraceAI-WEB..."
@@ -981,8 +988,8 @@ clone_repos() {
         fi
     fi
 
-    # Clone CLI repo if any MCP is enabled or CLI mode
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
+    # Clone CLI repo if needed
+    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
         if [[ -d "$CLI_DIR/.git" ]]; then
             step "Updating BugTraceAI-CLI..."
             if ! (cd "$CLI_DIR" && git pull --quiet) 2>/dev/null; then
@@ -1024,7 +1031,7 @@ generate_env() {
     step "Generating configuration..."
 
     # WEB configuration
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
+    if $INSTALL_WEB; then
         if [[ -n "$WEB_PORT" ]]; then
             # In full/custom mode, use nginx proxy path so the UI works from any device on the network.
             local cli_url=""
@@ -1055,7 +1062,7 @@ EOF
     fi
 
     # CLI configuration
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
+    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
         local cors="*"
         [[ -n "$WEB_PORT" ]] && cors="http://localhost:${WEB_PORT}"
 
@@ -1133,7 +1140,7 @@ patch_compose() {
     export COMPOSE_PROFILES="$profiles"
 
     # Patch CLI docker-compose if CLI or any MCP is enabled
-    if [[ -f "$CLI_DIR/docker-compose.yml" ]] && { [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; }; then
+    if [[ -f "$CLI_DIR/docker-compose.yml" ]] && { $INSTALL_CLI || $MCP_CLI_ENABLED; }; then
         local compose="$CLI_DIR/docker-compose.yml"
 
         # Remove entire environment section (CORS is loaded from .env via env_file)
@@ -1179,25 +1186,23 @@ _cli_compose() {
 
 start_services() {
     # Start WEB services
-    if [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
-        if [[ -n "$WEB_PORT" ]]; then
-            if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
-                error "WEB docker-compose.yml not found — clone may have failed."
-                exit 1
-            fi
-            echo ""
-            step "Building & starting WEB services..."
-            echo -e "    ${DIM}(postgres + backend + frontend — may take 5-10 min on first run)${NC}"
-            if ! _web_compose up -d --build; then
-                error "Failed to start WEB services. Run: ./launcher.sh logs web"
-                exit 1
-            fi
-            echo -e "    ${OK} WEB services started"
+    if $INSTALL_WEB && [[ -n "$WEB_PORT" ]]; then
+        if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
+            error "WEB docker-compose.yml not found — clone may have failed."
+            exit 1
         fi
+        echo ""
+        step "Building & starting WEB services..."
+        echo -e "    ${DIM}(postgres + backend + frontend — may take 5-10 min on first run)${NC}"
+        if ! _web_compose up -d --build; then
+            error "Failed to start WEB services. Run: ./launcher.sh logs web"
+            exit 1
+        fi
+        echo -e "    ${OK} WEB services started"
     fi
 
     # Start CLI service
-    if [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] || $MCP_CLI_ENABLED; then
+    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
         if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
             error "CLI docker-compose.yml not found — clone may have failed."
             exit 1
@@ -1413,6 +1418,12 @@ load_state() {
     [[ "$mcp_cli" == "true" ]] && MCP_CLI_ENABLED=true || MCP_CLI_ENABLED=false
     [[ "$mcp_recon" == "true" ]] && MCP_RECON_ENABLED=true || MCP_RECON_ENABLED=false
     [[ "$mcp_kali" == "true" ]] && MCP_KALI_ENABLED=true || MCP_KALI_ENABLED=false
+
+    # Derive install flags from state
+    INSTALL_WEB=false
+    INSTALL_CLI=false
+    [[ -n "$WEB_PORT" ]] && INSTALL_WEB=true
+    [[ -n "$CLI_PORT" ]] && INSTALL_CLI=true
 }
 
 cmd_status() {
