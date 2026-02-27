@@ -601,24 +601,26 @@ wizard_select_components() {
 
     # Step 2: Select Extras (only for Web+CLI or Solo WEB)
     if $INSTALL_WEB; then
-        echo -e "\n${BOLD}Additional AI Agents (Extras)${NC}"
-        echo -e "  ${DIM}Optional: Add specialized reconnaissance or testing tools to the Chat Agent.${NC}"
+        select_option "Would you like to add any additional AI Agents (MCPs) for the Chat?" \
+            "Add BOTH (Full Pack: Kali + reconFTW)" \
+            "Add Kali Linux MCP (Full Pentest Toolkit - 3GB+)" \
+            "Add reconFTW MCP (OSINT & Subdomains by @six2dez)" \
+            "NONE (Only BugTraceAI core components)"
         
-        local -a extra_options=()
-        extra_options+=("reconFTW MCP  (Automated Recon by @six2dez)")
-        extra_options+=("Kali Linux MCP (Full Pentest Toolkit - 3GB+)")
-        
-        # We don't pre-select any extras
-        PRE_SELECTED=()
-        
-        select_multi "Would you like to add any of these extra agents?" "${extra_options[@]}"
-        
-        for idx in "${SELECTED_INDICES[@]}"; do
-            case $idx in
-                0) MCP_RECON_ENABLED=true ;;
-                1) MCP_KALI_ENABLED=true ;;
-            esac
-        done
+        case $MENU_SELECTION in
+            0) # BOTH
+                MCP_KALI_ENABLED=true
+                MCP_RECON_ENABLED=true
+                ;;
+            1) # Kali
+                MCP_KALI_ENABLED=true
+                ;;
+            2) # Recon
+                MCP_RECON_ENABLED=true
+                ;;
+            3) # None
+                ;;
+        esac
         
         # If any specialized MCP is enabled, we ensure the core CLI agent is also there
         if $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
