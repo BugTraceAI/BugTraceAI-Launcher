@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BugTraceAI Launcher v2.5.0
+# BugTraceAI Launcher v2.5.1
 # One-command deployment for the BugTraceAI security platform
 #
 # Usage: ./launcher.sh [command]
@@ -23,7 +23,7 @@ fi
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"

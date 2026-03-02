@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
-  <img src="https://img.shields.io/badge/Version-2.0.0-blue" />
+  <img src="https://img.shields.io/badge/Version-2.5.1-blue" />
   <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
@@ -43,15 +43,15 @@ The wizard will guide you step by step: choose deployment mode, enter your OpenR
 
 ## Requirements
 
-| Requirement | Details |
-|-------------|---------|
-| **OS** | Linux (x86_64) or macOS (Intel / Apple Silicon) |
-| **Docker** | 24.0+ with Docker Compose v2 — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS |
-| **Git** | Any recent version |
-| **curl** | For the one-liner installer |
-| **RAM** | 4 GB minimum (8 GB recommended) |
-| **Disk** | 10 GB free space |
-| **OpenRouter API Key** | [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`) |
+| Requirement            | Details                                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- |
+| **OS**                 | Linux (x86_64) or macOS (Intel / Apple Silicon)                                                           |
+| **Docker**             | 24.0+ with Docker Compose v2 — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS |
+| **Git**                | Any recent version                                                                                        |
+| **curl**               | For the one-liner installer                                                                               |
+| **RAM**                | 4 GB minimum (8 GB recommended)                                                                           |
+| **Disk**               | 10 GB free space                                                                                          |
+| **OpenRouter API Key** | [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`)                                   |
 
 ### Auto-Installation (Linux)
 
@@ -71,11 +71,11 @@ Install [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/) b
 
 The wizard presents three deployment options:
 
-| Mode | What gets deployed | Use case |
-|------|--------------------|----------|
-| **Full Platform** (WEB + CLI) | Both stacks, auto-connected | Complete security workflow with UI |
-| **Standalone WEB** | Browser-based dashboard only | Manual analysis, report management |
-| **Standalone CLI** | Headless autonomous scanner only | CI/CD pipelines, automation, API-only |
+| Mode                          | What gets deployed               | Use case                              |
+| ----------------------------- | -------------------------------- | ------------------------------------- |
+| **Full Platform** (WEB + CLI) | Both stacks, auto-connected      | Complete security workflow with UI    |
+| **Standalone WEB**            | Browser-based dashboard only     | Manual analysis, report management    |
+| **Standalone CLI**            | Headless autonomous scanner only | CI/CD pipelines, automation, API-only |
 
 In **Full** mode the launcher automatically configures CORS and points the WEB frontend to the CLI API — no manual wiring needed.
 
@@ -126,12 +126,12 @@ Each stack runs its own independent Docker Compose project. In **Full** mode, th
 
 ### Default Ports
 
-| Service | Port | Stack |
-|---------|------|-------|
-| WEB Frontend (Nginx) | **6869** | WEB |
-| WEB Backend (Express) | 3001 (internal) | WEB |
-| PostgreSQL | 5432 (internal) | WEB |
-| CLI API (FastAPI) | **8000** | CLI |
+| Service               | Port            | Stack |
+| --------------------- | --------------- | ----- |
+| WEB Frontend (Nginx)  | **6869**        | WEB   |
+| WEB Backend (Express) | 3001 (internal) | WEB   |
+| PostgreSQL            | 5432 (internal) | WEB   |
+| CLI API (FastAPI)     | **8000**        | CLI   |
 
 Ports marked **(internal)** are only accessible between containers. The wizard auto-detects busy ports and proposes the next available one.
 
@@ -158,19 +158,19 @@ BUGTRACEAI_DIR=/srv/bugtraceai ./launcher.sh
 
 ### WEB config: `~/bugtraceai/BugTraceAI-WEB/.env.docker`
 
-| Variable | Description |
-|----------|-------------|
-| `POSTGRES_USER` | Database user (default: `bugtraceai`) |
-| `POSTGRES_PASSWORD` | Database password (auto-generated, 24 chars) |
-| `POSTGRES_DB` | Database name (default: `bugtraceai_web`) |
-| `FRONTEND_PORT` | Public frontend port (default: `6869`) |
-| `VITE_CLI_API_URL` | CLI API URL (auto-set in Full mode, empty in Standalone WEB) |
+| Variable            | Description                                                  |
+| ------------------- | ------------------------------------------------------------ |
+| `POSTGRES_USER`     | Database user (default: `bugtraceai`)                        |
+| `POSTGRES_PASSWORD` | Database password (auto-generated, 24 chars)                 |
+| `POSTGRES_DB`       | Database name (default: `bugtraceai_web`)                    |
+| `FRONTEND_PORT`     | Public frontend port (default: `6869`)                       |
+| `VITE_CLI_API_URL`  | CLI API URL (auto-set in Full mode, empty in Standalone WEB) |
 
 ### CLI config: `~/bugtraceai/BugTraceAI-CLI/.env`
 
-| Variable | Description |
-|----------|-------------|
-| `OPENROUTER_API_KEY` | Your OpenRouter API key |
+| Variable                | Description                                                                     |
+| ----------------------- | ------------------------------------------------------------------------------- |
+| `OPENROUTER_API_KEY`    | Your OpenRouter API key                                                         |
 | `BUGTRACE_CORS_ORIGINS` | Allowed origins (`*` in Standalone CLI, `http://localhost:<port>` in Full mode) |
 
 After editing configs, restart for changes to take effect:
