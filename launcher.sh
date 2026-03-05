@@ -16,11 +16,6 @@
 #   uninstall     Remove everything
 #
 
-# ── Restore stdin if piped (e.g. curl | bash) ───────────────────────────────
-if [ ! -t 0 ]; then
-    exec </dev/tty
-fi
-
 # ── Constants ────────────────────────────────────────────────────────────────
 
 VERSION="2.5.0"
@@ -134,7 +129,7 @@ find_free_port() {
 }
 
 generate_password() {
-    tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-24}"
+    LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-24}"
 }
 
 # Portable lowercase (macOS ships Bash 3.2 which lacks ${var,,})
@@ -156,6 +151,221 @@ sed_inplace() {
     else
         sed -i "$@"
     fi
+}
+
+ensure_macos_docker_path() {
+    for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
+        if [[ -x "$p/docker" ]]; then
+            export PATH="$p:$PATH"
+        fi
+    done
+    hash -r
+}
+
+detect_compose_cmd() {
+    COMPOSE_CMD=""
+    if docker compose version &>/dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &>/dev/null && docker-compose version &>/dev/null 2>&1; then
+        COMPOSE_CMD="docker-compose"
+    fi
+}
+
+wait_for_docker_daemon() {
+    local timeout=${1:-120}
+    local elapsed=0
+    local interval=3
+    while [[ $elapsed -lt $timeout ]]; do
+        if docker info &>/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
+ensure_homebrew() {
+    if command -v brew &>/dev/null; then
+        return 0
+    fi
+
+    warn "Homebrew is required for automated macOS dependency installation."
+    read -rp "$(echo -e "${YELLOW}Install Homebrew now? [Y/n]: ${NC}")" confirm
+    if [[ "$(to_lower "${confirm:-}")" == "n" ]]; then
+        return 1
+    fi
+
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || return 1
+
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    elif [[ -x /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+    fi
+
+    command -v brew &>/dev/null
+}
+
+ensure_macos_brew_packages() {
+    local formulas=("$@")
+    local missing=()
+    local formula
+    for formula in "${formulas[@]}"; do
+        if ! brew list --formula "$formula" &>/dev/null; then
+            missing+=("$formula")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    info "Installing Homebrew packages: ${missing[*]}"
+    brew install "${missing[@]}"
+}
+
+colima_profile_arch() {
+    colima list 2>/dev/null | awk 'NR==2{print $3}'
+}
+
+maybe_fix_colima_arch() {
+    # On Apple Silicon, running an x86_64 Colima VM causes image arch mismatches.
+    if [[ "$(uname -m)" != "arm64" ]]; then
+        return 0
+    fi
+
+    local arch
+    arch="$(colima_profile_arch)"
+    if [[ "$arch" != "x86_64" ]]; then
+        return 0
+    fi
+
+    warn "Detected Colima profile arch=x86_64 on Apple Silicon."
+    warn "This can fail with container image format errors."
+    read -rp "$(echo -e "${YELLOW}Recreate Colima as arm64 (aarch64)? [Y/n]: ${NC}")" confirm
+    if [[ "$(to_lower "${confirm:-}")" == "n" ]]; then
+        warn "Continuing with x86_64 Colima profile (may fail for some images)."
+        return 0
+    fi
+
+    info "Recreating Colima profile with arm64 architecture..."
+    colima stop >/dev/null 2>&1 || true
+    colima delete -f >/dev/null 2>&1 || true
+}
+
+ensure_docker_desktop_runtime() {
+    ensure_macos_docker_path
+
+    if docker info &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ ! -d "/Applications/Docker.app" ]]; then
+        if ! ensure_homebrew; then
+            error "Homebrew is required to install Docker Desktop automatically."
+            return 1
+        fi
+        info "Installing Docker Desktop..."
+        brew install --cask docker
+    fi
+
+    info "Starting Docker Desktop..."
+    open -a Docker || true
+
+    if wait_for_docker_daemon 150; then
+        ensure_macos_docker_path
+        return 0
+    fi
+
+    error "Docker Desktop did not become ready in time."
+    return 1
+}
+
+ensure_colima_runtime() {
+    ensure_macos_docker_path
+
+    if ! ensure_homebrew; then
+        error "Homebrew is required for Colima setup."
+        return 1
+    fi
+
+    ensure_macos_brew_packages docker docker-compose colima qemu lima-additional-guestagents
+    ensure_macos_docker_path
+    maybe_fix_colima_arch
+
+    if docker info &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    info "Starting Colima (Docker runtime)..."
+    local start_cmd=(colima start --runtime docker)
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        start_cmd+=(--arch aarch64)
+    fi
+    local start_output
+    start_output=$("${start_cmd[@]}" 2>&1) || {
+        if echo "$start_output" | grep -qi "guest agent"; then
+            warn "Missing Lima guest agents detected. Installing helper package and retrying..."
+            ensure_macos_brew_packages lima-additional-guestagents || true
+            "${start_cmd[@]}" >/dev/null 2>&1 || {
+                error "Colima failed to start."
+                echo "$start_output" >&2
+                return 1
+            }
+        else
+            error "Colima failed to start."
+            echo "$start_output" >&2
+            return 1
+        fi
+    }
+
+    if wait_for_docker_daemon 90; then
+        detect_compose_cmd
+        return 0
+    fi
+
+    error "Docker daemon did not become ready after Colima start."
+    return 1
+}
+
+ensure_macos_runtime_ready() {
+    ensure_macos_docker_path
+    detect_compose_cmd
+
+    if docker info &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    local has_colima=false
+    local has_docker_desktop=false
+    command -v colima &>/dev/null && has_colima=true
+    [[ -d "/Applications/Docker.app" ]] && has_docker_desktop=true
+
+    if $has_colima; then
+        read -rp "$(echo -e "${YELLOW}Docker daemon is down. Start Colima now? [Y/n]: ${NC}")" confirm_colima
+        if [[ "$(to_lower "${confirm_colima:-}")" != "n" ]] && ensure_colima_runtime; then
+            return 0
+        fi
+    fi
+
+    if $has_docker_desktop; then
+        read -rp "$(echo -e "${YELLOW}Start Docker Desktop instead? [y/N]: ${NC}")" confirm_desktop
+        if [[ "$(to_lower "${confirm_desktop:-}")" == "y" ]] && ensure_docker_desktop_runtime; then
+            return 0
+        fi
+    fi
+
+    echo ""
+    select_option "Select container runtime for macOS setup:" \
+        "Colima (Docker Desktop-free, recommended for OSS stack)" \
+        "Docker Desktop"
+
+    case $MENU_SELECTION in
+        0) ensure_colima_runtime ;;
+        1) ensure_docker_desktop_runtime ;;
+        *) return 1 ;;
+    esac
 }
 
 # Propose port with max 3 attempts. Exits if none accepted.
@@ -423,28 +633,24 @@ check_for_updates() {
 
 # ── Pre-flight Checks ───────────────────────────────────────────────────────
 
-# On macOS, Docker Desktop may not be in PATH by default
-if $IS_MACOS && ! command -v docker &>/dev/null; then
-    for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
-        if [[ -x "$p/docker" ]]; then
-            export PATH="$p:$PATH"
-            break
-        fi
-    done
+if $IS_MACOS; then
+    ensure_macos_docker_path
 fi
-
-# Detect docker compose command
-COMPOSE_CMD=""
-if docker compose version &>/dev/null; then
-    COMPOSE_CMD="docker compose"
-elif docker-compose version &>/dev/null; then
-    COMPOSE_CMD="docker-compose"
-fi
+detect_compose_cmd
 
 check_deps() {
     info "Checking requirements..."
     echo ""
     local ok=true
+
+    if $IS_MACOS; then
+        ensure_macos_docker_path
+        if ! docker info &>/dev/null 2>&1; then
+            if ! ensure_macos_runtime_ready; then
+                ok=false
+            fi
+        fi
+    fi
 
     if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
         echo -e "  ${OK} Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
@@ -453,12 +659,22 @@ check_deps() {
         ok=false
     fi
 
+    detect_compose_cmd
     if [[ -n "$COMPOSE_CMD" ]]; then
         version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         echo -e "  ${OK} Docker Compose $version"
     else
-        # Try auto-installing Docker Compose v2 plugin
-        if ! $IS_MACOS; then
+        if $IS_MACOS; then
+            if ensure_homebrew && ensure_macos_brew_packages docker-compose; then
+                detect_compose_cmd
+            fi
+        fi
+
+        if [[ -n "$COMPOSE_CMD" ]]; then
+            version=$($COMPOSE_CMD version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            echo -e "  ${OK} Docker Compose $version"
+        elif ! $IS_MACOS; then
+            # Try auto-installing Docker Compose v2 plugin
             echo -e "  ${YELLOW}⚠${NC}  Docker Compose not found — attempting auto-install..."
             local compose_installed=false
 
@@ -511,7 +727,7 @@ check_deps() {
             fi
         else
             echo -e "  ${FAIL} Docker Compose not found"
-            echo -e "       ${DIM}Install Docker Desktop: https://docs.docker.com/desktop/install/mac-install/${NC}"
+            echo -e "       ${DIM}Install via Homebrew: brew install docker-compose${NC}"
             ok=false
         fi
     fi
@@ -665,18 +881,20 @@ wizard_select_provider() {
 }
 
 wizard_ask_api_key() {
-    local key_label key_url key_prefix key_env_var
+    local key_label key_url key_prefix key_env_var key_min_len
 
     if [[ "$LLM_PROVIDER" == "zai" ]]; then
         key_label="Z.ai (GLM)"
         key_url="https://open.bigmodel.cn/usercenter/apikeys"
         key_prefix=""
         key_env_var="GLM_API_KEY"
+        key_min_len=20
     else
         key_label="OpenRouter"
         key_url="https://openrouter.ai/keys"
         key_prefix="sk-or-"
         key_env_var="OPENROUTER_API_KEY"
+        key_min_len=32
     fi
 
     echo -e "  ${DIM}BugTraceAI uses ${key_label} for AI-powered analysis.${NC}"
@@ -689,6 +907,11 @@ wizard_ask_api_key() {
 
         if [[ -z "$API_KEY" ]]; then
             error "API key cannot be empty"
+            continue
+        fi
+
+        if (( ${#API_KEY} < key_min_len )); then
+            error "${key_label} API key appears too short (minimum ${key_min_len} characters)"
             continue
         fi
 
@@ -795,6 +1018,11 @@ wizard_show_summary() {
 }
 
 run_wizard() {
+    # Restore stdin if piped (e.g. curl | bash)
+    if [ ! -t 0 ] && [ -c /dev/tty ]; then
+        exec </dev/tty 2>/dev/null || true
+    fi
+
     show_banner
 
     # Detect existing installation
@@ -1575,10 +1803,23 @@ _teardown_all() {
 # ── Docker Check ─────────────────────────────────────────────────────────────
 
 check_docker() {
+    if $IS_MACOS; then
+        ensure_macos_docker_path
+        if ! docker info &>/dev/null 2>&1; then
+            if ! ensure_macos_runtime_ready; then
+                error "Docker runtime is not ready."
+                exit 1
+            fi
+        fi
+    fi
+
     if ! command -v docker &>/dev/null; then
         error "Docker not found."
         if $IS_MACOS; then
-            echo -e "  Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+            echo -e "  Install runtime with launcher helper (recommended): rerun ./launcher.sh"
+            echo -e "  Or install manually:"
+            echo -e "    - Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
+            echo -e "    - Colima stack:   ${DIM}brew install docker docker-compose colima qemu lima-additional-guestagents${NC}"
         else
             echo -e "  Install Docker: ${CYAN}https://docs.docker.com/engine/install/${NC}"
         fi
@@ -1605,6 +1846,8 @@ check_docker() {
         info "Applying new group, restarting launcher..."
         exec sg docker "$0 $*"
     fi
+
+    detect_compose_cmd
 }
 
 # ── Help ─────────────────────────────────────────────────────────────────────
