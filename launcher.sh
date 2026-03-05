@@ -1339,6 +1339,14 @@ patch_compose() {
         local host_arch
         host_arch="$(uname -m)"
 
+        # Launcher expects MCP agents over SSE; make SSE default for WEB-managed MCP services.
+        if $MCP_RECON_ENABLED; then
+            sed_inplace 's/SSE_MODE=${RECON_SSE_MODE:-false}/SSE_MODE=${RECON_SSE_MODE:-true}/' "$web_compose"
+        fi
+        if $MCP_CLI_ENABLED; then
+            sed_inplace 's/SSE_MODE=${CLI_SSE_MODE:-false}/SSE_MODE=${CLI_SSE_MODE:-true}/' "$web_compose"
+        fi
+
         # Patch reconFTW port if non-default
         if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" && "$RECON_PORT" != "8002" ]]; then
             sed_inplace "s/\"8002:8002\"/\"${RECON_PORT}:8002\"/" "$web_compose"
@@ -1472,7 +1480,14 @@ health_checks() {
     fi
 
     if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]]; then
-        wait_for_url "http://localhost:${RECON_PORT}/sse" "reconFTW MCP (port ${RECON_PORT})" 120 || all_ok=false
+        local recon_timeout=180
+        local host_arch
+        host_arch="$(uname -m)"
+        if [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
+            # reconFTW runs in amd64 emulation on Apple Silicon and may need extra warmup time.
+            recon_timeout=300
+        fi
+        wait_for_url "http://localhost:${RECON_PORT}/sse" "reconFTW MCP (port ${RECON_PORT})" "$recon_timeout" || all_ok=false
     fi
 
     if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" ]]; then
