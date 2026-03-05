@@ -176,6 +176,83 @@ ensure_recon_amd64_platform() {
     mv "$tmp_file" "$compose_file"
 }
 
+ensure_recon_health_timing() {
+    local compose_file=$1
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    awk '
+    BEGIN { in_recon=0 }
+    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; print; next }
+    in_recon && /^  [^[:space:]]/ { in_recon=0 }
+    in_recon && /^[[:space:]]+retries:[[:space:]]*[0-9]+[[:space:]]*$/ { print "      retries: 10"; next }
+    in_recon && /^[[:space:]]+start_period:[[:space:]]*[0-9]+s[[:space:]]*$/ { print "      start_period: 300s"; next }
+    { print }
+    ' "$compose_file" > "$tmp_file"
+
+    mv "$tmp_file" "$compose_file"
+}
+
+patch_recon_entrypoint_startup() {
+    local entrypoint="$RECON_DIR/entrypoint.sh"
+    local tmp_file
+
+    [[ -f "$entrypoint" ]] || return 0
+
+    # Already patched.
+    if grep -q "RECONFTW_AUTO_INSTALL" "$entrypoint"; then
+        return 0
+    fi
+
+    tmp_file="$(mktemp)"
+    awk '
+    BEGIN { in_old_block=0 }
+    /^# Check if reconftw\.sh exists$/ {
+        in_old_block=1
+        print "# Check if reconftw.sh exists"
+        print "# Try to discover an existing install first to avoid expensive bootstrap on container start."
+        print "if [ ! -f \"$RECONFTW_DIR/reconftw.sh\" ]; then"
+        print "    FOUND_RECONFTW_SCRIPT=\"$(find /opt /root /usr /home -maxdepth 5 -type f -name reconftw.sh 2>/dev/null | head -n 1 || true)\""
+        print "    if [ -n \"$FOUND_RECONFTW_SCRIPT\" ]; then"
+        print "        RECONFTW_DIR=\"$(dirname \"$FOUND_RECONFTW_SCRIPT\")\""
+        print "        log_info \"Detected existing reconftw at $RECONFTW_DIR\""
+        print "    fi"
+        print "fi"
+        print ""
+        print "if [ ! -f \"$RECONFTW_DIR/reconftw.sh\" ]; then"
+        print "    log_warn \"reconftw.sh not found at $RECONFTW_DIR/reconftw.sh\""
+        print "    log_info \"Attempting to clone reconftw repository...\""
+        print ""
+        print "    git clone --depth 1 https://github.com/six2dez/reconftw.git \"$RECONFTW_DIR\" 2>/dev/null || {"
+        print "        log_error \"Failed to clone reconftw repository\""
+        print "        exit 1"
+        print "    }"
+        print ""
+        print "    cd \"$RECONFTW_DIR\""
+        print "    chmod +x reconftw.sh"
+        print ""
+        print "    if [ \"${RECONFTW_AUTO_INSTALL:-false}\" = \"true\" ] && [ -f \"install.sh\" ]; then"
+        print "        log_info \"Installing reconftw dependencies...\""
+        print "        ./install.sh 2>/dev/null || log_warn \"Some dependencies may have failed to install\""
+        print "    else"
+        print "        log_warn \"Skipping reconftw install.sh bootstrap during startup (set RECONFTW_AUTO_INSTALL=true to enable).\""
+        print "    fi"
+        print "fi"
+        next
+    }
+    in_old_block && /^# Make reconftw executable$/ {
+        in_old_block=0
+        print
+        next
+    }
+    in_old_block { next }
+    { print }
+    ' "$entrypoint" > "$tmp_file"
+
+    mv "$tmp_file" "$entrypoint"
+    info "Applied reconftw-mcp startup bootstrap compatibility patch."
+}
+
 patch_recon_dockerfile_venv() {
     local dockerfile="$RECON_DIR/Dockerfile"
     local host_arch
@@ -190,6 +267,8 @@ patch_recon_dockerfile_venv() {
             info "Applied reconftw-mcp amd64 base image pin for ARM hosts."
         fi
     fi
+
+    patch_recon_entrypoint_startup
 
     # Already patched or upstream fixed.
     if grep -q "python3 -m virtualenv /opt/mcp-venv" "$dockerfile"; then
@@ -1355,6 +1434,7 @@ patch_compose() {
         # reconFTW base image is currently amd64-only; enforce emulation on ARM hosts.
         if $MCP_RECON_ENABLED && [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
             ensure_recon_amd64_platform "$web_compose"
+            ensure_recon_health_timing "$web_compose"
         fi
 
         # Patch CLI MCP port if non-default
