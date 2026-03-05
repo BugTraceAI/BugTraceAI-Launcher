@@ -23,15 +23,24 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 
+is_macos() {
+    local kernel
+    kernel="$(uname -s 2>/dev/null || true)"
+    [[ "$kernel" == "Darwin" ]] && return 0
+    command -v sw_vers >/dev/null 2>&1
+}
+
 IS_MACOS=false
-[[ "$(uname -s)" == "Darwin" ]] && IS_MACOS=true
+if is_macos; then
+    IS_MACOS=true
+fi
 
 TARGET_USER="${SUDO_USER:-$USER}"
 TARGET_HOME="$(eval echo "~$TARGET_USER")"
 LAUNCHER_DIR="${BUGTRACEAI_LAUNCHER_DIR:-$TARGET_HOME/bugtraceai-launcher}"
 
-if $IS_MACOS && [[ $EUID -eq 0 ]] && [[ -z "${SUDO_USER:-}" ]]; then
-    error "On macOS, run this installer as your normal user (without sudo)."
+if [[ "$IS_MACOS" == true && $EUID -eq 0 ]]; then
+    error "On macOS, do not run this installer with sudo/root. Run as your normal user."
     exit 1
 fi
 

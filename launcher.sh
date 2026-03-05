@@ -153,6 +153,29 @@ sed_inplace() {
     fi
 }
 
+ensure_recon_amd64_platform() {
+    local compose_file=$1
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    # six2dez/reconftw:main is amd64-only at the moment; force platform so ARM hosts
+    # use emulation instead of failing manifest resolution.
+    awk '
+    BEGIN { in_recon=0; has_platform=0 }
+    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; print; next }
+    in_recon && /^  [^[:space:]]/ {
+        if (!has_platform) print "    platform: linux/amd64"
+        in_recon=0
+    }
+    in_recon && /^[[:space:]]+platform:[[:space:]]*linux\/amd64[[:space:]]*$/ { has_platform=1 }
+    { print }
+    END {
+        if (in_recon && !has_platform) print "    platform: linux/amd64"
+    }' "$compose_file" > "$tmp_file"
+
+    mv "$tmp_file" "$compose_file"
+}
+
 ensure_macos_docker_path() {
     for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
         if [[ -x "$p/docker" ]]; then
@@ -1273,10 +1296,17 @@ patch_compose() {
     # Patch WEB docker-compose for MCP agents
     if [[ -f "$WEB_DIR/docker-compose.yml" ]] && [[ -n "$profiles" ]]; then
         local web_compose="$WEB_DIR/docker-compose.yml"
+        local host_arch
+        host_arch="$(uname -m)"
 
         # Patch reconFTW port if non-default
         if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" && "$RECON_PORT" != "8002" ]]; then
             sed_inplace "s/\"8002:8002\"/\"${RECON_PORT}:8002\"/" "$web_compose"
+        fi
+
+        # reconFTW base image is currently amd64-only; enforce emulation on ARM hosts.
+        if $MCP_RECON_ENABLED && [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
+            ensure_recon_amd64_platform "$web_compose"
         fi
 
         # Patch CLI MCP port if non-default
