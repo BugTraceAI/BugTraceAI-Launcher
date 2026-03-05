@@ -267,11 +267,6 @@ docker logs --tail 200 reconftw-mcp
 docker logs --tail 200 kali-mcp-server
 ```
 
-### Regression Risk (non-macOS)
-
-- Expected risk for Linux users is **low**: most new behavior is gated to macOS and/or ARM and only applies when optional MCP profiles are enabled.
-- Main maintenance risk is future upstream format changes in patched compose/Dockerfile/entrypoint files; launcher patch anchors may need updates if upstream structure changes.
-
 **Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (pull + rebuild).
 
 ## How the Install Script Works
