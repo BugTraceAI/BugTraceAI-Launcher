@@ -28,7 +28,7 @@ Interactive wizard that clones the BugTraceAI repos, builds Docker images, gener
 **One-liner install** (recommended):
 
 ```bash
-git clone https://github.com/BugTraceAI/BugTraceAI-Launcher.git ~/bugtraceai-launcher && ~/bugtraceai-launcher/launcher.sh
+curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh | bash
 ```
 
 Or step by step:
@@ -46,7 +46,7 @@ The wizard will guide you step by step: choose deployment mode, enter your OpenR
 | Requirement | Details |
 |-------------|---------|
 | **OS** | Linux (x86_64) or macOS (Intel / Apple Silicon) |
-| **Docker** | 24.0+ with Docker Compose v2 — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on macOS |
+| **Container Runtime** | Docker Engine 24.0+ + Compose (Linux), or on macOS: **Docker Desktop** OR **Colima** |
 | **Git** | Any recent version |
 | **curl** | For the one-liner installer |
 | **RAM** | 4 GB minimum (8 GB recommended) |
@@ -63,9 +63,24 @@ The wizard will guide you step by step: choose deployment mode, enter your OpenR
 
 You'll be prompted for confirmation before anything is installed. If you're on a non-Debian system, the installer will provide manual installation instructions.
 
-### macOS
+### Auto-Installation (macOS)
 
-Install [Docker Desktop](https://docs.docker.com/desktop/install/mac-install/) before running the launcher. The script automatically detects Docker Desktop's install location (`~/.docker/bin`, `/usr/local/bin`, Homebrew) and adds it to the PATH if needed. Git and curl are included with Xcode Command Line Tools (`xcode-select --install`).
+The launcher now supports **two runtime paths** on macOS:
+
+- **Docker Desktop** (traditional)
+- **Colima** (Docker Desktop-free)
+
+If Docker is not ready, the wizard can:
+
+- Prompt you to choose Docker Desktop or Colima
+- Install missing dependencies with Homebrew (`docker`, `docker-compose`, `colima`, `qemu`, `lima-additional-guestagents`)
+- Start the selected runtime automatically and continue installation
+
+For best automation, install Xcode CLT first if missing:
+
+```bash
+xcode-select --install
+```
 
 ## Deployment Modes
 
@@ -94,7 +109,7 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
 ./launcher.sh help         # Show usage
 ```
 
-> No `sudo` required. On Linux, your user needs Docker permissions (`sudo usermod -aG docker $USER`). On macOS, Docker Desktop handles permissions automatically.
+> No `sudo` required. On Linux, your user needs Docker permissions (`sudo usermod -aG docker $USER`). On macOS, the launcher can bootstrap either Docker Desktop or Colima.
 
 ## Architecture
 
@@ -213,7 +228,44 @@ docker ps -a | grep bugtraceai     # Raw container status
 
 **Permission issues (Linux):** Your user needs Docker permissions. Run `sudo usermod -aG docker $USER` and re-login.
 
-**Docker not found (macOS):** Make sure Docker Desktop is installed and running. The launcher auto-detects common install paths, but if Docker still isn't found, open Docker Desktop first and try again.
+**Docker not found (macOS):** Re-run `./launcher.sh` and choose a runtime when prompted. If you pick Colima, the launcher can install/start it automatically via Homebrew.
+
+**Colima start fails with missing guest agent:** Install and retry:
+
+```bash
+brew install lima-additional-guestagents
+colima start --runtime docker
+```
+
+### macOS MCP Compatibility Notes (reconFTW + Kali)
+
+The launcher now applies macOS-focused compatibility patches during deployment when these MCPs are enabled.
+
+**reconFTW MCP (Apple Silicon):**
+- Forces `linux/amd64` for `six2dez/reconftw:main` on ARM hosts.
+- Patches `reconftw-mcp` Dockerfile for Python venv fallback (`virtualenv`) when `ensurepip` fails.
+- Forces SSE mode for WEB-managed MCP startup (`/sse` health path consistency).
+- Extends reconFTW health timing on ARM emulation.
+- Patches startup behavior to skip heavy `reconftw/install.sh` auto-bootstrap by default (`RECONFTW_AUTO_INSTALL=false`) to avoid health timeouts.
+
+**Kali MCP:**
+- Rewrites the Kali startup command into a robust single `bash -lc` command to avoid multiline parsing/continuation issues during package install.
+- Verifies key binaries (`nmap`, `hydra`, `python3`) after install in container startup.
+
+If you still see MCP issues after pulling latest launcher changes, rebuild only the affected service:
+
+```bash
+cd ~/bugtraceai/BugTraceAI-WEB
+docker compose --env-file .env.docker build --no-cache reconftw-mcp kali-mcp
+docker compose --env-file .env.docker up -d reconftw-mcp kali-mcp
+```
+
+Then inspect logs:
+
+```bash
+docker logs --tail 200 reconftw-mcp
+docker logs --tail 200 kali-mcp-server
+```
 
 **Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (pull + rebuild).
 
@@ -221,10 +273,11 @@ docker ps -a | grep bugtraceai     # Raw container status
 
 The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the interactive wizard, which:
 
-1. **Checks dependencies**: Docker, Docker Compose, Git, curl, RAM, and disk space
-2. **Selects deployment mode**: Full (WEB + CLI), Standalone WEB, or Standalone CLI
-3. **Configures**: Asks for OpenRouter API key, proposes ports, generates `.env` files
-4. **Deploys**: Clones repos, builds Docker images, starts services, runs health checks
+1. **Bootstraps dependencies**: Git/curl first, then Docker runtime + Compose checks
+2. **Selects macOS runtime when needed**: Docker Desktop or Colima
+3. **Selects deployment mode**: Full (WEB + CLI), Standalone WEB, or Standalone CLI
+4. **Configures**: Asks for OpenRouter API key, proposes ports, generates `.env` files
+5. **Deploys**: Clones repos, builds Docker images, starts services, runs health checks
 
 ## License
 
