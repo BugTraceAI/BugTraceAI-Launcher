@@ -237,6 +237,41 @@ brew install lima-additional-guestagents
 colima start --runtime docker
 ```
 
+### macOS MCP Compatibility Notes (reconFTW + Kali)
+
+The launcher now applies macOS-focused compatibility patches during deployment when these MCPs are enabled.
+
+**reconFTW MCP (Apple Silicon):**
+- Forces `linux/amd64` for `six2dez/reconftw:main` on ARM hosts.
+- Patches `reconftw-mcp` Dockerfile for Python venv fallback (`virtualenv`) when `ensurepip` fails.
+- Forces SSE mode for WEB-managed MCP startup (`/sse` health path consistency).
+- Extends reconFTW health timing on ARM emulation.
+- Patches startup behavior to skip heavy `reconftw/install.sh` auto-bootstrap by default (`RECONFTW_AUTO_INSTALL=false`) to avoid health timeouts.
+
+**Kali MCP:**
+- Rewrites the Kali startup command into a robust single `bash -lc` command to avoid multiline parsing/continuation issues during package install.
+- Verifies key binaries (`nmap`, `hydra`, `python3`) after install in container startup.
+
+If you still see MCP issues after pulling latest launcher changes, rebuild only the affected service:
+
+```bash
+cd ~/bugtraceai/BugTraceAI-WEB
+docker compose --env-file .env.docker build --no-cache reconftw-mcp kali-mcp
+docker compose --env-file .env.docker up -d reconftw-mcp kali-mcp
+```
+
+Then inspect logs:
+
+```bash
+docker logs --tail 200 reconftw-mcp
+docker logs --tail 200 kali-mcp-server
+```
+
+### Regression Risk (non-macOS)
+
+- Expected risk for Linux users is **low**: most new behavior is gated to macOS and/or ARM and only applies when optional MCP profiles are enabled.
+- Main maintenance risk is future upstream format changes in patched compose/Dockerfile/entrypoint files; launcher patch anchors may need updates if upstream structure changes.
+
 **Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (pull + rebuild).
 
 ## How the Install Script Works
