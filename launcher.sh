@@ -337,27 +337,8 @@ ensure_macos_runtime_ready() {
         return 0
     fi
 
-    local has_colima=false
-    local has_docker_desktop=false
-    command -v colima &>/dev/null && has_colima=true
-    [[ -d "/Applications/Docker.app" ]] && has_docker_desktop=true
-
-    if $has_colima; then
-        read -rp "$(echo -e "${YELLOW}Docker daemon is down. Start Colima now? [Y/n]: ${NC}")" confirm_colima
-        if [[ "$(to_lower "${confirm_colima:-}")" != "n" ]] && ensure_colima_runtime; then
-            return 0
-        fi
-    fi
-
-    if $has_docker_desktop; then
-        read -rp "$(echo -e "${YELLOW}Start Docker Desktop instead? [y/N]: ${NC}")" confirm_desktop
-        if [[ "$(to_lower "${confirm_desktop:-}")" == "y" ]] && ensure_docker_desktop_runtime; then
-            return 0
-        fi
-    fi
-
     echo ""
-    select_option "Select container runtime for macOS setup:" \
+    select_option "Docker daemon is down. Select runtime for macOS setup:" \
         "Colima (Docker Desktop-free, recommended for OSS stack)" \
         "Docker Desktop"
 
