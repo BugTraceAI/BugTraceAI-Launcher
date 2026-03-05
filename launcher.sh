@@ -223,6 +223,34 @@ ensure_recon_env_defaults() {
     mv "$tmp_file" "$compose_file"
 }
 
+ensure_kali_startup_command() {
+    local compose_file=$1
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    awk '
+    BEGIN { in_kali=0; in_cmd=0 }
+    /^  kali-mcp:[[:space:]]*$/ { in_kali=1; print; next }
+    in_kali && /^  [^[:space:]]/ { in_kali=0 }
+    in_kali && /^[[:space:]]+command:[[:space:]]*>[[:space:]]*$/ {
+        in_cmd=1
+        print "    command: >"
+        print "      bash -lc \"set -e; echo '\''Waiting for network initialization...'\''; sleep 5; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y nmap ffuf nuclei sqlmap dirb gobuster nikto hydra john hashcat curl wget netcat-openbsd python3 python3-pip git vim; command -v nmap hydra python3 >/dev/null; echo '\''Kali MCP Server ready!'\''; tail -f /dev/null\""
+        next
+    }
+    in_cmd {
+        if (in_kali && /^[[:space:]]+(extra_hosts:|restart:|networks:|ports:|volumes:|environment:|cap_add:|security_opt:|profiles:|container_name:|image:)/) {
+            in_cmd=0
+            print
+        }
+        next
+    }
+    { print }
+    ' "$compose_file" > "$tmp_file"
+
+    mv "$tmp_file" "$compose_file"
+}
+
 patch_recon_entrypoint_startup() {
     local entrypoint="$RECON_DIR/entrypoint.sh"
     local tmp_file
@@ -1468,6 +1496,9 @@ patch_compose() {
         fi
         if $MCP_RECON_ENABLED; then
             ensure_recon_env_defaults "$web_compose"
+        fi
+        if $MCP_KALI_ENABLED; then
+            ensure_kali_startup_command "$web_compose"
         fi
 
         # Patch CLI MCP port if non-default
