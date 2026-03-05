@@ -176,6 +176,45 @@ ensure_recon_amd64_platform() {
     mv "$tmp_file" "$compose_file"
 }
 
+patch_recon_dockerfile_venv() {
+    local dockerfile="$RECON_DIR/Dockerfile"
+    local host_arch
+    local tmp_file
+
+    [[ -f "$dockerfile" ]] || return 0
+
+    host_arch="$(uname -m)"
+    if [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
+        if ! grep -q "^FROM --platform=linux/amd64 six2dez/reconftw:main" "$dockerfile"; then
+            sed_inplace -E 's|^FROM[[:space:]]+six2dez/reconftw:main|FROM --platform=linux/amd64 six2dez/reconftw:main|' "$dockerfile"
+            info "Applied reconftw-mcp amd64 base image pin for ARM hosts."
+        fi
+    fi
+
+    # Already patched or upstream fixed.
+    if grep -q "python3 -m virtualenv /opt/mcp-venv" "$dockerfile"; then
+        return 0
+    fi
+
+    if ! grep -q "RUN python3 -m venv /opt/mcp-venv" "$dockerfile"; then
+        return 0
+    fi
+
+    tmp_file="$(mktemp)"
+    awk '
+    /RUN python3 -m venv \/opt\/mcp-venv/ {
+        print "RUN python3 -m venv /opt/mcp-venv || \\"
+        print "    ( (python3 -m pip install --no-cache-dir virtualenv || python3 -m pip install --no-cache-dir --break-system-packages virtualenv) && \\"
+        print "      python3 -m virtualenv /opt/mcp-venv )"
+        next
+    }
+    { print }
+    ' "$dockerfile" > "$tmp_file"
+
+    mv "$tmp_file" "$dockerfile"
+    info "Applied reconftw-mcp Python venv compatibility patch."
+}
+
 ensure_macos_docker_path() {
     for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
         if [[ -x "$p/docker" ]]; then
@@ -1159,6 +1198,7 @@ clone_repos() {
                 exit 1
             fi
         fi
+        patch_recon_dockerfile_venv
         echo -e "    ${OK} reconftw-mcp"
     fi
 }
@@ -1759,6 +1799,7 @@ cmd_update() {
         if ! (cd "$RECON_DIR" && git pull --quiet); then
             warn "Failed to pull Recon updates"
         fi
+        patch_recon_dockerfile_venv
         echo -e "    ${OK} Recon updated"
     fi
 
