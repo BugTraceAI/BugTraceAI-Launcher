@@ -193,6 +193,36 @@ ensure_recon_health_timing() {
     mv "$tmp_file" "$compose_file"
 }
 
+ensure_recon_env_defaults() {
+    local compose_file=$1
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    awk '
+    BEGIN { in_recon=0; has_auto=0; inserted=0 }
+    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; has_auto=0; inserted=0; print; next }
+    in_recon && /^[[:space:]]+- RECONFTW_AUTO_INSTALL=/ { has_auto=1 }
+    in_recon && /^[[:space:]]+- MCP_PORT=8002[[:space:]]*$/ {
+        print
+        if (!has_auto && !inserted) {
+            print "      - RECONFTW_AUTO_INSTALL=false"
+            inserted=1
+        }
+        next
+    }
+    in_recon && /^  [^[:space:]]/ {
+        if (!has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
+        in_recon=0
+    }
+    { print }
+    END {
+        if (in_recon && !has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
+    }
+    ' "$compose_file" > "$tmp_file"
+
+    mv "$tmp_file" "$compose_file"
+}
+
 patch_recon_entrypoint_startup() {
     local entrypoint="$RECON_DIR/entrypoint.sh"
     local tmp_file
@@ -1435,6 +1465,9 @@ patch_compose() {
         if $MCP_RECON_ENABLED && [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
             ensure_recon_amd64_platform "$web_compose"
             ensure_recon_health_timing "$web_compose"
+        fi
+        if $MCP_RECON_ENABLED; then
+            ensure_recon_env_defaults "$web_compose"
         fi
 
         # Patch CLI MCP port if non-default
