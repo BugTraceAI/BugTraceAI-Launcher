@@ -1094,7 +1094,8 @@ wizard_ask_api_key() {
     echo ""
 
     while true; do
-        read -rsp "$(echo -e "  ${YELLOW}${key_label} API key: ${NC}")" API_KEY
+        echo -en "  ${YELLOW}${key_label} API key: ${NC}"
+        read -rs API_KEY
         echo ""
 
         if [[ -z "$API_KEY" ]]; then
