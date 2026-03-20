@@ -392,7 +392,8 @@ ensure_homebrew() {
     fi
 
     warn "Homebrew is required for automated macOS dependency installation."
-    read -rp "$(echo -e "${YELLOW}Install Homebrew now? [Y/n]: ${NC}")" confirm
+    echo -en "${YELLOW}Install Homebrew now? [Y/n]: ${NC}"
+    read -r confirm
     if [[ "$(to_lower "${confirm:-}")" == "n" ]]; then
         return 1
     fi
@@ -447,7 +448,8 @@ maybe_fix_colima_arch() {
 
     warn "Detected Colima profile arch=x86_64 on Apple Silicon."
     warn "This can fail with container image format errors."
-    read -rp "$(echo -e "${YELLOW}Recreate Colima as arm64 (aarch64)? [Y/n]: ${NC}")" confirm
+    echo -en "${YELLOW}Recreate Colima as arm64 (aarch64)? [Y/n]: ${NC}"
+    read -r confirm
     if [[ "$(to_lower "${confirm:-}")" == "n" ]]; then
         warn "Continuing with x86_64 Colima profile (may fail for some images)."
         return 0
@@ -571,7 +573,8 @@ propose_port() {
     while [[ $attempts -lt 3 ]]; do
         echo ""
         echo -e "  ${BOLD}$label${NC}: ${CYAN}$port${NC}"
-        read -rp "$(echo -e "  ${YELLOW}Accept? [Y] / n=next / or type a port: ${NC}")" answer
+        echo -en "  ${YELLOW}Accept? [Y] / n=next / or type a port: ${NC}"
+        read -r answer
 
         case "$(to_lower "$answer")" in
             ""|y|yes)
@@ -2006,7 +2009,8 @@ cmd_uninstall() {
     warn "This will remove all BugTraceAI containers, volumes, and data."
     echo -e "  ${DIM}Install directory: $INSTALL_DIR${NC}"
     echo ""
-    read -rp "$(echo -e "${YELLOW}Are you sure? [y/N]: ${NC}")" confirm
+    echo -en "${YELLOW}Are you sure? [y/N]: ${NC}"
+    read -r confirm
     [[ "$(to_lower "$confirm")" != "y" ]] && { info "Cancelled."; exit 0; }
 
     _teardown_all
