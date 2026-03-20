@@ -620,7 +620,8 @@ select_option() {
     echo ""
 
     while true; do
-        read -rp "$(echo -e "${YELLOW}Choice [1-$total]: ${NC}")" choice
+        echo -en "${YELLOW}Choice [1-$total]: ${NC}"
+        read -r choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$total" ]]; then
             MENU_SELECTION=$((choice - 1))
             return 0
@@ -667,7 +668,8 @@ select_multi() {
         done
         echo ""
         echo -e "  ${DIM}Enter numbers to toggle selections (e.g., '1 3'), or press ENTER to confirm current setup.${NC}"
-        read -rp "$(echo -e "${YELLOW}Selection: ${NC}")" choices
+        echo -en "${YELLOW}Selection: ${NC}"
+        read -r choices
 
         if [[ -z "$choices" ]]; then
             break
@@ -1116,7 +1118,8 @@ wizard_ask_api_key() {
             echo -e "  ${DIM}Key: ${API_KEY:0:2}...${API_KEY: -2}  (${key_len} characters)${NC}"
         fi
 
-        read -rp "$(echo -e "  ${YELLOW}Does this look correct? [Y/n]: ${NC}")" confirm
+        echo -en "  ${YELLOW}Does this look correct? [Y/n]: ${NC}"
+        read -r confirm
         if [[ "$(to_lower "$confirm")" == "n" ]]; then
             info "Let's try again..."
             continue
@@ -1125,7 +1128,8 @@ wizard_ask_api_key() {
         # Provider-specific prefix validation
         if [[ -n "$key_prefix" && ! "$API_KEY" =~ ^${key_prefix} ]]; then
             warn "Key doesn't look like a ${key_label} key (expected ${key_prefix}...)"
-            read -rp "$(echo -e "  ${YELLOW}Continue anyway? [y/N]: ${NC}")" confirm
+            echo -en "  ${YELLOW}Continue anyway? [y/N]: ${NC}"
+            read -r confirm
             [[ "$(to_lower "$confirm")" != "y" ]] && continue
         fi
 
@@ -1202,7 +1206,8 @@ wizard_show_summary() {
     echo -e "${BOLD}─────────────────────────────${NC}"
     echo ""
 
-    read -rp "$(echo -e "${YELLOW}Proceed with installation? [Y/n]: ${NC}")" confirm
+    echo -en "${YELLOW}Proceed with installation? [Y/n]: ${NC}"
+    read -r confirm
     if [[ "$(to_lower "$confirm")" == "n" ]]; then
         warn "Installation cancelled."
         exit 0
