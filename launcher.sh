@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BugTraceAI Launcher v2.5.1
+# BugTraceAI Launcher
 # One-command deployment for the BugTraceAI security platform
 #
 # Usage: ./launcher.sh [command]
@@ -18,7 +18,9 @@
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-VERSION="2.5.1"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION_FILE="$SCRIPT_DIR/VERSION"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.5.1')"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
@@ -75,6 +77,32 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 step()    { echo -e "  ${ARROW} $1"; }
+
+read_web_version() {
+    local version_file="$WEB_DIR/VERSION"
+    local version=""
+
+    if [[ -f "$version_file" ]]; then
+        version=$(tr -d '[:space:]' < "$version_file" 2>/dev/null)
+    elif [[ -f "$WEB_DIR/package.json" ]]; then
+        version=$(awk -F'"' '/"version"/{print $4; exit}' "$WEB_DIR/package.json" 2>/dev/null)
+    fi
+
+    printf '%s' "${version%%-*}"
+}
+
+read_cli_version() {
+    local version_file="$CLI_DIR/VERSION"
+    local version=""
+
+    if [[ -f "$version_file" ]]; then
+        version=$(tr -d '[:space:]' < "$version_file" 2>/dev/null)
+    elif [[ -f "$CLI_DIR/bugtrace/__init__.py" ]]; then
+        version=$(awk -F'"' '/__version__/{print $2; exit}' "$CLI_DIR/bugtrace/__init__.py" 2>/dev/null)
+    fi
+
+    printf '%s' "${version%%-*}"
+}
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 
@@ -771,10 +799,7 @@ check_for_updates() {
     # Check CLI version (read from deployed repo if available)
     if [[ -d "$CLI_DIR" ]]; then
         local cli_ver=""
-        # Try to read VERSION from config.py (portable: no grep -P on macOS)
-        if [[ -f "$CLI_DIR/bugtrace/core/config.py" ]]; then
-            cli_ver=$(awk -F'"' '/VERSION.*=/{for(i=1;i<=NF;i++){if($i~/^[0-9]+\.[0-9]+\.[0-9]+/){print $i; exit}}}' "$CLI_DIR/bugtrace/core/config.py" 2>/dev/null)
-        fi
+        cli_ver=$(read_cli_version)
         if [[ -n "$cli_ver" ]]; then
             local latest_cli
             latest_cli=$(_get_latest_version "$REPOS_CLI")
@@ -788,10 +813,7 @@ check_for_updates() {
     # Check WEB version (read from package.json if available)
     if [[ -d "$WEB_DIR" ]]; then
         local web_ver=""
-        if [[ -f "$WEB_DIR/package.json" ]]; then
-            web_ver=$(awk -F'"' '/"version"/{print $4; exit}' "$WEB_DIR/package.json" 2>/dev/null)
-            web_ver="${web_ver%%-*}"  # Strip -beta, -alpha, etc.
-        fi
+        web_ver=$(read_web_version)
         if [[ -n "$web_ver" ]]; then
             local latest_web
             latest_web=$(_get_latest_version "$REPOS_WEB")

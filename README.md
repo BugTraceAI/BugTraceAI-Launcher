@@ -17,6 +17,8 @@
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
 </p>
 
+Launcher version source of truth: [VERSION](VERSION)
+
 ---
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB, CLI, or both with a single command.
