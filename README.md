@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <a href="https://discord.gg/5HjujkScC"><img src="https://img.shields.io/discord/5HjujkScC?label=Discord&logo=discord&logoColor=white&color=5865F2" alt="Discord" /></a>
+  <a href="https://discord.gg/5HjujkScC"><img src="https://img.shields.io/badge/Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Community on Discord" /></a>
   <img src="https://img.shields.io/badge/Version-2.8.7-blue" />
   <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
