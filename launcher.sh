@@ -64,8 +64,13 @@ MCP_CLI_ENABLED=false
 MCP_RECON_ENABLED=false
 MCP_KALI_ENABLED=false
 RECON_PORT=""
-KALI_PORT=""
 SELECTED_INDICES=()
+
+# Compose profiles are deliberately passed as explicit CLI flags.  Exporting
+# COMPOSE_PROFILES leaks into the base WEB startup and starts every optional
+# agent before the launcher reaches its dedicated MCP step.
+WEB_MCP_PROFILE_ARGS=()
+WEB_MCP_PROFILE_NAMES=()
 
 # ── Colors & Symbols ────────────────────────────────────────────────────────
 
@@ -121,13 +126,36 @@ _assert_safe_install_dir() {
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[OK]${NC} $1"; }
+# Empty until _init_install_log (real runs only). Tests that source this file
+# must not write a log unless BUGTRACEAI_INSTALL_LOG is set.
+INSTALL_LOG_FILE=""
+
+_log_event() {
+    local level="$1"
+    local msg="$2"
+    local dest="${INSTALL_LOG_FILE:-${BUGTRACEAI_INSTALL_LOG:-}}"
+    [[ -n "$dest" ]] || return 0
+    [[ -n "${API_KEY:-}" ]] && msg="${msg//"$API_KEY"/[REDACTED]}"
+    msg=$(printf '%s' "$msg" | tr '\n' ' ')
+    printf '%s %s %s\n' "$(iso_date)" "$level" "$msg" >>"$dest" 2>/dev/null || true
+}
+
+_init_install_log() {
+    INSTALL_LOG_FILE="${BUGTRACEAI_INSTALL_LOG:-$SCRIPT_DIR/install.log}"
+    {
+        printf '\n===== BugTraceAI Launcher v%s  %s  pid=%s =====\n' \
+            "$VERSION" "$(iso_date)" "$$"
+        printf 'host=%s user=%s\n' "$(hostname 2>/dev/null || echo unknown)" "${USER:-unknown}"
+    } >>"$INSTALL_LOG_FILE" 2>/dev/null || INSTALL_LOG_FILE=""
+}
+
+info()    { echo -e "${BLUE}[INFO]${NC} $1"; _log_event INFO "$1"; }
+success() { echo -e "${GREEN}[OK]${NC} $1"; _log_event OK "$1"; }
 # WARN/ERROR go to stderr so they never pollute a function's stdout that a
 # caller captures via $(...) — e.g. find_free_port feeding POSTGRES_PORT.
-warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
-error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-step()    { echo -e "  ${ARROW} $1"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; _log_event WARN "$1"; }
+error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; _log_event ERROR "$1"; }
+step()    { echo -e "  ${ARROW} $1"; _log_event STEP "$1"; }
 
 read_web_version() {
     local version_file="$WEB_DIR/VERSION"
@@ -174,6 +202,10 @@ BANNER
     echo -e "          ${BOLD}BugTraceAI Launcher v${VERSION}${NC}"
     echo -e "        Autonomous Web Security Scanner"
     echo ""
+    if [[ -n "$INSTALL_LOG_FILE" ]]; then
+        echo -e "        ${DIM}Install log: $INSTALL_LOG_FILE${NC}"
+        echo ""
+    fi
 }
 
 # ── Utility Functions ────────────────────────────────────────────────────────
@@ -185,7 +217,6 @@ port_available() {
     [[ "$port" == "$CLI_PORT" ]] && return 1
     [[ "$port" == "$MCP_PORT" ]] && return 1
     [[ "$port" == "$RECON_PORT" ]] && return 1
-    [[ "$port" == "$KALI_PORT" ]] && return 1
 
     if $IS_MACOS; then
         ! lsof -i ":$port" -sTCP:LISTEN &>/dev/null
@@ -203,6 +234,27 @@ port_available() {
             return 1
         fi
         ! grep -q ":$port " <<< "$listing"
+    fi
+}
+
+# Resolve only the profiles served by the WEB compose file.  In Full mode the
+# core BugTraceAI MCP belongs to the CLI compose project, so it must not also
+# start the WEB-owned bugtrace-cli-mcp service.
+resolve_web_mcp_profiles() {
+    WEB_MCP_PROFILE_ARGS=()
+    WEB_MCP_PROFILE_NAMES=()
+
+    if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
+        WEB_MCP_PROFILE_ARGS+=(--profile cli)
+        WEB_MCP_PROFILE_NAMES+=(cli)
+    fi
+    if $MCP_RECON_ENABLED; then
+        WEB_MCP_PROFILE_ARGS+=(--profile recon)
+        WEB_MCP_PROFILE_NAMES+=(recon)
+    fi
+    if $MCP_KALI_ENABLED; then
+        WEB_MCP_PROFILE_ARGS+=(--profile kali)
+        WEB_MCP_PROFILE_NAMES+=(kali)
     fi
 }
 
@@ -349,29 +401,115 @@ ensure_recon_env_defaults() {
     mv "$tmp_file" "$compose_file"
 }
 
-ensure_kali_startup_command() {
+# Public WEB compose ships recon as `image: reconftw-mcp:local` with no build.
+# Compose then tries to pull that name from Docker Hub, fails, and aborts Kali
+# in the same `up`. Point it at the sibling source the launcher already clones.
+ensure_recon_local_build() {
     local compose_file=$1
     local tmp_file
     tmp_file="$(mktemp)"
 
     awk '
-    BEGIN { in_kali=0; in_cmd=0 }
-    /^  kali-mcp:[[:space:]]*$/ { in_kali=1; print; next }
-    in_kali && /^  [^[:space:]]/ { in_kali=0; in_cmd=0 }
-    in_kali && /^[[:space:]]+command:[[:space:]]*>[[:space:]]*$/ {
-        in_cmd=1
-        print "    command: >"
-        print "      bash -lc \"set -e; echo '\''Waiting for network initialization...'\''; sleep 5; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y nmap ffuf nuclei sqlmap dirb gobuster nikto hydra john hashcat curl wget netcat-openbsd python3 python3-pip git vim; command -v nmap hydra python3 >/dev/null; echo '\''Kali MCP Server ready!'\''; tail -f /dev/null\""
+    BEGIN { in_recon=0; has_build=0; has_pull=0 }
+    function emit_missing() {
+        if (!has_build) {
+            print "    build:"
+            print "      context: ../reconftw-mcp"
+            print "      dockerfile: Dockerfile"
+        }
+        if (!has_pull) print "    pull_policy: build"
+    }
+    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; has_build=0; has_pull=0; print; next }
+    in_recon && /^[[:space:]]+build:[[:space:]]*$/ { has_build=1 }
+    in_recon && /^[[:space:]]+pull_policy:[[:space:]]*/ { has_pull=1 }
+    in_recon && /^  [^[:space:]]/ {
+        emit_missing()
+        in_recon=0
+    }
+    { print }
+    END { if (in_recon) emit_missing() }
+    ' "$compose_file" > "$tmp_file"
+
+    mv "$tmp_file" "$compose_file"
+}
+
+ensure_kali_startup_command() {
+    local compose_file=$1
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    # Upstream has used both an inline command array and a folded YAML scalar.
+    # Replace either form, then make retries explicit.  Kali is a toolbox
+    # container, not an HTTP/SSE MCP endpoint, so it needs no host port.
+    awk '
+    function emit_command() {
+        print "    command:"
+        print "      - bash"
+        print "      - -lc"
+        print "      - |"
+        print "        set -u"
+        print "        export DEBIAN_FRONTEND=noninteractive"
+        print "        echo '\''Preparing Kali toolbox...'\''"
+        print "        for attempt in 1 2 3; do"
+        print "          if apt-get update && apt-get install -y --no-install-recommends nmap ffuf sqlmap dirb gobuster nikto hydra john hashcat curl wget netcat-openbsd python3 python3-pip git vim; then"
+        print "            break"
+        print "          fi"
+        # Emit an escaped Compose variable so the container, rather than
+        # Compose, expands the retry counter at runtime.
+        print "          if [ " sprintf("%c%c", 36, 36) "attempt -eq 3 ]; then"
+        print "            echo '\''Failed to install required Kali tools.'\'' >&2"
+        print "            exit 1"
+        print "          fi"
+        print "          echo '\''Package installation failed; retrying.'\'' >&2"
+        print "          sleep 10"
+        print "        done"
+        print "        if ! command -v nuclei >/dev/null 2>&1; then"
+        print "          apt-get install -y --no-install-recommends nuclei || echo '\''Warning: nuclei package unavailable; continuing without it.'\'' >&2"
+        print "        fi"
+        print "        if ! command -v nmap >/dev/null 2>&1 || ! command -v hydra >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then"
+        print "          echo '\''Required Kali tools are unavailable.'\'' >&2"
+        print "          exit 1"
+        print "        fi"
+        print "        echo '\''Kali toolbox ready!'\''"
+        print "        exec tail -f /dev/null"
+    }
+    BEGIN { in_kali=0; skip_command=0; emitted=0 }
+    /^  kali-mcp:[[:space:]]*$/ {
+        in_kali=1
+        skip_command=0
+        emitted=0
+        print
         next
     }
-    in_cmd {
-        if (in_kali && /^[[:space:]]+(extra_hosts:|restart:|networks:|ports:|volumes:|environment:|cap_add:|security_opt:|profiles:|container_name:|image:)/) {
-            in_cmd=0
+    in_kali && /^  [^[:space:]]/ {
+        if (!emitted) emit_command()
+        in_kali=0
+        skip_command=0
+        print
+        next
+    }
+    in_kali && /^    command:[[:space:]]*/ {
+        if (!emitted) emit_command()
+        emitted=1
+        # A command without an inline value (or a folded/literal scalar) owns
+        # following indented lines.  Drop those old lines too.
+        if ($0 ~ /^    command:[[:space:]]*$/ ||
+            $0 ~ /^    command:[[:space:]]*[>|][+-]?[[:space:]]*$/) {
+            skip_command=1
+        }
+        next
+    }
+    in_kali && skip_command {
+        if (/^    [^[:space:]]/) {
+            skip_command=0
             print
         }
         next
     }
     { print }
+    END {
+        if (in_kali && !emitted) emit_command()
+    }
     ' "$compose_file" > "$tmp_file"
 
     mv "$tmp_file" "$compose_file"
@@ -478,6 +616,53 @@ patch_recon_dockerfile_venv() {
     info "Applied reconftw-mcp Python venv compatibility patch."
 }
 
+# The WEB compose project builds reconFTW from a sibling directory:
+#   BugTraceAI-WEB/../reconftw-mcp
+# A previous interrupted install could leave the launcher state behind while
+# that directory was never cloned. Validate the actual build input before a
+# compose command can turn that into Docker's opaque "path not found" error.
+recon_source_ready() {
+    [[ -f "$RECON_DIR/Dockerfile" ]] || return 1
+
+    # Under the normal launcher layout these are the same directory. Checking
+    # the relative path too makes a manually moved WEB directory fail with a
+    # clear explanation instead of a later Compose build-context error.
+    if [[ -d "$WEB_DIR" && ! -f "$WEB_DIR/../reconftw-mcp/Dockerfile" ]]; then
+        return 1
+    fi
+}
+
+# Restore only a completely missing reconFTW source tree. An existing but
+# incomplete tree might contain a user's work, so it is deliberately never
+# deleted or overwritten by start/update.
+ensure_recon_source() {
+    if recon_source_ready; then
+        patch_recon_dockerfile_venv
+        return 0
+    fi
+
+    if [[ -e "$RECON_DIR" || -L "$RECON_DIR" ]]; then
+        error "reconFTW MCP build context is incomplete at: $RECON_DIR"
+        error "Expected: $RECON_DIR/Dockerfile"
+        error "Refusing to overwrite the existing directory. Restore or move it aside, then run: ./launcher.sh update"
+        return 1
+    fi
+
+    step "Restoring missing reconftw-mcp source..."
+    if ! git clone --depth 1 "$RECON_REPO" "$RECON_DIR"; then
+        error "Failed to restore reconftw-mcp from $RECON_REPO"
+        return 1
+    fi
+
+    if ! recon_source_ready; then
+        error "reconftw-mcp was cloned, but its Dockerfile is missing. Cannot start the recon profile."
+        return 1
+    fi
+
+    patch_recon_dockerfile_venv
+    echo -e "    ${OK} reconftw-mcp restored"
+}
+
 ensure_macos_docker_path() {
     local found=false
     for p in "$HOME/.docker/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
@@ -509,6 +694,177 @@ wait_for_docker_daemon() {
         sleep "$interval"
         elapsed=$((elapsed + interval))
     done
+    return 1
+}
+
+linux_docker_usable() {
+    command -v docker &>/dev/null && docker info &>/dev/null 2>&1
+}
+
+linux_docker_daemon_up() {
+    docker info &>/dev/null 2>&1 || sudo docker info &>/dev/null 2>&1
+}
+
+# How Linux Docker Engine would be installed. Prefer Docker's official script
+# when curl exists; otherwise the distro package manager.
+_linux_docker_install_method() {
+    if command -v curl &>/dev/null; then
+        printf '%s\n' "get.docker.com"
+        return 0
+    fi
+    if command -v apt-get &>/dev/null; then
+        printf '%s\n' "apt"
+        return 0
+    fi
+    if command -v dnf &>/dev/null; then
+        printf '%s\n' "dnf"
+        return 0
+    fi
+    if command -v yum &>/dev/null; then
+        printf '%s\n' "yum"
+        return 0
+    fi
+    if command -v pacman &>/dev/null; then
+        printf '%s\n' "pacman"
+        return 0
+    fi
+    if command -v zypper &>/dev/null; then
+        printf '%s\n' "zypper"
+        return 0
+    fi
+    return 1
+}
+
+_install_linux_docker_packages() {
+    local method
+    method="$(_linux_docker_install_method)" || return 1
+    case "$method" in
+        get.docker.com)
+            curl -fsSL https://get.docker.com | sudo sh
+            ;;
+        apt)
+            sudo apt-get update -qq
+            sudo apt-get install -y docker.io docker-compose-plugin
+            ;;
+        dnf)
+            sudo dnf install -y docker docker-compose-plugin \
+                || sudo dnf install -y moby-engine docker-compose
+            ;;
+        yum)
+            sudo yum install -y docker docker-compose
+            ;;
+        pacman)
+            sudo pacman -Syu --noconfirm docker docker-compose
+            ;;
+        zypper)
+            sudo zypper install -y docker docker-compose
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_start_linux_docker_daemon() {
+    if command -v systemctl &>/dev/null; then
+        sudo systemctl enable --now docker 2>/dev/null || sudo systemctl start docker 2>/dev/null || true
+    fi
+    sudo service docker start 2>/dev/null || true
+}
+
+_wait_for_linux_docker_daemon() {
+    local timeout=${1:-45}
+    local elapsed=0
+    local interval=3
+    while [[ $elapsed -lt $timeout ]]; do
+        if linux_docker_daemon_up; then
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+    return 1
+}
+
+_reexec_in_docker_group() {
+    [[ $EUID -eq 0 ]] && return 0
+    sudo usermod -aG docker "$USER"
+    # Only restart the launcher when this file is the running process. A sourced
+    # caller (tests, AI installer) applies the group and continues.
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 0
+    fi
+    if ! command -v sg &>/dev/null; then
+        warn "Added $USER to the docker group. Run: newgrp docker"
+        return 1
+    fi
+    info "Applying docker group, restarting launcher..."
+    local reexec_cmd
+    printf -v reexec_cmd '%q ' "$0" "${ORIG_ARGS[@]}"
+    exec sg docker "$reexec_cmd"
+}
+
+# Install and/or start Docker Engine on Linux so the wizard can continue.
+# Pass "yes" to skip the confirmation (the caller already asked).
+ensure_linux_docker_engine() {
+    local assume_yes="${1:-}"
+
+    if linux_docker_usable; then
+        return 0
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        echo ""
+        warn "Docker Engine is not installed."
+        echo -e "  ${DIM}The launcher can install it with Docker's official installer (get.docker.com).${NC}"
+        if [[ "$assume_yes" != "yes" ]]; then
+            echo -en "${YELLOW}Install Docker Engine now? [Y/n]: ${NC}"
+            read -r confirm
+            if [[ "$(to_lower "${confirm:-}")" == "n" ]]; then
+                return 1
+            fi
+        fi
+        info "Installing Docker Engine..."
+        if ! _install_linux_docker_packages; then
+            error "Failed to install Docker Engine."
+            echo -e "  ${DIM}Manual install: https://docs.docker.com/engine/install/${NC}"
+            return 1
+        fi
+        echo -e "  ${OK} Docker Engine installed"
+    fi
+
+    if linux_docker_usable; then
+        detect_compose_cmd
+        return 0
+    fi
+
+    if ! linux_docker_daemon_up; then
+        info "Starting Docker daemon..."
+        _start_linux_docker_daemon
+        if ! _wait_for_linux_docker_daemon 45; then
+            error "Docker daemon did not become ready."
+            echo -e "  ${DIM}Start it with: sudo systemctl start docker${NC}"
+            return 1
+        fi
+    fi
+
+    if linux_docker_usable; then
+        detect_compose_cmd
+        return 0
+    fi
+
+    if sudo docker info &>/dev/null 2>&1; then
+        _reexec_in_docker_group || return 1
+        if linux_docker_usable; then
+            detect_compose_cmd
+            return 0
+        fi
+        warn "Added $USER to the docker group. Docker commands may need sudo until you log in again."
+        detect_compose_cmd
+        return 0
+    fi
+
+    error "Docker Engine is not ready."
     return 1
 }
 
@@ -766,7 +1122,7 @@ select_option() {
 MCP_DESCRIPTIONS=(
     "BugTraceAI Scanner: Core vulnerability scanning engine with AI-powered analysis"
     "reconFTW: Automated subdomain enumeration, OSINT gathering, and vulnerability detection"
-    "Kali Linux: Full penetration testing toolkit (nmap, nuclei, sqlmap, ffuf, etc.) - 3GB+ download"
+    "Kali Linux toolbox: Full penetration testing toolkit (nmap, nuclei, sqlmap, ffuf, etc.) - 3GB+ download"
 )
 
 # Multi-select menu with SPACE to toggle, ENTER to confirm
@@ -1009,6 +1365,8 @@ check_deps() {
 
     if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
         echo -e "  ${OK} Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
+    elif ! $IS_MACOS && ensure_linux_docker_engine; then
+        echo -e "  ${OK} Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
     else
         echo -e "  ${FAIL} Docker not found or not running"
         ok=false
@@ -1129,6 +1487,7 @@ check_deps() {
 
     if [[ "$ok" == false ]]; then
         error "Missing required dependencies."
+        [[ -n "$INSTALL_LOG_FILE" ]] && echo -e "  ${DIM}Install log: $INSTALL_LOG_FILE${NC}"
         echo ""
         if $IS_MACOS; then
             echo -e "  Install Docker Desktop: ${CYAN}https://docs.docker.com/desktop/install/mac-install/${NC}"
@@ -1163,7 +1522,7 @@ launch_ai_installer() {
     fi
 
     chmod +x "$SCRIPT_DIR/ai_installer.py"
-    info "Starting AI Setup & Repair Assistant (provider selected at startup)..."
+    info "Starting AI Setup & Repair Assistant (DeepSeek V4.1 Flash · Qwen 3.8 Max fallback)..."
     exec python3 "$SCRIPT_DIR/ai_installer.py"
 }
 
@@ -1213,9 +1572,9 @@ wizard_select_components() {
 
     # Step 2: Select Extras (only for Web+CLI or Solo WEB)
     if $INSTALL_WEB; then
-        select_option "Would you like to add any additional AI Agents (MCPs) for the Chat?" \
-            "Add BOTH (Full Pack: Kali + reconFTW)" \
-            "Add Kali Linux MCP (Full Pentest Toolkit - 3GB+)" \
+        select_option "Would you like to add chat MCPs or the Kali toolbox?" \
+            "Add Full Pack (reconFTW MCP + Kali toolbox)" \
+            "Add Kali Linux toolbox (Full Pentest Toolkit - 3GB+)" \
             "Add reconFTW MCP (OSINT & Subdomains by @six2dez)" \
             "NONE (Only BugTraceAI core components)"
         
@@ -1246,7 +1605,7 @@ wizard_select_components() {
     $INSTALL_CLI && echo -e "  ${OK} CLI Scanner"
     $MCP_CLI_ENABLED && echo -e "  ${OK} BugTraceAI MCP (Core Agent)"
     $MCP_RECON_ENABLED && echo -e "  ${OK} reconFTW MCP (by @six2dez)"
-    $MCP_KALI_ENABLED && echo -e "  ${OK} Kali Linux MCP"
+    $MCP_KALI_ENABLED && echo -e "  ${OK} Kali Linux toolbox (interactive container)"
 
     echo ""
     success "Configuration set to $DEPLOY_MODE mode"
@@ -1371,10 +1730,6 @@ wizard_configure_ports() {
         propose_port "reconFTW MCP port" 8002 RECON_PORT
     fi
 
-    if $MCP_KALI_ENABLED; then
-        propose_port "Kali MCP port" 8003 KALI_PORT
-    fi
-
     echo ""
     success "Ports configured"
     echo ""
@@ -1396,17 +1751,18 @@ wizard_show_summary() {
     fi
 
     # Show MCP agents
-    local has_mcps=false
-    $MCP_CLI_ENABLED && has_mcps=true
-    $MCP_RECON_ENABLED && has_mcps=true
-    $MCP_KALI_ENABLED && has_mcps=true
+    local has_mcp_endpoints=false
+    $MCP_CLI_ENABLED && has_mcp_endpoints=true
+    $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
-    if $has_mcps; then
+    if $has_mcp_endpoints; then
         echo ""
-        echo -e "  ${BOLD}MCP Agents:${NC}"
+        echo -e "  ${BOLD}MCP endpoints:${NC}"
         $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
         $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
-        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali:      ${CYAN}http://localhost:${KALI_PORT}${NC}"
+    fi
+    if $MCP_KALI_ENABLED; then
+        echo -e "    ${OK} Kali toolbox: ${CYAN}docker exec -it kali-mcp-server bash${NC}"
     fi
 
     echo -e "  API Key:    ${DIM}...${API_KEY: -4} (${API_KEY_ENV_VAR})${NC}"
@@ -1433,7 +1789,7 @@ run_wizard() {
     show_banner
     offer_installer_mode
     cleanup_legacy_version_cache_dir
-    check_docker
+    check_docker install
 
     # Detect existing BugTraceAI containers (running OR stopped — both cause name conflicts)
     local existing_btai
@@ -1616,7 +1972,9 @@ clone_repos() {
                 exit 1
             fi
         fi
-        patch_recon_dockerfile_venv
+        if ! ensure_recon_source; then
+            exit 1
+        fi
         echo -e "    ${OK} reconftw-mcp"
     fi
 }
@@ -1677,15 +2035,24 @@ VITE_CLI_API_URL=${cli_url}
 EOF
             )
 
-            # Add MCP ports if enabled
-            if $MCP_RECON_ENABLED || $MCP_CLI_ENABLED || $MCP_KALI_ENABLED; then
-                cat >> "$WEB_DIR/.env.docker" << EOF
-
-# MCP Agent Configuration
-COMPOSE_PROFILES=${COMPOSE_PROFILES:-}
-RECON_MCP_PORT=${RECON_PORT:-8002}
-CLI_MCP_PORT=${MCP_PORT:-8001}
-EOF
+            # Add only endpoint variables for WEB-owned MCP services.  Profiles
+            # are passed as explicit Docker Compose flags later; persisting
+            # COMPOSE_PROFILES would silently start optional services too early.
+            local web_mcp_env_needed=false
+            $MCP_RECON_ENABLED && web_mcp_env_needed=true
+            if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
+                web_mcp_env_needed=true
+            fi
+            if $web_mcp_env_needed; then
+                {
+                    printf '\n# MCP Endpoint Configuration\n'
+                    if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]]; then
+                        printf 'RECON_MCP_PORT=%s\n' "$RECON_PORT"
+                    fi
+                    if $MCP_CLI_ENABLED && ! $INSTALL_CLI && [[ -n "$MCP_PORT" ]]; then
+                        printf 'CLI_MCP_PORT=%s\n' "$MCP_PORT"
+                    fi
+                } >> "$WEB_DIR/.env.docker"
             fi
 
             chmod 600 "$WEB_DIR/.env.docker" 2>/dev/null || true
@@ -1723,12 +2090,11 @@ EOF
 
 # Generate MCP configuration file for AI assistants (mcporter, claude, etc.)
 generate_mcp_config() {
-    local has_mcps=false
-    $MCP_CLI_ENABLED && has_mcps=true
-    $MCP_RECON_ENABLED && has_mcps=true
-    $MCP_KALI_ENABLED && has_mcps=true
+    local has_mcp_endpoints=false
+    $MCP_CLI_ENABLED && has_mcp_endpoints=true
+    $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
-    if ! $has_mcps; then
+    if ! $has_mcp_endpoints; then
         return
     fi
 
@@ -1742,10 +2108,6 @@ generate_mcp_config() {
 
     if $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]]; then
         entries+=("    \"reconftw\": { \"baseUrl\": \"http://localhost:${RECON_PORT}/sse\" }")
-    fi
-
-    if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" ]]; then
-        entries+=("    \"kali\": { \"baseUrl\": \"http://localhost:${KALI_PORT}\" }")
     fi
 
     # Join entries with comma+newline
@@ -1770,18 +2132,13 @@ EOF
 
 # Patch docker-compose files to use .env values and enable MCP profiles
 patch_compose() {
-    # Build COMPOSE_PROFILES based on MCP selection
-    local profiles=""
-    # If the user is installing the CLI standalone/full mode, the CLI's own docker-compose
-    # runs the MCP. We only want the WEB to run the 'cli' mcp profile if we are in "Solo WEB" mode.
-    if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-        profiles="$profiles,cli"
+    # Migrate installations produced by older launcher versions, which wrote
+    # COMPOSE_PROFILES into .env.docker and could activate optional services
+    # during an unrelated base WEB command.
+    local web_env="$WEB_DIR/.env.docker"
+    if [[ -f "$web_env" ]]; then
+        sed_inplace '/^COMPOSE_PROFILES=/d' "$web_env"
     fi
-    $MCP_RECON_ENABLED && profiles="$profiles,recon"
-    $MCP_KALI_ENABLED && profiles="$profiles,kali"
-    # Remove leading comma
-    profiles="${profiles#,}"
-    export COMPOSE_PROFILES="$profiles"
 
     # Patch CLI docker-compose if CLI or any MCP is enabled
     if [[ -f "$CLI_DIR/docker-compose.yml" ]] && { $INSTALL_CLI || $MCP_CLI_ENABLED; }; then
@@ -1828,6 +2185,7 @@ patch_compose() {
         fi
         if $MCP_RECON_ENABLED; then
             ensure_recon_env_defaults "$web_compose"
+            ensure_recon_local_build "$web_compose"
         fi
         if $MCP_KALI_ENABLED; then
             ensure_kali_startup_command "$web_compose"
@@ -1838,18 +2196,16 @@ patch_compose() {
             sed_inplace "s/\"8001:8001\"/\"${MCP_PORT}:8001\"/" "$web_compose"
         fi
 
-        # Patch Kali port if non-default
-        if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" && "$KALI_PORT" != "8003" ]]; then
-            # Kali doesn't have a default port mapping, add if needed
-            :
-        fi
     fi
 }
 
 # Docker compose helpers
 _web_compose() {
     if [[ -z "$COMPOSE_CMD" ]]; then error "Docker Compose not found. Run: ./launcher.sh"; return 1; fi
-    (cd "$WEB_DIR" && $COMPOSE_CMD --env-file .env.docker "$@")
+    # Do not inherit a caller's COMPOSE_PROFILES, including one left in an old
+    # .env.docker. An empty process value takes precedence over --env-file;
+    # optional agents are selected solely through explicit --profile flags.
+    (cd "$WEB_DIR" && COMPOSE_PROFILES= $COMPOSE_CMD --env-file .env.docker "$@")
 }
 
 _cli_compose() {
@@ -1873,6 +2229,24 @@ _build_with_progress() {
     echo -e "    ${DIM}${label}: building — live docker output below (can take several minutes)${NC}"
     "$@" 2>&1 | tee -a "$build_log"
     return "${PIPESTATUS[0]}"
+}
+
+_start_web_profile() {
+    local label=$1
+    shift
+    local build_log="$INSTALL_DIR/.build.log"
+
+    if _build_with_progress "$label" _web_compose "$@"; then
+        return 0
+    fi
+    echo ""
+    error "Failed to start $label."
+    echo -e "    ${DIM}Last lines from build log:${NC}"
+    tail -5 "$build_log" 2>/dev/null | while IFS= read -r line; do
+        echo -e "    ${RED}│${NC} ${DIM}${line}${NC}"
+    done
+    echo -e "    ${DIM}Full log: ${build_log}${NC}"
+    return 1
 }
 
 start_services() {
@@ -1929,34 +2303,39 @@ start_services() {
         echo -e "    ${OK} CLI service started"
     fi
 
-    # Start MCP agents via WEB docker-compose profiles
-    if [[ -n "$COMPOSE_PROFILES" ]] && [[ -f "$WEB_DIR/docker-compose.yml" ]]; then
+    # Start optional WEB-owned agents only after the base services and CLI are
+    # up. Each profile is a separate Compose invocation so a recon build cannot
+    # cancel Kali's image pull (public WEB names recon `reconftw-mcp:local`).
+    resolve_web_mcp_profiles
+    if (( ${#WEB_MCP_PROFILE_ARGS[@]} > 0 )) && [[ -f "$WEB_DIR/docker-compose.yml" ]]; then
+        local profile_label
+        profile_label="$(IFS=,; printf '%s' "${WEB_MCP_PROFILE_NAMES[*]}")"
         echo ""
-        step "Starting MCP agents (profiles: ${COMPOSE_PROFILES})..."
+        step "Starting optional agents (profiles: ${profile_label})..."
 
-        # Convert comma-separated profiles to individual --profile flags
-        local profile_flags=""
-        local IFS=','
-        read -ra ADDR <<< "$COMPOSE_PROFILES"
-        IFS=$' \t\n' # restore default
-        for profile in "${ADDR[@]}"; do
-            profile_flags="$profile_flags --profile $profile"
-        done
-
-        if ! _build_with_progress "MCP" _web_compose $profile_flags up -d --build; then
-            echo ""
-            error "Failed to start MCP agents."
-            echo -e "    ${DIM}Last lines from build log:${NC}"
-            tail -5 "$build_log" 2>/dev/null | while IFS= read -r line; do
-                echo -e "    ${RED}│${NC} ${DIM}${line}${NC}"
-            done
-            echo -e "    ${DIM}Full log: ${build_log}${NC}"
-            exit 1
+        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
+            if _start_web_profile "MCP" --profile cli up -d --build; then
+                echo -e "    ${OK} BugTraceAI MCP started"
+            else
+                warn "BugTraceAI MCP failed to start. Core services are already up."
+            fi
         fi
-
-        $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI MCP started"
-        $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW MCP started"
-        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali Linux MCP started"
+        if $MCP_RECON_ENABLED; then
+            if ! ensure_recon_source; then
+                error "Cannot start reconFTW until its source is available."
+            elif _start_web_profile "reconFTW" --profile recon up -d --build; then
+                echo -e "    ${OK} reconFTW MCP started"
+            else
+                warn "reconFTW MCP failed to start. Core services are already up."
+            fi
+        fi
+        if $MCP_KALI_ENABLED; then
+            if _start_web_profile "Kali" --profile kali up -d; then
+                echo -e "    ${OK} Kali Linux toolbox started"
+            else
+                warn "Kali toolbox failed to start. Core services are already up."
+            fi
+        fi
     fi
 }
 
@@ -2018,14 +2397,14 @@ health_checks() {
         wait_for_url "http://localhost:${RECON_PORT}/sse" "reconFTW MCP (port ${RECON_PORT})" "$recon_timeout" sse || all_ok=false
     fi
 
-    if $MCP_KALI_ENABLED && [[ -n "$KALI_PORT" ]]; then
-        # Kali doesn't have HTTP endpoint, just check container
+    if $MCP_KALI_ENABLED; then
+        # Kali is a toolbox container, not an HTTP/SSE MCP endpoint.
         local kali_status
         kali_status=$(docker ps --format '{{.Status}}' --filter "name=^kali-mcp-server$" 2>/dev/null | head -1)
         if [[ -n "$kali_status" ]] && echo "$kali_status" | grep -q "Up"; then
-            echo -e "    ${OK} Kali MCP (running)"
+            echo -e "    ${OK} Kali toolbox (running)"
         else
-            echo -e "    ${FAIL} Kali MCP (not running)"
+            echo -e "    ${FAIL} Kali toolbox (not running)"
             all_ok=false
         fi
     fi
@@ -2047,7 +2426,6 @@ save_state() {
   "cli_port": "${CLI_PORT}",
   "mcp_port": "${MCP_PORT}",
   "recon_port": "${RECON_PORT}",
-  "kali_port": "${KALI_PORT}",
   "provider": "${LLM_PROVIDER}",
   "install_web": ${INSTALL_WEB},
   "install_cli": ${INSTALL_CLI},
@@ -2099,18 +2477,17 @@ show_success() {
         fi
     fi
 
-    # Show MCP agents
-    local has_mcps=false
-    $MCP_CLI_ENABLED && has_mcps=true
-    $MCP_RECON_ENABLED && has_mcps=true
-    $MCP_KALI_ENABLED && has_mcps=true
+    # Show only real MCP endpoints here. Kali is rendered separately because
+    # its upstream image is an interactive toolbox, not a network MCP server.
+    local has_mcp_endpoints=false
+    $MCP_CLI_ENABLED && has_mcp_endpoints=true
+    $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
-    if $has_mcps; then
+    if $has_mcp_endpoints; then
         echo ""
-        echo -e "  ${BOLD}MCP Agents:${NC}"
+        echo -e "  ${BOLD}MCP endpoints:${NC}"
         $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
         $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC} (by @six2dez)"
-        $MCP_KALI_ENABLED && echo -e "    ${OK} Kali Linux: ${CYAN}(interactive container)${NC}"
 
         echo ""
         echo -e "  ${BOLD}Connect your AI assistant:${NC}"
@@ -2135,6 +2512,7 @@ show_success() {
 
     if $MCP_KALI_ENABLED; then
         echo ""
+        echo -e "  ${BOLD}Kali toolbox:${NC} ${CYAN}docker exec -it kali-mcp-server bash${NC}"
         echo -e "  ${YELLOW}Kali Tip:${NC} To scan this machine from Kali, use:"
         echo -e "     ${BOLD}${DIM}nmap -Pn host.docker.internal${NC}"
     fi
@@ -2160,7 +2538,6 @@ load_state() {
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     MCP_PORT=$(awk -F'"' '/"mcp_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     RECON_PORT=$(awk -F'"' '/"recon_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
-    KALI_PORT=$(awk -F'"' '/"kali_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     LLM_PROVIDER=$(awk -F'"' '/"provider"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     if [[ -z "$LLM_PROVIDER" && -f "$CLI_DIR/.env" ]]; then
         LLM_PROVIDER=$(awk -F= '/^PROVIDER=/{print $2; exit}' "$CLI_DIR/.env" 2>/dev/null || echo "")
@@ -2274,6 +2651,7 @@ cmd_start() {
     load_state
     info "Starting services..."
     local ok=true
+    local recon_ready=true
     
     # Start WEB services
     if [[ -d "$WEB_DIR" ]] && [[ -n "$WEB_PORT" ]]; then
@@ -2285,19 +2663,22 @@ cmd_start() {
         _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
     fi
     
-    # Start MCP agents
-    if [[ -d "$WEB_DIR" ]] && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
-        # Build profiles string
-        local profiles=""
+    # Start optional WEB-owned agents with explicit profiles, one at a time.
+    resolve_web_mcp_profiles
+    if $MCP_RECON_ENABLED && ! ensure_recon_source; then
+        error "Skipping selected reconFTW MCP profile because its build context is unavailable."
+        recon_ready=false
+        ok=false
+    fi
+    if [[ -d "$WEB_DIR" ]]; then
         if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            profiles="$profiles,cli"
+            _web_compose --profile cli up -d --build || { error "Failed to start BugTraceAI MCP"; ok=false; }
         fi
-        $MCP_RECON_ENABLED && profiles="$profiles,recon"
-        $MCP_KALI_ENABLED && profiles="$profiles,kali"
-        profiles="${profiles#,}"
-
-        if [[ -n "$profiles" ]]; then
-            COMPOSE_PROFILES="$profiles" _web_compose up -d || { error "Failed to start MCP agents"; ok=false; }
+        if $MCP_RECON_ENABLED && $recon_ready; then
+            _web_compose --profile recon up -d --build || { error "Failed to start reconFTW MCP"; ok=false; }
+        fi
+        if $MCP_KALI_ENABLED; then
+            _web_compose --profile kali up -d || { error "Failed to start Kali toolbox"; ok=false; }
         fi
     fi
     
@@ -2308,18 +2689,10 @@ cmd_stop() {
     load_state
     info "Stopping services..."
     
-    # Stop MCP agents first
-    if [[ -d "$WEB_DIR" ]] && ($MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED); then
-        local profile_flags=""
-        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            profile_flags="$profile_flags --profile cli"
-        fi
-        $MCP_RECON_ENABLED && profile_flags="$profile_flags --profile recon"
-        $MCP_KALI_ENABLED && profile_flags="$profile_flags --profile kali"
-
-        if [[ -n "$profile_flags" ]]; then
-            _web_compose $profile_flags stop 2>/dev/null || true
-        fi
+    # Stop optional WEB-owned agents first.
+    resolve_web_mcp_profiles
+    if [[ -d "$WEB_DIR" ]] && (( ${#WEB_MCP_PROFILE_ARGS[@]} > 0 )); then
+        _web_compose "${WEB_MCP_PROFILE_ARGS[@]}" stop 2>/dev/null || true
     fi
     
     # Stop CLI
@@ -2395,6 +2768,25 @@ cmd_update() {
     info "Updating BugTraceAI..."
     echo ""
     local update_ok=true
+    local recon_ready=true
+
+    # WEB's recon profile needs this source directory during its image build.
+    # Do this before rebuilding WEB, not afterwards, so an old/partial install
+    # repairs itself instead of failing with "../reconftw-mcp not found".
+    if [[ "$DEPLOY_MODE" == "recon" || "$DEPLOY_MODE" == "custom" ]] || $MCP_RECON_ENABLED; then
+        if ! ensure_recon_source; then
+            recon_ready=false
+            update_ok=false
+        elif [[ -d "$RECON_DIR/.git" ]]; then
+            step "Pulling Recon updates..."
+            if ! (cd "$RECON_DIR" && git pull --quiet); then
+                warn "Failed to pull Recon updates"
+                update_ok=false
+            fi
+            patch_recon_dockerfile_venv
+            echo -e "    ${OK} Recon updated"
+        fi
+    fi
 
     if [[ -d "$WEB_DIR/.git" ]] && [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
         step "Pulling WEB updates..."
@@ -2408,20 +2800,27 @@ cmd_update() {
         _patch_env_docker
         patch_compose
         step "Rebuilding WEB..."
-        # Include the same MCP --profile flags used at start/build time, otherwise
-        # a plain `up` excludes the profile-gated MCP services (cli/recon/kali) and
-        # they keep running on their OLD images after a git pull.
-        local update_profile_flags=""
-        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            update_profile_flags="$update_profile_flags --profile cli"
-        fi
-        $MCP_RECON_ENABLED && update_profile_flags="$update_profile_flags --profile recon"
-        $MCP_KALI_ENABLED && update_profile_flags="$update_profile_flags --profile kali"
-        if ! _web_compose $update_profile_flags up -d --build; then
+        resolve_web_mcp_profiles
+        if ! _web_compose up -d --build; then
             error "Failed to rebuild WEB services"
             update_ok=false
         else
             echo -e "    ${OK} WEB updated"
+        fi
+        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
+            _web_compose --profile cli up -d --build || { error "Failed to rebuild BugTraceAI MCP"; update_ok=false; }
+        fi
+        if $MCP_RECON_ENABLED; then
+            if ! $recon_ready; then
+                error "Skipping reconFTW rebuild; its build context is unavailable."
+                update_ok=false
+            elif ! _web_compose --profile recon up -d --build; then
+                error "Failed to rebuild reconFTW MCP"
+                update_ok=false
+            fi
+        fi
+        if $MCP_KALI_ENABLED; then
+            _web_compose --profile kali up -d || { error "Failed to start Kali toolbox"; update_ok=false; }
         fi
     fi
 
@@ -2441,16 +2840,6 @@ cmd_update() {
         else
             echo -e "    ${OK} CLI updated"
         fi
-    fi
-
-    if [[ -d "$RECON_DIR/.git" ]] && [[ "$DEPLOY_MODE" == "recon" || "$DEPLOY_MODE" == "custom" || "$MCP_RECON_ENABLED" == "true" ]]; then
-        step "Pulling Recon updates..."
-        if ! (cd "$RECON_DIR" && git pull --quiet); then
-            warn "Failed to pull Recon updates"
-            update_ok=false
-        fi
-        patch_recon_dockerfile_venv
-        echo -e "    ${OK} Recon updated"
     fi
 
     # Clear version cache so next status check fetches fresh data
@@ -2511,6 +2900,8 @@ _teardown_all() {
 # ── Docker Check ─────────────────────────────────────────────────────────────
 
 check_docker() {
+    local may_install="${1:-}"
+
     if $IS_MACOS; then
         ensure_macos_docker_path
         if ! docker info &>/dev/null 2>&1; then
@@ -2518,6 +2909,12 @@ check_docker() {
                 error "Docker runtime is not ready."
                 exit 1
             fi
+        fi
+    elif [[ "$may_install" == "install" ]]; then
+        if ! ensure_linux_docker_engine; then
+            error "Docker Engine is not ready."
+            echo -e "  Install Docker: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            exit 1
         fi
     fi
 
@@ -2587,6 +2984,8 @@ show_help() {
 
 main() {
     ORIG_ARGS=("$@")
+    _init_install_log
+    _log_event INFO "command: ${1:-wizard}"
     case "${1:-}" in
         "")         run_wizard ;;
         status)     cmd_status ;;
@@ -2605,4 +3004,6 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v2.8.7
-Runs on OpenRouter (DeepSeek V3 -> Claude Haiku 4.5) or Anthropic (Claude Haiku 4.5,
-direct Messages API), selected at startup.
+BugTraceAI — AI Setup & Repair Assistant v2.8.8
+Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
+(Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
 This is the IMPERATIVE SHELL of a Functional-Core / Imperative-Shell design.
 All decision logic (timeouts, retries, response parsing, command safety,
@@ -27,9 +27,18 @@ import time
 import signal
 import atexit
 import getpass
+import secrets
+import socket
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Optional
 
 import installer_core as core
 from installer_core import Err, DomainError, PromptSpec, TerminalCaps
+from assistant_runtime import (
+    AgentLoop, LoopOutcome, PrivilegeSession, ToolOutcome,
+    rewrite_service_host_port, rewrite_web_cli_proxy,
+)
 
 # ── Terminal capabilities → palette (pure core decides; we only read env) ─────
 _CAPS = TerminalCaps(
@@ -60,6 +69,7 @@ THINKING = "The AI is thinking" if _UTF8_ENABLED else "The AI is thinking"
 # explicitly on every exit/interrupt path, or a long `docker compose up --build`
 # would be orphaned and keep running after the installer quits.
 _bash = None
+_privilege_session: Optional[PrivilegeSession] = None
 
 
 def _terminate_bash():
@@ -85,6 +95,8 @@ def _cleanup_terminal():
 
 def _on_signal_exit(code):
     _terminate_bash()
+    if _privilege_session is not None:
+        _privilege_session.close()
     if _STDOUT_IS_TTY:
         sys.stdout.write("\n\033[0m  Interrupted.\n")
     sys.exit(code)
@@ -92,22 +104,69 @@ def _on_signal_exit(code):
 
 atexit.register(_terminate_bash)
 atexit.register(_cleanup_terminal)
+
+
+def _close_privilege_session():
+    if _privilege_session is not None:
+        _privilege_session.close()
+
+
+def _docker_info_ok():
+    try:
+        return subprocess.run(
+            ["docker", "info"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=20,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _ensure_linux_docker_engine():
+    """Run the launcher's Linux Docker installer; output and sudo stay on the TTY."""
+    launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh")
+    if not os.path.isfile(launcher):
+        return False
+    env = os.environ.copy()
+    if _INSTALL_LOG_FILE:
+        env["BUGTRACEAI_INSTALL_LOG"] = _INSTALL_LOG_FILE
+    proc = subprocess.run(
+        ["bash", "-c", 'source "$1" && ensure_linux_docker_engine yes',
+         "bash", launcher],
+        env=env,
+    )
+    return proc.returncode == 0
+
+
+atexit.register(_close_privilege_session)
 signal.signal(signal.SIGINT, lambda *_: _on_signal_exit(130))
 signal.signal(signal.SIGTERM, lambda *_: _on_signal_exit(143))
 
+
+def _positive_env_int(name, default):
+    """Read an optional positive integer without making a bad env value fatal."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, value)
+
+
 # ── Constants ────────────────────────────────────────────────────────────────
-MAX_TURNS = 40
+MAX_TURNS = _positive_env_int("BTAI_INSTALLER_MAX_TURNS", 80)
+SUPPORT_TURNS = _positive_env_int("BTAI_INSTALLER_SUPPORT_TURNS", 32)
 CMD_TIMEOUT_DEFAULT = 60
 CMD_TIMEOUT_DOCKER_BUILD = 600
 API_MAX_ATTEMPTS = 4
-INSTALL_DIR = os.path.expanduser("~/bugtraceai")
+INSTALL_DIR = os.path.abspath(os.path.expanduser(
+    os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
 CLI_REPO = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
-VERSION = "2.8.7"
+VERSION = "2.8.8"
 
-# LLM provider + model chain are chosen AFTER the boot banner (the user picks the
-# provider from a menu), so these module globals are (re)assigned during boot.
-# OpenRouter: DeepSeek V3 primary + sticky Claude Haiku 4.5 fallback. Anthropic
+# LLM provider + model chain are resolved from explicit environment overrides or
+# a previous local deployment.  The default is intentionally OpenRouter's
+# DeepSeek -> Qwen chain, with no provider-selection question at boot.
+# OpenRouter: DeepSeek V4.1 Flash primary + sticky Qwen 3.8 Max (0902) fallback. Anthropic
 # (direct Messages API, x-api-key): a single Claude Haiku 4.5. Either primary/
 # fallback can be overridden via env without touching code.
 PROVIDER = core.PROVIDER_OPENROUTER
@@ -124,14 +183,22 @@ _BANNER_SUBTITLE_ASCII = "Autonomous install - diagnose - repair"
 def _build_model_chain(provider):
     """Per-provider model chain, honouring the BTAI_INSTALLER_MODEL/_FALLBACK_MODEL
     env overrides. Anthropic runs a single Haiku 4.5 (its own direct-API slug);
-    OpenRouter keeps the DeepSeek V3 -> Haiku 4.5 fallback pair."""
+    OpenRouter keeps the DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902) fallback
+    pair."""
     if provider == core.PROVIDER_ANTHROPIC:
         primary = os.environ.get("BTAI_INSTALLER_MODEL", core.DEFAULT_ANTHROPIC_PRIMARY_MODEL)
         fallback = os.environ.get("BTAI_INSTALLER_FALLBACK_MODEL", "")
     else:
         primary = os.environ.get("BTAI_INSTALLER_MODEL", core.DEFAULT_PRIMARY_MODEL)
         fallback = os.environ.get("BTAI_INSTALLER_FALLBACK_MODEL", core.DEFAULT_FALLBACK_MODEL)
-    return core.build_model_chain(primary, fallback)
+    chain = core.build_model_chain(primary, fallback)
+    if chain:
+        return chain
+    # A blank environment override must not leave the session with an empty
+    # chain and crash before it can explain the configuration problem.
+    return (core.DEFAULT_ANTHROPIC_PRIMARY_MODEL
+            if provider == core.PROVIDER_ANTHROPIC
+            else core.DEFAULT_PRIMARY_MODEL,)
 
 try:
     COLS = min(os.get_terminal_size().columns, 100)
@@ -147,14 +214,64 @@ def hr(char="─", color=GREY):
     sys.stdout.flush()
 
 
-def ok(msg):   print(f"{GREEN}  {CHECK}  {RESET}{msg}")
-def err(msg):  print(f"{RED}  {CROSS}  {RESET}{msg}")
-def info(msg): print(f"{CYAN}  {DOT}  {RESET}{DIM}{msg}{RESET}")
+_INSTALL_LOG_FILE = None
+
+
+def _install_log_timestamp():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _known_log_secrets():
+    key = globals().get("api_key")
+    return (key,) if key else ()
+
+
+def _log_event(level, msg):
+    if not _INSTALL_LOG_FILE:
+        return
+    line = core.format_install_log_line(
+        _install_log_timestamp(), level, msg, _known_log_secrets())
+    try:
+        with open(_INSTALL_LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
+def _init_install_log():
+    global _INSTALL_LOG_FILE
+    path = os.environ.get("BUGTRACEAI_INSTALL_LOG") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "install.log")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n===== BugTraceAI AI installer v{VERSION}  "
+                f"{_install_log_timestamp()}  pid={os.getpid()} =====\n")
+        _INSTALL_LOG_FILE = path
+    except OSError:
+        _INSTALL_LOG_FILE = None
+
+
+def ok(msg):
+    print(f"{GREEN}  {CHECK}  {RESET}{msg}")
+    _log_event("OK", msg)
+
+
+def err(msg):
+    print(f"{RED}  {CROSS}  {RESET}{msg}")
+    _log_event("ERROR", msg)
+
+
+def info(msg):
+    print(f"{CYAN}  {DOT}  {RESET}{DIM}{msg}{RESET}")
+    _log_event("INFO", msg)
 
 
 def _active_model_label():
     """Display name of the model currently answering; flags the fallback so the
-    user can see when the cheap primary handed off to Haiku."""
+    user can see when the primary handed off to the secondary model."""
+    if not MODEL_CHAIN:
+        return "Assistant"
     name = core.model_display_name(MODEL_CHAIN[_active_model_idx])
     return f"{name} · fallback" if _active_model_idx > 0 else name
 
@@ -163,6 +280,8 @@ def bubble_ai(text):
     print(f"\n{BLUE}{BOLD}  {_active_model_label()}{RESET}")
     for line in textwrap.wrap(text.strip(), width=COLS - 4) or [""]:
         print(f"  {BLUE}{line}{RESET}")
+    if text and text.strip():
+        _log_event("AI", text.strip())
 
 
 def bubble_user(text):
@@ -187,6 +306,10 @@ def cmd_block(cmd, output, rc):
         if len(lines) > show:
             print(f"{DIM}{GREY}  {side}  {ELLIPSIS} ({len(lines) - show} more lines){RESET}")
     print(f"{rc_col}{DIM}  {bottom} exit {rc}{RESET}")
+    _log_event("CMD", f"rc={rc} {cmd}")
+    if rc != 0 and output.strip():
+        tail = "\n".join(output.strip().splitlines()[-20:])
+        _log_event("CMD_OUT", tail)
 
 
 def check_row(label, passed, note=""):
@@ -290,8 +413,336 @@ def validate_key(provider, key):
         return False
 
 
+@dataclass
+class DeploymentContext:
+    """Runtime configuration resolved from state, Docker, and local config.
+
+    Host ports are values discovered at runtime.  They are never guessed from
+    service defaults inside the AI assistant.
+    """
+
+    install_dir: str
+    mode: str
+    provider: str
+    ports: core.DeploymentPorts
+    mcp_cli_enabled: bool = False
+    mcp_recon_enabled: bool = False
+    mcp_kali_enabled: bool = False
+    has_state: bool = False
+
+
+def _as_port(value):
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _read_env_values(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return values
+
+
+def _load_saved_api_key(install_dir, provider):
+    """Read an already-private deployed key locally without exposing it to the
+    assistant transcript.  A missing key simply means we must ask once."""
+    values = _read_env_values(os.path.join(install_dir, "BugTraceAI-CLI", ".env"))
+    key = values.get(core.cli_key_env(provider), "").strip()
+    return key or None
+
+
+def _read_launcher_state(install_dir):
+    try:
+        with open(os.path.join(install_dir, ".launcher-state"), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _allocate_host_port(reserved=()):
+    """Ask the kernel for a currently free host port, without a fixed base."""
+    reserved_ports = {port for port in reserved if _as_port(port) is not None}
+    for _ in range(16):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in reserved_ports:
+            return port
+    raise OSError("could not reserve a distinct ephemeral host port")
+
+
+def _capture_host_command(argv, timeout=5):
+    """Run a fixed host-side probe, retrying via the managed sudo ticket only
+    when Docker socket permissions require it.  This never handles a password."""
+    try:
+        proc = subprocess.run(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return 1, str(ex)
+
+    output = proc.stdout or ""
+    if proc.returncode == 0 or _privilege_session is None:
+        return proc.returncode, output
+    if "permission denied" not in output.lower() or not _privilege_session.ensure():
+        return proc.returncode, output
+
+    try:
+        privileged = subprocess.run(
+            ["sudo", "-n", *argv], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=timeout,
+        )
+        return privileged.returncode, privileged.stdout or ""
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return 1, str(ex)
+
+
+def _published_port(container):
+    rc, output = _capture_host_command(["docker", "port", container])
+    if rc != 0:
+        return None
+    for line in output.splitlines():
+        candidate = line.split("->", 1)[-1].strip()
+        _, sep, tail = candidate.rpartition(":")
+        if sep:
+            port = _as_port(tail)
+            if port is not None:
+                return port
+    return None
+
+
+def _first_published_port(*containers):
+    for container in containers:
+        port = _published_port(container)
+        if port is not None:
+            return port
+    return None
+
+
+def _bool_state(value):
+    return value is True or str(value).strip().lower() == "true"
+
+
+def _resolve_deployment_context():
+    """Merge launcher state, local env files, and live Docker mappings."""
+    state = _read_launcher_state(INSTALL_DIR)
+    requested_mode = os.environ.get("BTAI_INSTALLER_MODE", "").strip().lower()
+    state_mode = str(state.get("mode", "")).strip().lower()
+    mode = requested_mode if requested_mode in ("full", "cli", "web") else state_mode
+    if mode not in ("full", "cli", "web"):
+        mode = "full"
+
+    requested_provider = os.environ.get("BTAI_INSTALLER_PROVIDER", "").strip().lower()
+    state_provider = str(state.get("provider", "")).strip().lower()
+    provider = requested_provider if requested_provider in (
+        core.PROVIDER_OPENROUTER, core.PROVIDER_ANTHROPIC,
+    ) else state_provider
+    if provider not in (core.PROVIDER_OPENROUTER, core.PROVIDER_ANTHROPIC):
+        provider = core.PROVIDER_OPENROUTER
+
+    web_env = _read_env_values(os.path.join(INSTALL_DIR, "BugTraceAI-WEB", ".env.docker"))
+    ports = core.DeploymentPorts(
+        web=_as_port(state.get("web_port")) or _as_port(web_env.get("FRONTEND_PORT")),
+        cli=_as_port(state.get("cli_port")),
+        mcp=_as_port(state.get("mcp_port")) or _as_port(web_env.get("CLI_MCP_PORT")),
+        recon=_as_port(state.get("recon_port")) or _as_port(web_env.get("RECON_MCP_PORT")),
+        kali=_as_port(state.get("kali_port")),
+    )
+    context = DeploymentContext(
+        install_dir=INSTALL_DIR,
+        mode=mode,
+        provider=provider,
+        ports=ports,
+        mcp_cli_enabled=_bool_state(state.get("mcp_cli_enabled")),
+        mcp_recon_enabled=_bool_state(state.get("mcp_recon_enabled")),
+        mcp_kali_enabled=_bool_state(state.get("mcp_kali_enabled")),
+        has_state=bool(state),
+    )
+    return _refresh_deployment_context(context, allocate_web=not context.has_state)
+
+
+def _refresh_deployment_context(context, allocate_web=False):
+    """Prefer actual published Docker ports over possibly stale saved state."""
+    web = _published_port("bugtraceai-web-frontend") or context.ports.web
+    cli = _first_published_port("bugtrace_api", "bugtrace-api") or context.ports.cli
+    mcp = _first_published_port("bugtrace_mcp", "bugtrace-mcp", "bugtrace-cli-mcp") or context.ports.mcp
+    recon = _published_port("reconftw-mcp") or context.ports.recon
+    if allocate_web and context.mode in ("full", "web") and web is None:
+        web = _allocate_host_port()
+    return replace(context, ports=core.DeploymentPorts(
+        web=web, cli=cli, mcp=mcp, recon=recon, kali=context.ports.kali,
+    ))
+
+
+def _write_private_file(path, content):
+    """Write secret-bearing configuration with restrictive permissions from
+    creation time, without rendering the secret in the terminal."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def _set_cli_provider_active(conf_path, provider):
+    """Set only [PROVIDER]/ACTIVE without shelling out or exposing secrets."""
+    try:
+        with open(conf_path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+
+    active = core.cli_conf_active(provider)
+    section_start = next((i for i, line in enumerate(lines)
+                          if line.strip().upper() == "[PROVIDER]"), None)
+    if section_start is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.extend(["\n", "[PROVIDER]\n", f"ACTIVE = {active}\n"])
+    else:
+        section_end = next((i for i in range(section_start + 1, len(lines))
+                            if lines[i].lstrip().startswith("[")), len(lines))
+        for i in range(section_start + 1, section_end):
+            if lines[i].strip().upper().startswith("ACTIVE"):
+                lines[i] = f"ACTIVE = {active}\n"
+                break
+        else:
+            lines.insert(section_end, f"ACTIVE = {active}\n")
+    with open(conf_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _configure_cli():
+    global deployment_context
+    cli_dir = os.path.join(INSTALL_DIR, "BugTraceAI-CLI")
+    if not os.path.isdir(cli_dir):
+        return False, "CLI directory is missing. Clone BugTraceAI-CLI first."
+
+    if setup_action == "install":
+        reserved = [port for port in (
+            deployment_context.ports.web, deployment_context.ports.cli,
+            deployment_context.ports.mcp, deployment_context.ports.recon,
+            deployment_context.ports.kali,
+        ) if port is not None]
+        cli_port = deployment_context.ports.cli or _allocate_host_port(reserved)
+        if not rewrite_service_host_port(
+                os.path.join(cli_dir, "docker-compose.yml"), "bugtrace_api", cli_port):
+            return False, "Could not assign a dynamic host port to the CLI Compose service."
+
+        reserved.append(cli_port)
+        mcp_port = deployment_context.ports.mcp or _allocate_host_port(reserved)
+        mcp_patched = rewrite_service_host_port(
+            os.path.join(cli_dir, "docker-compose.yml"), "bugtrace_mcp", mcp_port)
+        deployment_context = replace(
+            deployment_context,
+            ports=replace(deployment_context.ports, cli=cli_port,
+                          mcp=mcp_port if mcp_patched else deployment_context.ports.mcp),
+            mcp_cli_enabled=mcp_patched or deployment_context.mcp_cli_enabled,
+        )
+
+    env_path = os.path.join(cli_dir, ".env")
+    key_env = core.cli_key_env(PROVIDER)
+    try:
+        _write_private_file(env_path, (
+            f"# Generated by BugTraceAI Launcher v{VERSION}\n"
+            f"PROVIDER={PROVIDER}\n"
+            f"{key_env}={api_key}\n"
+            "BUGTRACE_CORS_ORIGINS=*\n"
+        ))
+        _set_cli_provider_active(os.path.join(cli_dir, "bugtraceaicli.conf"), PROVIDER)
+    except OSError as exc:
+        return False, f"Could not write CLI configuration: {exc}"
+    return True, "CLI configuration was written with restricted permissions."
+
+
+def _configure_web():
+    global deployment_context
+    web_dir = os.path.join(INSTALL_DIR, "BugTraceAI-WEB")
+    if not os.path.isdir(web_dir):
+        return False, "WEB directory is missing. Clone BugTraceAI-WEB first."
+    if setup_action == "repair" and os.path.isfile(os.path.join(web_dir, ".env.docker")):
+        return True, "Existing WEB configuration was preserved during repair."
+
+    if deployment_context.mode == "full" and deployment_context.ports.cli is None:
+        return False, "Full mode needs configure_cli before WEB configuration so its proxy has a resolved CLI endpoint."
+    if deployment_context.ports.web is None:
+        deployment_context = _refresh_deployment_context(deployment_context, allocate_web=True)
+    web_port = deployment_context.ports.web
+    if web_port is None:
+        return False, "Could not allocate a WEB host port."
+    reserved = [port for port in (
+        deployment_context.ports.web, deployment_context.ports.cli,
+        deployment_context.ports.mcp, deployment_context.ports.recon,
+        deployment_context.ports.kali,
+    ) if port is not None]
+    database_port = _allocate_host_port(reserved)
+    database_password = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+                                for _ in range(24))
+    try:
+        _write_private_file(os.path.join(web_dir, ".env.docker"), (
+            f"# Generated by BugTraceAI Launcher v{VERSION}\n"
+            "POSTGRES_USER=bugtraceai\n"
+            f"POSTGRES_PASSWORD={database_password}\n"
+            "POSTGRES_DB=bugtraceai_web\n"
+            f"POSTGRES_PORT={database_port}\n"
+            f"FRONTEND_PORT={web_port}\n"
+            "VITE_CLI_API_URL=/cli-api\n"
+        ))
+        if deployment_context.mode == "full" and not rewrite_web_cli_proxy(
+                os.path.join(web_dir, "nginx.conf"), deployment_context.ports.cli):
+            return False, "Could not point the WEB proxy at the resolved CLI endpoint."
+    except OSError as exc:
+        return False, f"Could not write WEB configuration: {exc}"
+    return True, f"WEB configuration was written for the resolved host endpoint {core.endpoint_url(web_port)}."
+
+
+def _save_ai_state(context):
+    """Persist the same public state contract consumed by launcher.sh.
+
+    The state deliberately excludes API and database secrets.
+    """
+    state_path = os.path.join(context.install_dir, ".launcher-state")
+    data = {
+        "version": VERSION,
+        "mode": context.mode,
+        "web_port": str(context.ports.web or ""),
+        "cli_port": str(context.ports.cli or ""),
+        "mcp_port": str(context.ports.mcp or ""),
+        "recon_port": str(context.ports.recon or ""),
+        "kali_port": str(context.ports.kali or ""),
+        "provider": context.provider,
+        "primary_model": MODEL_CHAIN[0] if MODEL_CHAIN else "",
+        "fallback_model": MODEL_CHAIN[1] if len(MODEL_CHAIN) > 1 else "",
+        "install_web": context.mode in ("full", "web"),
+        "install_cli": context.mode in ("full", "cli"),
+        "mcp_cli_enabled": context.mcp_cli_enabled,
+        "mcp_recon_enabled": context.mcp_recon_enabled,
+        "mcp_kali_enabled": context.mcp_kali_enabled,
+        "install_dir": context.install_dir,
+        "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _write_private_file(state_path, json.dumps(data, indent=2) + "\n")
+
+
 # ── Verification (runs the pure plan; the predicates are pure) ────────────────
-def run_verification(run_fn, mode):
+def run_verification(run_fn, context):
     print()
     hr("═", CYAN + BOLD)
     print(f"{CYAN}{BOLD}  Checking that everything responds{ELLIPSIS}{RESET}")
@@ -300,8 +751,27 @@ def run_verification(run_fn, mode):
 
     report = []
     all_ok = True
-    for check in core.verification_checks(mode, INSTALL_DIR):
+
+    # A running container without a resolved host endpoint is not enough to
+    # claim that the user can reach the service.  Do not substitute a familiar
+    # port number here; make the unresolved mapping visible to the agent.
+    required_ports = []
+    if context.mode in ("full", "cli"):
+        required_ports.append(("CLI host port", context.ports.cli))
+    if context.mode in ("full", "web"):
+        required_ports.append(("WEB host port", context.ports.web))
+    for label, port in required_ports:
+        passed = port is not None
+        check_row(label, passed, str(port) if passed else "not discovered")
+        report.append(f"[{'PASS' if passed else 'FAIL'}] {label}: {port if passed else 'not discovered'}")
+        all_ok = all_ok and passed
+
+    for check in core.verification_checks(
+            context.mode, context.install_dir, context.ports,
+            mcp_enabled=context.mcp_cli_enabled,
+            recon_enabled=context.mcp_recon_enabled):
         rc, out = run_fn(check.command)
+        out = core.redact_sensitive_output(out, (api_key,))
         passed = core.evaluate_check(check.predicate, rc, out)
         note = out.strip()[:50] if out.strip() else ""
         check_row(check.label, passed, note if passed else (note or "FAILED"))
@@ -321,7 +791,7 @@ def run_verification(run_fn, mode):
     return all_ok, "\n".join(report)
 
 
-def print_success_next_steps(mode, action):
+def print_success_next_steps(context, action):
     action_label = "Repair" if action == "repair" else "Installation"
     print()
     hr("═", GREEN + BOLD)
@@ -329,18 +799,21 @@ def print_success_next_steps(mode, action):
     hr("═", GREEN + BOLD)
     print()
     print(f"{WHITE}{BOLD}  Check it now on your machine:{RESET}")
-    if mode in ("full", "web"):
-        print(f"  {CYAN}- WEB:{RESET} http://localhost:6869")
-    if mode in ("full", "cli"):
-        print(f"  {CYAN}- CLI health:{RESET} http://localhost:8000/health")
+    if context.mode in ("full", "web") and context.ports.web is not None:
+        print(f"  {CYAN}- WEB:{RESET} {core.endpoint_url(context.ports.web)}")
+    if context.mode in ("full", "cli") and context.ports.cli is not None:
+        print(f"  {CYAN}- CLI health:{RESET} {core.endpoint_url(context.ports.cli, '/health')}")
     print(f"  {CYAN}- Status:{RESET} ./launcher.sh status")
     print(f"  {CYAN}- Logs:{RESET} ./launcher.sh logs")
+    if _INSTALL_LOG_FILE:
+        print(f"  {CYAN}- Install log:{RESET} {_INSTALL_LOG_FILE}")
     print()
     print(f"{DIM}  You can type a question now, or press ENTER to exit.{RESET}")
 
 
 # ── Boot ──────────────────────────────────────────────────────────────────────
 reconnect_tty_or_exit()
+_init_install_log()
 os.system("clear")
 print()
 bw = 56
@@ -359,16 +832,20 @@ print(f"{GREY}  Assisted agent with shell access. It can install BugTraceAI,{RES
 print(f"{GREY}  diagnose services, Docker, ports, database and configuration,{RESET}")
 print(f"{GREY}  and verify the result automatically.{RESET}")
 print(f"{GREY}  Recommended for clean VMs, VPS or controlled environments.{RESET}")
+if _INSTALL_LOG_FILE:
+    print(f"{GREY}  Install log: {_INSTALL_LOG_FILE}{RESET}")
 print()
 hr()
 
-# Sudo
-with spinner_running("Requesting sudo"):
-    _sudo = subprocess.run(["sudo", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-if _sudo.returncode != 0:
+# Privilege is intentionally acquired through the native terminal prompt.  We
+# retain no password: sudo owns a temporary ticket, refreshed only while this
+# process lives and explicitly invalidated on exit.
+_privilege_session = PrivilegeSession()
+info("Authenticate once with sudo if required; its native prompt will appear below.")
+if not _privilege_session.authenticate():
     err("Sudo access is required to continue.")
     sys.exit(1)
-ok("Sudo access confirmed.")
+ok("Temporary sudo session is active for this launcher only.")
 
 # Disclaimer
 print()
@@ -381,44 +858,46 @@ if not confirm("Continue?"):
     print("\n  Cancelled.\n")
     sys.exit(0)
 
-# ── Provider selection (before the key, so the prompt + validation match) ─────
-_env_provider = os.environ.get("BTAI_INSTALLER_PROVIDER", "").strip().lower()
-if _env_provider in (core.PROVIDER_OPENROUTER, core.PROVIDER_ANTHROPIC):
-    PROVIDER = _env_provider
-    ok(f"Provider (from BTAI_INSTALLER_PROVIDER): {PROVIDER}")
-else:
-    print()
-    print(f"{WHITE}{BOLD}  Which LLM provider should power the assistant?{RESET}")
-    print()
-    print(f"  {CYAN}1){RESET} OpenRouter   {DIM}(DeepSeek V3, key starts with sk-or-){RESET}")
-    print(f"  {CYAN}2){RESET} Anthropic    {DIM}(Claude Haiku 4.5, direct API, key starts with sk-ant-){RESET}")
-    print()
-    sys.stdout.write(f"{YELLOW}  Option [1/2]: {RESET}")
-    sys.stdout.flush()
-    PROVIDER = core.PROVIDER_ANTHROPIC if sys.stdin.readline().strip() == "2" else core.PROVIDER_OPENROUTER
+if sys.platform != "darwin" and not _docker_info_ok():
+    info("Docker Engine is not ready; installing or starting it...")
+    if not _ensure_linux_docker_engine() and not _docker_info_ok():
+        err("Docker Engine is required. Install it and rerun this installer.")
+        sys.exit(1)
+    if _docker_info_ok():
+        ok("Docker Engine is ready.")
+    else:
+        info("Docker is installed; privileged commands will be used until this user is in the docker group.")
 
+# ── Resolve existing state and choose safe defaults ───────────────────────────
+# No wizard is needed for the usual path.  A fresh target gets the full
+# deployment and an existing/partial target gets diagnosis first.  Advanced
+# callers may override either through explicit environment variables.
+deployment_context = _resolve_deployment_context()
+PROVIDER = deployment_context.provider
 MODEL_CHAIN = _build_model_chain(PROVIDER)
 _provider_name = "Anthropic" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter"
 _key_label = "Anthropic API key (sk-ant-...)" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter API key"
-ok(f"Provider: {_provider_name}  {DOT}  Model: {core.model_display_name(MODEL_CHAIN[0])}")
+_chain_label = " -> ".join(core.model_display_name(model) for model in MODEL_CHAIN)
+ok(f"Assistant provider: {_provider_name}  {DOT}  Models: {_chain_label}")
 
-# API key — read WITHOUT echo so it never appears on screen; only a masked
-# form (asterisks + last 5 chars) is ever displayed back to the user.
-print()
-try:
-    api_key = getpass.getpass(f"  {_key_label} (hidden input): ").strip()
-except Exception:
-    # getpass could not disable echo (odd PTY / no controlling TTY). Warn loudly
-    # rather than silently reading the key in cleartext.
-    err("WARNING: input could not be hidden — the API key WILL be visible on screen.")
-    sys.stdout.write(f"{WHITE}{BOLD}  {_key_label}:{RESET} ")
-    sys.stdout.flush()
-    api_key = sys.stdin.readline().strip()
-if not api_key:
-    err("The API key is required.")
-    sys.exit(1)
-# Fixed-width mask: asterisks + last 5 chars, so the display never leaks length.
-ok(f"API key received: {core.mask_secret(api_key, mask_width=8)}")
+api_key = _load_saved_api_key(INSTALL_DIR, PROVIDER)
+if api_key:
+    ok(f"Using the locally saved API key: {core.mask_secret(api_key, mask_width=8)}")
+else:
+    print()
+    try:
+        api_key = getpass.getpass(f"  {_key_label} (hidden input): ").strip()
+    except Exception:
+        # getpass could not disable echo (odd PTY / no controlling TTY). Warn loudly
+        # rather than silently reading the key in cleartext.
+        err("WARNING: input could not be hidden — the API key WILL be visible on screen.")
+        sys.stdout.write(f"{WHITE}{BOLD}  {_key_label}:{RESET} ")
+        sys.stdout.flush()
+        api_key = sys.stdin.readline().strip()
+    if not api_key:
+        err("The API key is required.")
+        sys.exit(1)
+    ok(f"API key received: {core.mask_secret(api_key, mask_width=8)}")
 
 hr()
 with spinner_running("Validating API key"):
@@ -428,33 +907,15 @@ if not _valid:
 ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
 hr()
 
-# Action selection
-print()
-print(f"{WHITE}{BOLD}  What would you like to do?{RESET}")
-print()
-print(f"  {CYAN}1){RESET} Install BugTraceAI")
-print(f"  {CYAN}2){RESET} Repair or diagnose an existing installation")
-print()
-sys.stdout.write(f"{YELLOW}  Option [1/2]: {RESET}")
-sys.stdout.flush()
-_action_input = sys.stdin.readline().strip()
-setup_action = "repair" if _action_input == "2" else "install"
-ok("Mode: repair/diagnose" if setup_action == "repair" else "Mode: install")
-
-# Scope selection
-print()
-print(f"{WHITE}{BOLD}  {'Which part do you want to review?' if setup_action == 'repair' else 'What do you want to install?'}{RESET}")
-print()
-_dash = "—" if _UTF8_ENABLED else "-"
-print(f"  {CYAN}1){RESET} Full platform        {DIM}(WEB + CLI {_dash} recommended){RESET}")
-print(f"  {CYAN}2){RESET} CLI only             {DIM}(scanner API, no web interface){RESET}")
-print(f"  {CYAN}3){RESET} WEB only             {DIM}(web interface {_dash} needs the CLI API elsewhere){RESET}")
-print()
-sys.stdout.write(f"{YELLOW}  Option [1/2/3]: {RESET}")
-sys.stdout.flush()
-_mode_input = sys.stdin.readline().strip()
-install_mode = {"1": "full", "2": "cli", "3": "web"}.get(_mode_input, "full")
-ok(f"Selected mode: {install_mode}")
+_requested_action = os.environ.get("BTAI_INSTALLER_ACTION", "").strip().lower()
+_existing_target = deployment_context.has_state or any(
+    os.path.isdir(os.path.join(INSTALL_DIR, name))
+    for name in ("BugTraceAI-CLI", "BugTraceAI-WEB")
+)
+setup_action = (_requested_action if _requested_action in ("install", "repair")
+                else ("repair" if _existing_target else "install"))
+install_mode = deployment_context.mode
+ok(f"Detected plan: {setup_action}  {DOT}  mode: {install_mode}")
 print()
 hr()
 print()
@@ -465,14 +926,14 @@ print()
 SYSTEM = core.build_system_prompt(PromptSpec(
     mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
     api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
-    provider=PROVIDER))
+    provider=PROVIDER, ports=deployment_context.ports))
 
 messages = [
     {"role": "system", "content": SYSTEM},
     {"role": "user", "content": (
         f"Action: {setup_action}. Install mode: {install_mode}. "
         f"Install directory: {INSTALL_DIR}. "
-        f"The API key is already in your system prompt — do NOT ask for it. "
+        f"The host holds the API key privately — do NOT ask for it. "
         f"If action is repair, diagnose first and do not reinstall without asking. "
         f"If action is install, start by assessing the system (Step 0), then follow the playbook."
     )},
@@ -481,10 +942,28 @@ messages = [
 tools = [
     {"type": "function", "function": {
         "name": "run_command",
-        "description": "Run a bash command in a persistent stateful shell. cd and env vars persist.",
+        "description": ("Run a non-privileged bash command in a persistent stateful shell. "
+                        "cd and env vars persist. Do not include sudo."),
         "parameters": {"type": "object",
                        "properties": {"command": {"type": "string", "description": "The bash command to execute."}},
                        "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "run_privileged_command",
+        "description": ("Run a root-required bash command through the temporary host-managed sudo ticket. "
+                        "The command starts in a fresh shell, so include its working directory. Do not include sudo."),
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string", "description": "The root-required bash command to execute."}},
+                       "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "configure_cli",
+        "description": ("Configure the cloned CLI locally. The host writes the API key securely and assigns dynamic "
+                        "host port mappings; use this after cloning CLI and before building it."),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "configure_web",
+        "description": ("Configure the cloned WEB locally. The host chooses dynamic ports, creates the database secret, "
+                        "and connects the WEB proxy to the resolved CLI endpoint in Full mode."),
+        "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "ask_user",
         "description": "Ask the user a question when a real preference decision is needed.",
@@ -553,10 +1032,14 @@ def call_api():
     """Try each model in MODEL_CHAIN, starting from the active one. A model that
     fails terminally with a fallback-eligible error (network down, 4xx/5xx,
     corrupt body) hands off to the next model. The switch is STICKY — once we
-    move to Haiku we stay there for the rest of the session instead of thrashing
-    back to a dead/rate-limited primary. Returns Ok(AssistantMessage) or
+    move to the secondary model we stay there for the rest of the session instead
+    of thrashing back to a dead/rate-limited primary. Returns Ok(AssistantMessage) or
     Err(DomainError) once the chain is exhausted."""
     global _active_model_idx
+    if not MODEL_CHAIN:
+        return Err(DomainError("configuration", "No assistant model is configured."))
+    if _active_model_idx >= len(MODEL_CHAIN):
+        _active_model_idx = 0
     idx = _active_model_idx
     while True:
         result = _call_one_model(MODEL_CHAIN[idx])
@@ -679,179 +1162,251 @@ def run_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
     return rc, output
 
 
-# ── Tool dispatch helpers (shared by both loops) ──────────────────────────────
+# ── Tool dispatch and autonomous agent loop ──────────────────────────────────
+def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
+    """Run one root-required command through sudo's cached ticket.
+
+    It deliberately uses a fresh process rather than the persistent user shell:
+    a sudo expiry can then trigger the native terminal prompt in ``ensure()``
+    rather than blocking invisibly behind the shell pipe.  No password enters
+    Python memory or a command string.
+    """
+    safe_cmd, was_followed = core.harden_command(cmd)
+    if _privilege_session is None or not _privilege_session.ensure():
+        return 1, "[AUTH_REQUIRED] sudo authentication was cancelled or expired."
+
+    argv = (["/bin/bash", "-lc", safe_cmd] if os.geteuid() == 0
+            else ["sudo", "-n", "/bin/bash", "-lc", safe_cmd])
+    try:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True,
+        )
+    except OSError as exc:
+        return 1, str(exc)
+
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_bash_group(proc)
+        try:
+            output, _ = proc.communicate(timeout=5)
+        except Exception:
+            output = ""
+        return 124, f"[TIMEOUT after {timeout}s — process killed]\n{output or ''}"
+
+    output = output or ""
+    if was_followed:
+        output = "[note] removed -f/--follow so the command can terminate.\n" + output
+    return proc.returncode, output
+
+
 def _tool_result(tc_id, name, content):
     return {"role": "tool", "tool_call_id": tc_id, "name": name, "content": content}
 
 
-def _run_command_tool(tc, args):
+def _run_shell_tool(tc, args, privileged=False):
     cmd = args.get("command")
-    if not cmd:
-        return _tool_result(tc.id, tc.name, "ERROR: no 'command' was provided.")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return _tool_result(tc.id, tc.name, "ERROR: a non-empty string 'command' is required.")
+    cmd = cmd.strip()
+    if core.requests_sudo(cmd):
+        return _tool_result(
+            tc.id, tc.name,
+            "ERROR: do not write sudo in commands. Use run_privileged_command without sudo.")
     if core.is_destructive(cmd):
         bubble_ai(f"The command looks destructive:\n  {cmd}")
         if not confirm("Run it anyway?"):
             return _tool_result(tc.id, tc.name, "The user declined to run the command.")
-    t = core.select_timeout(cmd, CMD_TIMEOUT_DEFAULT, CMD_TIMEOUT_DOCKER_BUILD)
-    is_long = t > CMD_TIMEOUT_DEFAULT
-    if is_long:
-        with spinner_running(core.command_spinner_label(cmd)) as sp:
-            rc, out = run_cmd(cmd, timeout=t, spinner=sp)
+
+    timeout = core.select_timeout(cmd, CMD_TIMEOUT_DEFAULT, CMD_TIMEOUT_DOCKER_BUILD)
+    runner = run_privileged_cmd if privileged else run_cmd
+    if timeout > CMD_TIMEOUT_DEFAULT:
+        with spinner_running(core.command_spinner_label(cmd)) as spinner:
+            rc, output = runner(cmd, timeout=timeout, spinner=spinner)
     else:
-        rc, out = run_cmd(cmd, timeout=t)
-    cmd_block(cmd, out, rc)
-    return _tool_result(tc.id, tc.name, f"Exit code: {rc}\nOUTPUT:\n{out}")
+        rc, output = runner(cmd, timeout=timeout)
+    output = core.redact_sensitive_output(output, (api_key,))
+    cmd_block(cmd, output, rc)
+    return _tool_result(tc.id, tc.name, f"Exit code: {rc}\nOUTPUT:\n{output}")
 
 
 def _ask_user_tool(tc, args):
     question = args.get("question", "How would you like to continue?")
+    if not isinstance(question, str) or not question.strip():
+        question = "How would you like to continue?"
     bubble_ai(question)
     answer = prompt_user()
     bubble_user(answer)
     return _tool_result(tc.id, tc.name, answer)
 
 
-# ── Request the assistant; handle Err gracefully ──────────────────────────────
+def _verification_command(cmd):
+    """Run checks as the user first, escalating only for a Docker socket error."""
+    rc, output = run_cmd(cmd)
+    if (rc != 0 and "docker" in cmd and "permission denied" in output.lower()):
+        return run_privileged_cmd(cmd)
+    return rc, output
+
+
+_consecutive_tool_protocol_errors = 0
+
+
+def _protocol_error(tc, description):
+    """Return a model-visible tool error and fail over after repeated malformed
+    calls.  A second model can often recover when the primary got stuck emitting
+    an incompatible tool schema.
+    """
+    global _active_model_idx, _consecutive_tool_protocol_errors
+    _consecutive_tool_protocol_errors += 1
+    suffix = ""
+    if (core.tool_error_requires_failover(_consecutive_tool_protocol_errors)
+            and _active_model_idx + 1 < len(MODEL_CHAIN)):
+        previous = MODEL_CHAIN[_active_model_idx]
+        _active_model_idx += 1
+        _consecutive_tool_protocol_errors = 0
+        suffix = (" The assistant was switched from "
+                  f"{core.model_display_name(previous)} to "
+                  f"{core.model_display_name(MODEL_CHAIN[_active_model_idx])}.")
+        info(suffix.strip())
+    return ToolOutcome(_tool_result(tc.id, tc.name, f"ERROR: {description}{suffix}"))
+
+
+def _finish_tool(tc, args):
+    global deployment_context
+    summary = args.get("summary", "")
+    if not isinstance(summary, str):
+        return _protocol_error(tc, "'summary' must be a string.")
+    if summary.strip():
+        bubble_ai(summary)
+
+    deployment_context = _refresh_deployment_context(deployment_context)
+    all_ok, report = run_verification(_verification_command, deployment_context)
+    if not all_ok:
+        _log_event("ERROR", "verification failed")
+        return ToolOutcome(_tool_result(
+            tc.id, tc.name,
+            "VERIFICATION FAILED. Fix the issues and call finish again.\n" + report))
+
+    try:
+        _save_ai_state(deployment_context)
+    except OSError as exc:
+        return ToolOutcome(_tool_result(
+            tc.id, tc.name,
+            f"VERIFICATION PASSED but state could not be saved: {exc}. Fix that and call finish again."))
+    _log_event("OK", "verification passed")
+    print_success_next_steps(deployment_context, setup_action)
+    return ToolOutcome(_tool_result(tc.id, tc.name, "VERIFICATION PASSED.\n" + report), finished=True)
+
+
+def _dispatch_tool(tc):
+    """Validate a model call at the boundary and execute exactly one host tool."""
+    global _consecutive_tool_protocol_errors
+    _log_event("TOOL", tc.name)
+    parsed = core.parse_tool_arguments(tc.arguments)
+    if core.is_err(parsed):
+        return _protocol_error(tc, f"{parsed.error.message} {parsed.error.detail}")
+    _consecutive_tool_protocol_errors = 0
+    args = parsed.value
+
+    if tc.name == "run_command":
+        return ToolOutcome(_run_shell_tool(tc, args, privileged=False))
+    if tc.name == "run_privileged_command":
+        return ToolOutcome(_run_shell_tool(tc, args, privileged=True))
+    if tc.name == "configure_cli":
+        try:
+            success, detail = _configure_cli()
+        except Exception as exc:
+            success, detail = False, f"CLI configuration failed: {exc}"
+        return ToolOutcome(_tool_result(tc.id, tc.name,
+                                        ("OK: " if success else "ERROR: ") + detail))
+    if tc.name == "configure_web":
+        try:
+            success, detail = _configure_web()
+        except Exception as exc:
+            success, detail = False, f"WEB configuration failed: {exc}"
+        return ToolOutcome(_tool_result(tc.id, tc.name,
+                                        ("OK: " if success else "ERROR: ") + detail))
+    if tc.name == "ask_user":
+        return ToolOutcome(_ask_user_tool(tc, args))
+    if tc.name == "finish":
+        return _finish_tool(tc, args)
+    return _protocol_error(tc, f"unknown tool '{tc.name}'.")
+
+
+# ── Request the assistant; handle provider errors as values ──────────────────
+_last_agent_error = None
+
+
 def request_assistant():
     with spinner_running(THINKING):
-        result = call_api()
-    return result
+        return call_api()
 
 
-def _fail_and_exit(error: DomainError, code=1):
+def _report_agent_error(error):
+    global _last_agent_error
+    _last_agent_error = error
     err(error.message)
     if error.detail:
         info(error.detail)
-    info("You can try again by running: ./launcher.sh")
-    try:
-        _bash.stdin.close()
-    except Exception:
-        pass
-    sys.exit(code)
 
 
-# ── Main chat loop (turn-limited) ─────────────────────────────────────────────
-turn = 0
-finished = False
-
-while turn < MAX_TURNS:
-    turn += 1
-    sys.stdout.write(f"{DIM}  [{turn}/{MAX_TURNS}]{RESET}\n")
+def _render_turn(turn, limit):
+    sys.stdout.write(f"{DIM}  [{turn}/{limit}]{RESET}\n")
     sys.stdout.flush()
 
-    result = request_assistant()
-    if core.is_err(result):
-        _fail_and_exit(result.error)
-    msg = result.value
 
-    if msg.content:
-        bubble_ai(msg.content)
-
-    if msg.tool_calls:
-        messages.append(core.assistant_message_dict(msg))
-        for tc in msg.tool_calls:
-            parsed = core.parse_tool_arguments(tc.arguments)
-            if core.is_err(parsed):
-                # Feed the error back so the model can self-correct instead of crashing.
-                messages.append(_tool_result(tc.id, tc.name,
-                                             f"ERROR: {parsed.error.message} {parsed.error.detail}"))
-                continue
-            args = parsed.value
-
-            if tc.name == "run_command":
-                messages.append(_run_command_tool(tc, args))
-            elif tc.name == "ask_user":
-                messages.append(_ask_user_tool(tc, args))
-            elif tc.name == "finish":
-                bubble_ai(args.get("summary", ""))
-                all_ok, report = run_verification(run_cmd, install_mode)
-                if all_ok:
-                    messages.append(_tool_result(tc.id, tc.name, f"VERIFICATION PASSED.\n{report}"))
-                    finished = True
-                    print_success_next_steps(install_mode, setup_action)
-                else:
-                    remaining = MAX_TURNS - turn
-                    messages.append(_tool_result(
-                        tc.id, tc.name,
-                        f"VERIFICATION FAILED. Fix the issues and call finish again.\n"
-                        f"You have {remaining} turns remaining.\n{report}"))
-            else:
-                messages.append(_tool_result(tc.id, tc.name, f"ERROR: unknown tool '{tc.name}'."))
-        if finished:
-            break
-    elif msg.content:
-        # The model spoke without a tool call → conversational turn.
-        messages.append(core.assistant_message_dict(msg))
-        answer = prompt_user()
-        if answer.lower() in ("exit", "quit", "bye", "salir"):
-            print(f"\n{CYAN}  Done. See you later.{RESET}\n")
+def _close_persistent_shell():
+    try:
+        if _bash is not None and _bash.stdin is not None:
             _bash.stdin.close()
-            sys.exit(0)
-        if answer:
-            bubble_user(answer)
-            messages.append({"role": "user", "content": answer})
-    else:
-        # Empty response (no content, no tool calls): don't append a null message
-        # (the API would reject it) and don't block on input — nudge and continue.
-        messages.append({"role": "user", "content": "Continue with the next step."})
+    except Exception:
+        pass
 
-# ── Exhausted ─────────────────────────────────────────────────────────────────
-if not finished:
+
+def _report_turn_limit(limit):
+    _log_event("ERROR", f"turn limit reached ({limit})")
     print()
     hr("═", RED + BOLD)
-    print(f"{RED}{BOLD}  Turn limit reached ({MAX_TURNS}). It did not finish.{RESET}")
-    print(f"{RED}  Try the standard installer: ./launcher.sh{RESET}")
+    print(f"{RED}{BOLD}  Turn limit reached ({limit}). The current task is not verified yet.{RESET}")
+    print(f"{RED}  You can describe the next repair step, or press ENTER to exit.{RESET}")
     hr("═", RED + BOLD)
     print()
-    _bash.stdin.close()
-    sys.exit(1)
 
-# ── Post-finish support loop (unlimited) ──────────────────────────────────────
-while True:
-    answer = prompt_user()
-    if not answer or answer.lower() in ("exit", "quit", "bye", "salir"):
-        print(f"\n{CYAN}  Done. See you later.{RESET}\n")
-        break
-    bubble_user(answer)
-    messages.append({"role": "user", "content": answer})
 
-    result = request_assistant()
-    if core.is_err(result):
-        err(result.error.message)
-        if result.error.detail:
-            info(result.error.detail)
-        continue
-    msg = result.value
+# Installer pass: tool results and status lines both request the model again.
+# Real questions go through ask_user (blocks in the tool). Enter is not continue.
+agent_loop = AgentLoop(
+    messages=messages,
+    request=request_assistant,
+    is_error=core.is_err,
+    assistant_message=core.assistant_message_dict,
+    dispatch_tool=_dispatch_tool,
+    render_assistant=bubble_ai,
+    on_error=_report_agent_error,
+    on_turn=_render_turn,
+)
 
-    if msg.content:
-        bubble_ai(msg.content)
+outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
+if outcome == LoopOutcome.ERROR:
+    info("The provider session stopped. You can run ./launcher.sh to start a new one.")
+elif outcome == LoopOutcome.TURN_LIMIT:
+    _report_turn_limit(MAX_TURNS)
 
-    if msg.tool_calls:
-        messages.append(core.assistant_message_dict(msg))
-        for tc in msg.tool_calls:
-            parsed = core.parse_tool_arguments(tc.arguments)
-            if core.is_err(parsed):
-                messages.append(_tool_result(tc.id, tc.name,
-                                             f"ERROR: {parsed.error.message} {parsed.error.detail}"))
-                continue
-            args = parsed.value
-            if tc.name == "run_command":
-                messages.append(_run_command_tool(tc, args))
-            elif tc.name == "ask_user":
-                messages.append(_ask_user_tool(tc, args))
-            elif tc.name == "finish":
-                # Re-verify on finish here too, so a repair done during Q&A is
-                # actually re-checked instead of blindly acknowledged.
-                bubble_ai(args.get("summary", ""))
-                all_ok, report = run_verification(run_cmd, install_mode)
-                tag = "VERIFICATION PASSED." if all_ok else "VERIFICATION FAILED. Fix and call finish again."
-                messages.append(_tool_result(tc.id, tc.name, f"{tag}\n{report}"))
-            else:
-                messages.append(_tool_result(tc.id, tc.name, f"ERROR: unknown tool '{tc.name}'."))
-    elif msg.content:
-        messages.append(core.assistant_message_dict(msg))
+# Prompt only after the installer has stopped (verified, or out of turns).
+# Empty Enter exits; a typed question is optional post-verify support.
+if outcome in (LoopOutcome.FINISHED, LoopOutcome.TURN_LIMIT):
+    while True:
+        answer = prompt_user()
+        if not answer or answer.lower() in ("exit", "quit", "bye", "salir"):
+            print(f"\n{CYAN}  Done. See you later.{RESET}\n")
+            break
+        bubble_user(answer)
+        messages.append({"role": "user", "content": answer})
+        outcome = agent_loop.advance(SUPPORT_TURNS, wait_on_text=True)
+        if outcome == LoopOutcome.ERROR:
+            break
+        if outcome == LoopOutcome.TURN_LIMIT:
+            _report_turn_limit(SUPPORT_TURNS)
 
-try:
-    _bash.stdin.close()
-except Exception:
-    pass
+_close_persistent_shell()
