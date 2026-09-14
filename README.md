@@ -13,8 +13,8 @@
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
   <a href="https://discord.gg/5HjujkScC"><img src="https://img.shields.io/badge/Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Community on Discord" /></a>
-  <img src="https://img.shields.io/badge/Version-2.8.7-blue" />
-  <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" />
+  <img src="https://img.shields.io/badge/Version-2.8.8-blue" />
+  <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
 </p>
@@ -25,7 +25,7 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB, CLI, or both with a single command.
 
-**New in v2.8.7**: **Anthropic is now a selectable LLM provider** (Claude direct API, `sk-ant-...` / Messages API) — in both the standard provider selector (which configures the deployed CLI) and the AI Setup & Repair Assistant. The **AI Setup & Repair Assistant** (`ai_installer.py`) runs on **DeepSeek V3** (via OpenRouter) or **Claude Haiku 4.5** (Anthropic direct), chosen at startup, with an automatic sticky fallback on the OpenRouter path — cheaper by default, resilient when it matters. It can **install** from scratch or **repair/diagnose** an existing deployment, and you pick the scope (Full / CLI / WEB). The OpenRouter API key is entered with hidden input and only shown back masked. Commands run in a stateful persistent Bash shell under a kernel-enforced timeout, destructive commands require confirmation, and the UI is English. The standard installer streams Docker's native build output (no fragile spinner), installs dependencies across distros (apt/dnf/yum/pacman/zypper), and writes generated `.env` files with `600` permissions.
+**New in v2.8.8**: the **AI Setup & Repair Assistant** (`ai_installer.py`) defaults to **DeepSeek V4.1 Flash** via OpenRouter, with sticky **Qwen 3.8 Max (0902)** failover. It uses one visible native `sudo` authentication to obtain a temporary ticket—never stores the root password—and revokes that ticket on exit. The assistant key is held outside the LLM transcript, configuration secrets are written with mode `600`, and fresh AI deployments select host ports dynamically instead of relying on fixed values. Tool results now automatically continue the model loop, including after installation, so the chat does not stall after one command. The standard installer remains available as the guided alternative.
 
 > This repository is part of the [BugTraceAI](https://github.com/BugTraceAI/BugTraceAI) monorepo (as a git submodule) and also works as a standalone repo.
 
@@ -74,8 +74,8 @@ If you start from a local clone with `./launcher.sh`, the first menu also lets y
 **The installer will automatically detect and offer to install missing dependencies** across major Linux distros:
 
 - ✅ **Git & curl** → Installed via your package manager (`apt-get`, `dnf`, `yum`, `pacman`, or `zypper`) if missing
+- ✅ **Docker Engine** → Installed automatically via Docker's official installer (`get.docker.com`), with a distro-package fallback, then the daemon is started and your user is added to the `docker` group
 - ✅ **Docker Compose** → Installed automatically as plugin (`docker-compose-plugin`) or standalone binary if missing
-- ℹ️ **Docker Engine** → If missing, the installer provides clear instructions and a quick-install command
 
 You'll be prompted for confirmation before anything is installed. If no supported package manager is found, the installer provides manual installation instructions.
 
@@ -229,6 +229,8 @@ Stops all containers, removes Docker volumes (including databases), and deletes 
 
 ## Troubleshooting
 
+**Installer log:** the wizard and the AI installer append events to `install.log` in the same directory as `launcher.sh` (override with `BUGTRACEAI_INSTALL_LOG`). API keys and env-style secrets are redacted. Docker image builds still go to `~/bugtraceai/.build.log`.
+
 **Services not starting:**
 
 ```bash
@@ -253,9 +255,11 @@ brew install lima-additional-guestagents
 colima start --runtime docker
 ```
 
-### macOS MCP Compatibility Notes (reconFTW + Kali)
+### MCP and Kali Toolbox Compatibility Notes
 
-The launcher now applies macOS-focused compatibility patches during deployment when these MCPs are enabled.
+The launcher starts optional Compose profiles explicitly after the base WEB and CLI services are up. This keeps a full selection from attempting reconFTW or Kali during the initial WEB build.
+
+If Docker reports that `../reconftw-mcp` cannot be found, run `./launcher.sh update`. The launcher restores a completely missing sibling source checkout before building the recon profile. It intentionally refuses to overwrite an existing incomplete `reconftw-mcp` folder, so move that folder aside or restore its `Dockerfile` first if prompted.
 
 **reconFTW MCP (Apple Silicon):**
 - Forces `linux/amd64` for `six2dez/reconftw:main` on ARM hosts.
@@ -264,16 +268,17 @@ The launcher now applies macOS-focused compatibility patches during deployment w
 - Extends reconFTW health timing on ARM emulation.
 - Patches startup behavior to skip heavy `reconftw/install.sh` auto-bootstrap by default (`RECONFTW_AUTO_INSTALL=false`) to avoid health timeouts.
 
-**Kali MCP:**
-- Rewrites the Kali startup command into a robust single `bash -lc` command to avoid multiline parsing/continuation issues during package install.
-- Verifies key binaries (`nmap`, `hydra`, `python3`) after install in container startup.
+**Kali toolbox:**
+- Replaces either upstream command format with a retrying startup command and verifies `nmap`, `hydra`, and `python3` before it stays running.
+- `nuclei` is installed separately so a transient package issue does not take down the whole toolbox.
+- The upstream Kali image is an interactive toolbox, not an HTTP/SSE MCP server, so it is not emitted as a fake MCP URL. Open a shell with `docker exec -it kali-mcp-server bash`.
 
 If you still see MCP issues after pulling latest launcher changes, rebuild only the affected service:
 
 ```bash
 cd ~/bugtraceai/BugTraceAI-WEB
-docker compose --env-file .env.docker build --no-cache reconftw-mcp kali-mcp
-docker compose --env-file .env.docker up -d reconftw-mcp kali-mcp
+docker compose --env-file .env.docker --profile recon --profile kali build --no-cache reconftw-mcp kali-mcp
+docker compose --env-file .env.docker --profile recon --profile kali up -d reconftw-mcp kali-mcp
 ```
 
 Then inspect logs:
@@ -298,14 +303,16 @@ The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the inte
 
 ## AI-Assisted Installer
 
-BugTraceAI Launcher includes an optional **AI Setup & Repair Assistant** (`ai_installer.py`) powered by **DeepSeek V3**, with an automatic fallback to **Claude Haiku 4.5** (both via OpenRouter). You choose up front whether to **install** from scratch or **repair/diagnose** an existing deployment, then the scope (Full / CLI / WEB). The API key is entered hidden and shown back masked, destructive commands require confirmation, and the assistant can autonomously:
+BugTraceAI Launcher includes an optional **AI Setup & Repair Assistant** (`ai_installer.py`) powered by **DeepSeek V4.1 Flash**, with an automatic sticky fallback to **Qwen 3.8 Max (0902)** (both via OpenRouter). A fresh target defaults to a Full install; an existing or partial target defaults to repair/diagnosis first. The assistant only asks when a real decision is needed, such as confirming a destructive reinstall. The API key is entered hidden only if no private local CLI configuration exists, destructive commands require confirmation, and the assistant can autonomously:
 
 - Analyze your system configuration and error logs
 - Diagnose Docker, network, port, or dependency issues
 - Propose and apply fixes interactively
 - Guide you through complex deployment scenarios (VM hosts, non-standard environments)
 
-The AI mode starts only after explicit confirmation with a classic `[y/N]` prompt. If you answer `y`, it asks for your OpenRouter API key and validates it before starting the agent; invalid keys stop the installer with an error. After validation, it can execute shell commands through its `run_command` tool while attempting to complete the installation, so use it primarily on clean VMs, VPS instances, or disposable test environments.
+The AI mode starts only after explicit confirmation with a classic `[y/N]` prompt. It then opens the operating system's normal `sudo` prompt once, keeping only sudo's temporary ticket for the running launcher; the password is never stored in Python, a shell variable, or the model context. If no locally saved key is available, it asks for and validates your OpenRouter API key before starting the agent. The key is never inserted into the system prompt: dedicated host tools write it directly to the private CLI configuration.
+
+For AI-managed fresh installs, host ports are allocated dynamically and then verified from Docker's published mappings. The WEB proxy is wired to the resolved CLI endpoint by the host tool, not by asking the model to guess a port. Every successful command/tool result immediately triggers the next model turn; after verification passes, the same loop remains available for support and repairs.
 
 ### How to invoke
 
@@ -322,11 +329,11 @@ cd ~/bugtraceai-launcher
 - Your **OpenRouter API key** (the same one used for BugTraceAI)
 - Internet access to reach the OpenRouter API
 
-> The AI installer uses DeepSeek V3 (falling back to Claude Haiku 4.5) through OpenRouter. You can override either model with the `BTAI_INSTALLER_MODEL` and `BTAI_INSTALLER_FALLBACK_MODEL` environment variables. It is experimental and can run commands after you opt in, so review the terminal output and use the standard wizard if you prefer fully manual control.
+> The AI installer uses DeepSeek V4.1 Flash (falling back to Qwen 3.8 Max (0902)) through OpenRouter. You can override either model with `BTAI_INSTALLER_MODEL` and `BTAI_INSTALLER_FALLBACK_MODEL`; use `BTAI_INSTALLER_ACTION`, `BTAI_INSTALLER_MODE`, or `BTAI_INSTALLER_PROVIDER` only when you need to override the safe detected defaults. It is experimental and can run commands after you opt in, so review the terminal output and use the standard wizard if you prefer fully manual control.
 
 ## License
 
-AGPL-3.0 License. See the [LICENSE](LICENSE) file for details.
+Apache License 2.0. See the [LICENSE](LICENSE) file for details.
 
 ## Links
 

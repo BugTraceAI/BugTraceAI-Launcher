@@ -26,11 +26,15 @@ the boundary parsers (json.loads), which immediately become typed DomainErrors.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 
 HEALTHY_TOKENS = ("healthy", "ok", "ready", "up", "alive", "running", "pass")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?im)^(?P<name>[A-Z0-9_]*(?:API_KEY|TOKEN|PASSWORD|SECRET)[A-Z0-9_]*)=(?P<value>[^\r\n]*)$")
 
 
 # ── Errors as values ──────────────────────────────────────────────────────────
@@ -206,6 +210,29 @@ def harden_command(cmd: str) -> Tuple[str, bool]:
     return (safe, True)
 
 
+def requests_sudo(cmd: str) -> bool:
+    """True when a model tried to invoke sudo itself.
+
+    The imperative shell owns privilege escalation through a dedicated tool so
+    sudo can never prompt invisibly inside the persistent command pipe.
+    """
+    # Inspect only the command position of each simple shell segment.  A plain
+    # substring/token scan would reject harmless output such as `printf sudo`.
+    for segment in re.split(r"(?:;|\|\||&&|\||[()])", cmd.lower()):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("="):
+            tokens.pop(0)  # environment assignment before a command
+        if not tokens:
+            continue
+        token = tokens[0]
+        if token == "sudo" or token.endswith("/sudo"):
+            return True
+    return False
+
+
 def is_destructive(cmd: str) -> bool:
     """True if the command is likely destructive. The shell turns True into an
     explicit y/N confirmation; it never silently blocks. Tokenized + whitespace
@@ -294,6 +321,29 @@ def mask_secret(secret: str, visible: int = 5, mask_char: str = "*",
     return mask_char * width + secret[-visible:]
 
 
+def redact_sensitive_output(text: str, known_secrets=()) -> str:
+    """Remove known secrets and env-style credential assignments from command
+    output before it reaches the terminal transcript or the model.  Pure.
+
+    The host still needs the key in memory for provider requests and private
+    configuration, but shell diagnostics should never become a second route for
+    exposing it to the assistant context.
+    """
+    redacted = str(text or "")
+    for secret in known_secrets:
+        if secret:
+            redacted = redacted.replace(str(secret), "[REDACTED]")
+    return _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group('name')}=[REDACTED]", redacted)
+
+
+def format_install_log_line(timestamp: str, level: str, message: str,
+                            known_secrets=()) -> str:
+    """One append-only installer event line. Newlines flattened; secrets redacted."""
+    body = " ".join(redact_sensitive_output(str(message or ""), known_secrets).split())
+    tag = str(level or "INFO").strip().upper() or "INFO"
+    return f"{timestamp} {tag} {body}\n"
+
+
 def backoff_delay(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:
     """Deterministic exponential backoff: base * 2^(attempt-1), capped. No
     randomness so the function stays pure and testable; the shell may add jitter
@@ -305,11 +355,11 @@ def backoff_delay(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:
 
 # ── Model selection / fallback chain (pure) ───────────────────────────────────
 # The installer drives an agentic tool-calling loop, so the model MUST be a
-# reliable tool-caller. DeepSeek V3 is the cheap primary; Claude Haiku 4.5 is the
-# proven fallback used only if the primary fails terminally. Both ids are
-# OpenRouter slugs; the shell may override either via env vars.
-DEFAULT_PRIMARY_MODEL = "deepseek/deepseek-chat"
-DEFAULT_FALLBACK_MODEL = "anthropic/claude-haiku-4.5"
+# reliable tool-caller. DeepSeek V4.1 Flash is the primary; Qwen 3.8 Max
+# (0902) is the sticky fallback used only if the primary fails terminally. Both
+# ids are OpenRouter slugs; the shell may override either via env vars.
+DEFAULT_PRIMARY_MODEL = "deepseek/deepseek-v4.1-flash"
+DEFAULT_FALLBACK_MODEL = "qwen/qwen3.8-max-0902"
 
 # Error kinds that mean "this model/provider could not give us a usable
 # response", so trying the next model in the chain is worthwhile. These are
@@ -323,6 +373,8 @@ _FALLBACK_ELIGIBLE_KINDS = frozenset({
 # Human-friendly names for the model ids we ship, so the UI never shows a raw
 # slug. Anything not listed degrades to its last path segment.
 _MODEL_DISPLAY_NAMES = {
+    "deepseek/deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+    "qwen/qwen3.8-max-0902": "Qwen 3.8 Max (0902)",
     "deepseek/deepseek-chat": "DeepSeek V3",
     "anthropic/claude-haiku-4.5": "Haiku 4.5",
     "claude-haiku-4-5": "Haiku 4.5",
@@ -395,6 +447,12 @@ def is_fallback_eligible(error: "DomainError") -> bool:
     """True if a terminal error from one model call warrants handing off to the
     next model in the chain (rather than failing outright). Pure."""
     return error.kind in _FALLBACK_ELIGIBLE_KINDS
+
+
+def tool_error_requires_failover(consecutive_errors: int, limit: int = 2) -> bool:
+    """A model that repeatedly emits unusable tool arguments is not making
+    progress.  After a short correction chance, switch to the next model."""
+    return consecutive_errors >= max(1, limit)
 
 
 def model_display_name(model_id: str) -> str:
@@ -760,11 +818,17 @@ def evaluate_check(predicate: str, rc: int, out: str) -> bool:
     text = out.strip()
     if predicate == "rc0_nonempty":
         return rc == 0 and bool(text)
+    if predicate == "rc0":
+        return rc == 0
+    if predicate == "sse":
+        # A healthy SSE endpoint commonly stays open until curl reaches its
+        # client timeout, which is exit 28 rather than a transport failure.
+        return rc in (0, 28)
     if predicate == "nonempty":
         return bool(text)
     if predicate == "health":
         low = out.lower()
-        return rc == 0 and (not text or any(token in low for token in HEALTHY_TOKENS))
+        return rc == 0 and bool(text) and any(token in low for token in HEALTHY_TOKENS)
     if predicate == "http200":
         return text == "200"
     if predicate == "exists":
@@ -772,13 +836,40 @@ def evaluate_check(predicate: str, rc: int, out: str) -> bool:
     return False
 
 
-def verification_checks(mode: str, install_dir: str) -> Tuple[Check, ...]:
+@dataclass(frozen=True)
+class DeploymentPorts:
+    """Published host ports resolved from launcher state or Docker.
+
+    They are optional because an existing partial deployment may not have a
+    published endpoint yet.  The imperative shell treats a missing required
+    endpoint as a failed verification rather than inventing a default port.
+    """
+
+    web: Optional[int] = None
+    cli: Optional[int] = None
+    mcp: Optional[int] = None
+    recon: Optional[int] = None
+    kali: Optional[int] = None
+
+
+def endpoint_url(port: Optional[int], path: str = "") -> Optional[str]:
+    """Build a local endpoint only from a resolved port."""
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    return f"http://localhost:{port}{path}"
+
+
+def verification_checks(mode: str, install_dir: str,
+                        ports: Optional[DeploymentPorts] = None,
+                        mcp_enabled: bool = False,
+                        recon_enabled: bool = False) -> Tuple[Check, ...]:
     """The verification plan as immutable data, derived purely from the install
     mode and directory. The shell iterates this, runs each command, and applies
     evaluate_check."""
+    ports = ports or DeploymentPorts()
     checks = [
         Check("Docker daemon",
-              "docker info --format '{{.ServerVersion}}' 2>/dev/null",
+              "docker info --format '{{.ServerVersion}}'",
               "rc0_nonempty"),
     ]
     if mode in ("full", "cli"):
@@ -786,13 +877,13 @@ def verification_checks(mode: str, install_dir: str) -> Tuple[Check, ...]:
             Check("CLI container (bugtrace_api)",
                   "docker ps --filter 'name=^bugtrace_api$' --format '{{.Names}} {{.Status}}'",
                   "nonempty"),
-            Check("CLI health (localhost:8000)",
-                  "curl -sf --max-time 5 http://localhost:8000/health 2>/dev/null",
-                  "health"),
             Check("CLI configuration (.env)",
                   f"test -f {install_dir}/BugTraceAI-CLI/.env && echo exists",
                   "exists"),
         ]
+        cli_health = endpoint_url(ports.cli, "/health")
+        if cli_health:
+            checks.append(Check("CLI health", f"curl -sf --max-time 5 {cli_health} 2>/dev/null", "health"))
     if mode in ("full", "web"):
         for cname, label in (
             ("bugtraceai-web-db", "PostgreSQL WEB"),
@@ -804,13 +895,27 @@ def verification_checks(mode: str, install_dir: str) -> Tuple[Check, ...]:
                 f"docker ps --filter 'name=^{cname}$' --format '{{{{.Names}}}} {{{{.Status}}}}'",
                 "nonempty"))
         checks += [
-            Check("WEB frontend (localhost:6869)",
-                  "curl -sf --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:6869 2>/dev/null",
-                  "http200"),
             Check("WEB configuration (.env.docker)",
                   f"test -f {install_dir}/BugTraceAI-WEB/.env.docker && echo exists",
                   "exists"),
         ]
+        web_url = endpoint_url(ports.web)
+        if web_url:
+            checks.append(Check("WEB frontend", f"curl -sf --max-time 5 -o /dev/null -w '%{{http_code}}' {web_url} 2>/dev/null", "http200"))
+
+    if mode == "full":
+        proxy_health = endpoint_url(ports.web, "/cli-api/health")
+        if proxy_health:
+            checks.append(Check("WEB to CLI proxy", f"curl -sf --max-time 5 {proxy_health} 2>/dev/null", "health"))
+
+    if mcp_enabled:
+        mcp_url = endpoint_url(ports.mcp, "/sse")
+        if mcp_url:
+            checks.append(Check("BugTraceAI MCP endpoint", f"curl -sf --max-time 3 {mcp_url} >/dev/null 2>&1", "sse", critical=False))
+    if recon_enabled:
+        recon_url = endpoint_url(ports.recon, "/sse")
+        if recon_url:
+            checks.append(Check("reconFTW MCP endpoint", f"curl -sf --max-time 3 {recon_url} >/dev/null 2>&1", "sse", critical=False))
     return tuple(checks)
 
 
@@ -820,30 +925,29 @@ class PromptSpec:
     mode: str          # full | cli | web
     action: str        # install | repair
     install_dir: str
+    # Retained for API compatibility at the boundary. It is never included in
+    # the prompt sent to an LLM.
     api_key: str
     cli_repo: str
     web_repo: str
     max_turns: int
-    provider: str = "openrouter"   # openrouter | anthropic — configures the deployed CLI
+    provider: str = "openrouter"
+    ports: DeploymentPorts = DeploymentPorts()
 
 
 def build_system_prompt(spec: PromptSpec) -> str:
-    """Build the agent system prompt. Pure: all dependencies (repos, key, dir,
-    turn budget) are injected via PromptSpec, none read from globals."""
+    """Build the agent prompt without credentials or invented port numbers."""
     install_dir = spec.install_dir
     cli_playbook = web_playbook = cli_verify = web_verify = ""
-
-    # Provider-aware deployment: which .env key var the deployed CLI reads, and
-    # (for a non-OpenRouter provider) the command that selects its preset in the
-    # conf. Default 'openrouter' reproduces the historical prompt exactly.
-    key_env = cli_key_env(spec.provider)
     provider_label = {"openrouter": "OPENROUTER", "anthropic": "ANTHROPIC",
                       "zai": "GLM/Z.AI"}.get(spec.provider, "OPENROUTER")
-    provider_select_step = "" if spec.provider == "openrouter" else (
-        f"4b. Point the deployed CLI at the {spec.provider} provider (it reads\n"
-        f"    [PROVIDER] ACTIVE from bugtraceaicli.conf, which ships as openrouter):\n"
-        f"     {cli_conf_patch_command(spec.provider)}\n"
-    )
+
+    endpoint_lines = []
+    for label, port in (("WEB", spec.ports.web), ("CLI", spec.ports.cli),
+                        ("BugTraceAI MCP", spec.ports.mcp), ("reconFTW MCP", spec.ports.recon)):
+        endpoint = endpoint_url(port)
+        endpoint_lines.append(f"- {label}: {endpoint}" if endpoint else f"- {label}: not resolved yet")
+    endpoint_context = "\n".join(endpoint_lines)
 
     if spec.mode in ("full", "cli"):
         cli_playbook = f"""
@@ -851,28 +955,24 @@ STEP 1: INSTALL CLI
 1. mkdir -p {install_dir} && cd {install_dir}
 2. git clone --depth 1 {spec.cli_repo} BugTraceAI-CLI
 3. cd BugTraceAI-CLI
-4. Create the .env file with this EXACT content (use cat << 'EOF' > .env):
-     {key_env}={spec.api_key}
-     BUGTRACE_CORS_ORIGINS=*
-   Then harden it: chmod 600 .env   (the file holds a secret).
-{provider_select_step}5. Build and start (this takes 5-15 min on first run):
+4. Call configure_cli. It writes the provider configuration and API secret
+   locally with mode 600. Never create or print the secret yourself.
+5. Build and start (this takes 5-15 min on first run):
      docker compose up -d --build
 6. Inspect build/startup output WITHOUT following forever:
      docker compose logs --tail=30
    (Never use -f/--follow — it blocks indefinitely.)
-   Wait until you see "Application startup complete" or similar.
-7. Verify health:
-     curl -sf http://localhost:8000/health
-   Must return {{"status":"healthy"}}. Retry every 15 seconds, up to 5 minutes.
+7. Call finish when the service is ready. The launcher resolves actual published
+   ports from Docker and verifies the real endpoints.
 
 Expected containers after CLI install:
-  - bugtrace_api (port 8000) — FastAPI scanner API
-  - bugtrace_mcp (port 8001) — MCP SSE server (depends on bugtrace_api health)
+  - bugtrace_api — FastAPI scanner API
+  - bugtrace_mcp — MCP SSE server, when enabled
 """
         cli_verify = """
 CLI checks:
   - Container bugtrace_api is Up
-  - curl http://localhost:8000/health returns {"status":"healthy"}
+  - A discovered CLI health endpoint responds healthy
   - File {install_dir}/BugTraceAI-CLI/.env exists
 """.replace("{install_dir}", install_dir)
 
@@ -883,31 +983,25 @@ STEP {step_num}: INSTALL WEB
 1. cd {install_dir}
 2. git clone --depth 1 {spec.web_repo} BugTraceAI-WEB
 3. cd BugTraceAI-WEB
-4. Generate a random password and create .env.docker (use cat << EOF > .env.docker):
-     POSTGRES_USER=bugtraceai
-     POSTGRES_PASSWORD=<generate a random 24-char alphanumeric password>
-     POSTGRES_DB=bugtraceai_web
-     FRONTEND_PORT=6869
-     VITE_CLI_API_URL=/cli-api
-   Then harden it: chmod 600 .env.docker   (it holds the DB password).
+4. Call configure_web. It chooses an available host port at runtime, creates a
+   random database password locally, and writes .env.docker with mode 600.
 5. Build and start (this takes 5-10 min on first run):
      docker compose --env-file .env.docker up -d --build
 6. Inspect progress WITHOUT following forever:
      docker compose --env-file .env.docker logs --tail=30
    (Never use -f/--follow.)
-7. Verify:
-     curl -sf -o /dev/null -w '%{{http_code}}' http://localhost:6869
-   Must return 200. Retry every 15 seconds, up to 5 minutes.
+7. Call finish when ready. The launcher verifies the discovered WEB endpoint
+   and, in Full mode, the WEB-to-CLI proxy.
 
 Expected containers after WEB install:
-  - bugtraceai-web-db (PostgreSQL on port 5432)
-  - bugtraceai-web-backend (Express on port 3001)
-  - bugtraceai-web-frontend (nginx on port 6869)
+  - bugtraceai-web-db
+  - bugtraceai-web-backend
+  - bugtraceai-web-frontend
 """
         web_verify = """
 WEB checks:
   - Containers bugtraceai-web-db, bugtraceai-web-backend, bugtraceai-web-frontend are Up
-  - curl http://localhost:6869 returns HTTP 200
+  - A discovered WEB endpoint returns HTTP 200
   - File {install_dir}/BugTraceAI-WEB/.env.docker exists
 """.replace("{install_dir}", install_dir)
 
@@ -933,16 +1027,22 @@ INSTALL MODE RULES:
 
     bar = "=" * 60
     return f"""You are the BugTraceAI Autonomous Setup & Repair agent.
-You have root shell access via the run_command tool. Beyond installing, you
-also diagnose and fix problems with an existing deployment (failed services,
-database connectivity, Docker, ports, env/config) when the user asks.
+Use run_command as the installation user and run_privileged_command for
+root-required work. configure_cli and configure_web are host-managed setup
+tools that handle secrets and dynamic endpoint wiring. Never type sudo yourself
+and never ask the user for their root password. Beyond installing, diagnose and
+fix problems with an existing deployment when the user asks.
 
 {action_instructions}
 INSTALL MODE: {mode_label}
 INSTALL DIRECTORY: {install_dir}
-{provider_label} API KEY: {spec.api_key}
+DEPLOYED CLI PROVIDER: {provider_label}
 
-You ALREADY have the API key above. Do NOT ask the user for it again.
+RESOLVED ENDPOINTS (never invent fixed ports):
+{endpoint_context}
+
+The host holds the API key privately. Do NOT ask for it, print it, search for it,
+or create an API-key line manually. Use configure_cli when CLI configuration is needed.
 
 {bar}
 INSTALLATION PLAYBOOK — Follow these steps IN ORDER
@@ -951,16 +1051,13 @@ INSTALLATION PLAYBOOK — Follow these steps IN ORDER
 STEP 0: SYSTEM ASSESSMENT (do this first, silently)
 - Run: uname -a && cat /etc/os-release 2>/dev/null && free -h && df -h /
 - Check Docker: docker --version && docker compose version
-- If Docker is NOT installed:
-  a. curl -fsSL https://get.docker.com | sudo sh
-  b. sudo usermod -aG docker $USER
-  c. sudo systemctl enable docker && sudo systemctl start docker
-  d. newgrp docker  (or use sudo for docker commands)
-- If docker compose is not available:
-  a. Try: sudo apt-get install -y docker-compose-plugin
-  b. Or download binary from GitHub
+- On Linux the launcher installs Docker Engine before this agent starts when
+  it is missing. Do not run get.docker.com yourself. If compose is still
+  missing, use run_privileged_command for that package only.
+- If a Docker command reports socket permission denied, rerun that command with
+  run_privileged_command (again without typing sudo).
 - Check if {install_dir} already exists. If BugTraceAI containers are running,
-  use ask_user to confirm reinstall before proceeding.
+  use ask_user to confirm a reinstall before proceeding.
 {cli_playbook}{web_playbook}
 {bar}
 VERIFICATION — What the system checks when you call finish
@@ -974,6 +1071,7 @@ and MUST fix the issues, then call finish again.
 RULES
 {bar}
 1. Shell is STATEFUL: cd and env vars persist between run_command calls.
+   Privileged commands are separate and must include their own working directory.
 2. Always use non-interactive flags: apt-get install -y, DEBIAN_FRONTEND=noninteractive.
 3. NEVER run destructive commands (rm -rf /, database drops) without ask_user.
 4. All messages to the user MUST be in English unless the user asks otherwise.
@@ -982,8 +1080,11 @@ RULES
 7. When a command returns exit code 124, it was killed by timeout.
    Docker builds have a long timeout, other commands a short one.
 8. NEVER use -f/--follow with `logs` — it blocks forever. Use --tail=N.
-9. Any .env file you create MUST be chmod 600 (it holds secrets).
+9. Do not hardcode, guess, or reuse a port number. Read the resolved endpoint
+   context or let the launcher discover it after Docker starts.
 10. After verification passes, remain available for troubleshooting.
 11. Keep messages brief and informative. No walls of text.
 12. If a docker build fails, check disk space and RAM first.
+13. Only answer with text when you need a genuine user decision or are answering
+    a direct question. Otherwise make the next appropriate tool call yourself.
 """

@@ -229,7 +229,7 @@ launch_wizard() {
     fi
 
     if [[ "${use_ai:-}" =~ ^[Yy]$ ]]; then
-        info "Starting AI Setup & Repair Assistant (DeepSeek V3 · Haiku 4.5 fallback)..."
+        info "Starting AI Setup & Repair Assistant (DeepSeek V4.1 Flash · Qwen 3.8 Max fallback)..."
         exec_as_target python3 "$LAUNCHER_DIR/ai_installer.py"
     else
         info "Starting BugTraceAI standard setup wizard..."
