@@ -13,7 +13,7 @@
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
   <a href="https://discord.gg/5HjujkScC"><img src="https://img.shields.io/badge/Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Community on Discord" /></a>
-  <img src="https://img.shields.io/badge/Version-2.8.8-blue" />
+  <img src="https://img.shields.io/badge/Version-2.9.0-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
@@ -25,7 +25,7 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB, CLI, or both with a single command.
 
-**New in v2.8.8**: the **AI Setup & Repair Assistant** (`ai_installer.py`) defaults to **DeepSeek V4.1 Flash** via OpenRouter, with sticky **Qwen 3.8 Max (0902)** failover. It uses one visible native `sudo` authentication to obtain a temporary ticket—never stores the root password—and revokes that ticket on exit. The assistant key is held outside the LLM transcript, configuration secrets are written with mode `600`, and fresh AI deployments select host ports dynamically instead of relying on fixed values. Tool results now automatically continue the model loop, including after installation, so the chat does not stall after one command. The standard installer remains available as the guided alternative.
+**New in v2.9.0**: the **AI Setup & Repair Assistant** (`ai_installer.py`) defaults to **DeepSeek V4.1 Flash** via OpenRouter, with sticky **Qwen 3.8 Max (0902)** failover. It uses one visible native `sudo` authentication to obtain a temporary ticket—never stores the root password—and revokes that ticket on exit. The assistant key is held outside the LLM transcript, configuration secrets are written with mode `600`, and fresh AI deployments select host ports dynamically instead of relying on fixed values. The installer keeps going until verification (a status line no longer waits for Enter). On Linux it can install Docker Engine if missing. reconFTW is built from the cloned local source instead of pulling `reconftw-mcp:local`, and Kali starts in a separate Compose step. Events go to `install.log` next to `launcher.sh`. The standard installer remains available as the guided alternative.
 
 > This repository is part of the [BugTraceAI](https://github.com/BugTraceAI/BugTraceAI) monorepo (as a git submodule) and also works as a standalone repo.
 

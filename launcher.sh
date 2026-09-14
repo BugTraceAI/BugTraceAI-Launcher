@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.8.6')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.0')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
