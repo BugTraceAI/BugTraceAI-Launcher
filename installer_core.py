@@ -933,6 +933,9 @@ class PromptSpec:
     max_turns: int
     provider: str = "openrouter"
     ports: DeploymentPorts = DeploymentPorts()
+    mcp_cli: bool = False
+    mcp_recon: bool = False
+    mcp_kali: bool = False
 
 
 def build_system_prompt(spec: PromptSpec) -> str:
@@ -998,6 +1001,23 @@ Expected containers after WEB install:
   - bugtraceai-web-backend
   - bugtraceai-web-frontend
 """
+        mcp_steps = []
+        if spec.mcp_recon:
+            mcp_steps.append(
+                "reconFTW MCP: after WEB is up, start it separately with "
+                "`docker compose --env-file .env.docker --profile recon up -d --build`. "
+                "Do not fold recon into the first WEB up.")
+        if spec.mcp_kali:
+            mcp_steps.append(
+                "Kali toolbox: after WEB is up, start it separately with "
+                "`docker compose --env-file .env.docker --profile kali up -d`. "
+                "Do not fold Kali into the first WEB up.")
+        if mcp_steps:
+            numbered = "\n".join(f"{i}. {step}" for i, step in enumerate(mcp_steps, 1))
+            web_playbook += f"""
+STEP {int(step_num) + 1}: OPTIONAL MCPs SELECTED BY THE USER
+{numbered}
+"""
         web_verify = """
 WEB checks:
   - Containers bugtraceai-web-db, bugtraceai-web-backend, bugtraceai-web-frontend are Up
@@ -1037,6 +1057,12 @@ fix problems with an existing deployment when the user asks.
 INSTALL MODE: {mode_label}
 INSTALL DIRECTORY: {install_dir}
 DEPLOYED CLI PROVIDER: {provider_label}
+SELECTED COMPONENTS:
+- WEB: {"yes" if spec.mode in ("full", "web") else "no"}
+- CLI: {"yes" if spec.mode in ("full", "cli") else "no"}
+- BugTraceAI MCP: {"yes" if spec.mcp_cli else "no"}
+- reconFTW MCP: {"yes" if spec.mcp_recon else "no"}
+- Kali toolbox: {"yes" if spec.mcp_kali else "no"}
 
 RESOLVED ENDPOINTS (never invent fixed ports):
 {endpoint_context}
@@ -1054,8 +1080,9 @@ STEP 0: SYSTEM ASSESSMENT (do this first, silently)
 - On Linux the launcher installs Docker Engine before this agent starts when
   it is missing. Do not run get.docker.com yourself. If compose is still
   missing, use run_privileged_command for that package only.
-- If a Docker command reports socket permission denied, rerun that command with
-  run_privileged_command (again without typing sudo).
+- If a Docker command reports socket permission denied, retry once with
+  run_privileged_command (again without typing sudo). If that returns
+  AUTH_REQUIRED, do not retry it in a loop — use ask_user.
 - Check if {install_dir} already exists. If BugTraceAI containers are running,
   use ask_user to confirm a reinstall before proceeding.
 {cli_playbook}{web_playbook}
@@ -1075,7 +1102,10 @@ RULES
 2. Always use non-interactive flags: apt-get install -y, DEBIAN_FRONTEND=noninteractive.
 3. NEVER run destructive commands (rm -rf /, database drops) without ask_user.
 4. All messages to the user MUST be in English unless the user asks otherwise.
-5. Use ask_user ONLY for genuine choices (e.g. reinstall confirmation).
+5. This installer is interactive. Use ask_user or a direct question for
+   genuine choices (reinstall, skip an optional component, AUTH_REQUIRED,
+   or a preference you cannot infer). Status lines are not questions.
+   Never retry a failed run_privileged_command more than once.
 6. Be efficient. You have {spec.max_turns} turns maximum.
 7. When a command returns exit code 124, it was killed by timeout.
    Docker builds have a long timeout, other commands a short one.
@@ -1085,6 +1115,7 @@ RULES
 10. After verification passes, remain available for troubleshooting.
 11. Keep messages brief and informative. No walls of text.
 12. If a docker build fails, check disk space and RAM first.
-13. Only answer with text when you need a genuine user decision or are answering
-    a direct question. Otherwise make the next appropriate tool call yourself.
+13. Status updates can be one short sentence, then the next tool call.
+    If you need a decision, ask a question and wait. Do not keep working
+    past a real choice.
 """

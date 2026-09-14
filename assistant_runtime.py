@@ -44,6 +44,88 @@ class ToolOutcome:
 # Installer-phase nudge: a status sentence is not a reason to wait for Enter.
 CONTINUE_NUDGE = "Continue with the next concrete tool call. Do not wait for a reply."
 
+# Phrases that mean the model is asking the human, even with wait_on_text=False.
+# Keep this conservative: a status line like "Checking which image to pull"
+# must not pause the installer.
+_QUESTION_PHRASES = (
+    "would you",
+    "do you want",
+    "should i",
+    "shall i",
+    "please confirm",
+    "is that ok",
+    "what would you like",
+    "how would you like",
+)
+
+
+def looks_like_user_question(text: str) -> bool:
+    """True when assistant text is a real question, not a status line."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if "?" in stripped:
+        return True
+    lowered = stripped.lower()
+    return any(phrase in lowered for phrase in _QUESTION_PHRASES)
+
+
+def wrap_readline_prompt(prompt: str) -> str:
+    """Mark ANSI CSI sequences as zero-width so GNU readline can backspace.
+
+    Without this, colored prompts make Backspace reprint the line and leave
+    ``^H`` on terminals whose erase character does not match the key.
+    """
+    out = []
+    i = 0
+    n = len(prompt or "")
+    while i < n:
+        if prompt[i] == "\x1b" and i + 1 < n and prompt[i + 1] == "[":
+            j = i + 2
+            while j < n and not ("A" <= prompt[j] <= "Z" or "a" <= prompt[j] <= "z"):
+                j += 1
+            if j < n:
+                out.append("\x01" + prompt[i:j + 1] + "\x02")
+                i = j + 1
+                continue
+        out.append(prompt[i])
+        i += 1
+    return "".join(out)
+
+# sudo -n in a new session cannot reuse Ubuntu tty_tickets.  Match the strings
+# sudo actually prints so the installer can re-prompt on the real TTY instead
+# of feeding "password is required" back to the model in a loop.
+_SUDO_TICKET_UNUSABLE = (
+    "a password is required",
+    "no tty present",
+    "a terminal is required to read the password",
+    "sudo: no askpass program specified",
+)
+
+
+def sudo_ticket_unusable(output: str) -> bool:
+    """True when sudo -n failed because it could not see the cached ticket."""
+    text = (output or "").lower()
+    return any(marker in text for marker in _SUDO_TICKET_UNUSABLE)
+
+
+def spawn_killable_process(argv, **popen_kwargs):
+    """Spawn a child that timeout-kill can reap without dropping the TTY.
+
+    ``start_new_session=True`` (setsid) creates a new session with no
+    controlling terminal, so a later ``sudo -n`` cannot use the ticket
+    obtained by ``sudo -v`` on the installer TTY.  A new process group in
+    the same session stays on that TTY and is still ``killpg``-able.
+
+    stdin defaults to DEVNULL so a background process group does not stop
+    on SIGTTIN if the command tries to read the terminal.
+    """
+    kwargs = dict(popen_kwargs)
+    kwargs.pop("start_new_session", None)
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    kwargs["preexec_fn"] = os.setpgrp
+    return subprocess.Popen(argv, **kwargs)
+
 
 class AgentLoop:
     """Drive one assistant task until it needs actual user input.
@@ -73,6 +155,7 @@ class AgentLoop:
         self._render_assistant = render_assistant
         self._on_error = on_error
         self._on_turn = on_turn
+        self.turns_used = 0
 
     def advance(self, max_turns: int, wait_on_text: bool = True) -> LoopOutcome:
         """Keep requesting the model after every tool result.
@@ -82,7 +165,8 @@ class AgentLoop:
         key.  ``wait_on_text=True`` is post-verify support, where a text reply
         is an answer and the human types next.
         """
-        for turn in range(1, max_turns + 1):
+        for turn in range(self.turns_used + 1, max_turns + 1):
+            self.turns_used = turn
             if self._on_turn is not None:
                 self._on_turn(turn, max_turns)
 
@@ -108,7 +192,7 @@ class AgentLoop:
 
             if msg.content:
                 self.messages.append(self._assistant_message(msg))
-                if wait_on_text:
+                if wait_on_text or looks_like_user_question(msg.content):
                     return LoopOutcome.WAITING_FOR_USER
                 self.messages.append({"role": "user", "content": CONTINUE_NUDGE})
                 continue
