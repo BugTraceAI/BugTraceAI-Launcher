@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v2.9.0
+BugTraceAI — AI Setup & Repair Assistant v2.9.1
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -27,7 +27,11 @@ import time
 import signal
 import atexit
 import getpass
+import grp
+import pwd
 import secrets
+import shlex
+import shutil
 import socket
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -36,8 +40,9 @@ from typing import Optional
 import installer_core as core
 from installer_core import Err, DomainError, PromptSpec, TerminalCaps
 from assistant_runtime import (
-    AgentLoop, LoopOutcome, PrivilegeSession, ToolOutcome,
+    AgentLoop, CONTINUE_NUDGE, LoopOutcome, PrivilegeSession, ToolOutcome,
     rewrite_service_host_port, rewrite_web_cli_proxy,
+    spawn_killable_process, sudo_ticket_unusable, wrap_readline_prompt,
 )
 
 # ── Terminal capabilities → palette (pure core decides; we only read env) ─────
@@ -121,6 +126,52 @@ def _docker_info_ok():
         return False
 
 
+def _docker_group_active():
+    try:
+        gid = grp.getgrnam("docker").gr_gid
+    except KeyError:
+        return False
+    return gid in os.getgroups()
+
+
+def _user_in_docker_group():
+    try:
+        docker = grp.getgrnam("docker")
+        user = pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError):
+        return False
+    if pwd.getpwuid(os.geteuid()).pw_gid == docker.gr_gid:
+        return True
+    return user in docker.gr_mem
+
+
+def _maybe_reexec_with_docker_group():
+    """Re-enter this process via ``sg docker`` so run_command can use the socket.
+
+    ``usermod -aG docker`` does not change the groups of a running process.
+    Without this, every docker call hits permission denied and the model
+    retries ``run_privileged_command`` until sudo -n fails in a loop.
+    """
+    if sys.platform == "darwin" or os.geteuid() == 0:
+        return
+    if os.environ.get("BTAI_DOCKER_GROUP_REEXEC") == "1":
+        return
+    if _docker_group_active() or not _user_in_docker_group():
+        return
+    sg = shutil.which("sg")
+    if not sg:
+        return
+    os.environ["BTAI_DOCKER_GROUP_REEXEC"] = "1"
+    info("Activating the docker group for this session...")
+    cmd = "exec " + shlex.join(
+        [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+    try:
+        os.execv(sg, [sg, "docker", "-c", cmd])
+    except OSError as exc:
+        os.environ.pop("BTAI_DOCKER_GROUP_REEXEC", None)
+        info(f"Could not activate docker group ({exc}); privileged Docker commands will be used.")
+
+
 def _ensure_linux_docker_engine():
     """Run the launcher's Linux Docker installer; output and sudo stay on the TTY."""
     launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh")
@@ -161,11 +212,10 @@ INSTALL_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
 CLI_REPO = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
-# LLM provider + model chain are resolved from explicit environment overrides or
-# a previous local deployment.  The default is intentionally OpenRouter's
-# DeepSeek -> Qwen chain, with no provider-selection question at boot.
+# LLM provider + model chain are chosen AFTER the boot banner (the user picks
+# the provider from a menu, unless BTAI_INSTALLER_PROVIDER is set).
 # OpenRouter: DeepSeek V4.1 Flash primary + sticky Qwen 3.8 Max (0902) fallback. Anthropic
 # (direct Messages API, x-api-key): a single Claude Haiku 4.5. Either primary/
 # fallback can be overridden via env without touching code.
@@ -176,8 +226,8 @@ MODEL_CHAIN = ()
 _active_model_idx = 0
 
 # The boot banner is printed BEFORE the provider is known, so its subtitle is static.
-_BANNER_SUBTITLE = "Autonomous install  ·  diagnose  ·  repair"
-_BANNER_SUBTITLE_ASCII = "Autonomous install - diagnose - repair"
+_BANNER_SUBTITLE = "Interactive install  ·  diagnose  ·  repair"
+_BANNER_SUBTITLE_ASCII = "Interactive install - diagnose - repair"
 
 
 def _build_model_chain(provider):
@@ -318,18 +368,184 @@ def check_row(label, passed, note=""):
     print(f"  {icon}  {label:<38}{n}")
 
 
+def _restore_cooked_tty():
+    """Undo raw/cbreak leftovers so Backspace and arrows work in the chat.
+
+    After sudo, Docker, and spinners the TTY can be left with ICANON off or
+    with VERASE=DEL while the key sends ^H, which prints as ``^H^H^H``.
+    """
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        iflag, oflag, cflag, lflag, ispeed, ospeed, cc = termios.tcgetattr(fd)
+        lflag |= (termios.ICANON | termios.ECHO | termios.ECHOE
+                  | termios.ECHOK | termios.ISIG)
+        echoctl = getattr(termios, "ECHOCTL", 0)
+        if echoctl:
+            lflag &= ~echoctl
+        # Lubuntu/QTerminal Backspace is typically ^H, not DEL.
+        cc[termios.VERASE] = "\x08"
+        termios.tcsetattr(fd, termios.TCSADRAIN,
+                          [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    except Exception:
+        try:
+            os.system("stty sane erase ^H -echoctl 2>/dev/null")
+        except Exception:
+            pass
+    if _STDOUT_IS_TTY:
+        sys.stdout.write("\033[0m\033[?25h")
+        sys.stdout.flush()
+
+
+_readline_ready = False
+
+
+def _ensure_readline():
+    """Load GNU readline so Backspace and arrows edit the chat line."""
+    global _readline_ready
+    if _readline_ready:
+        return
+    try:
+        import readline
+        readline.parse_and_bind(r'"\C-h": backward-delete-char')
+        readline.parse_and_bind(r'"\C-?": backward-delete-char')
+        readline.parse_and_bind("set horizontal-scroll-mode on")
+        readline.parse_and_bind("set bell-style none")
+        _readline_ready = True
+    except ImportError:
+        _readline_ready = False
+
+
+def _read_line(prompt=""):
+    _restore_cooked_tty()
+    _ensure_readline()
+    try:
+        return input(wrap_readline_prompt(prompt) if prompt else "")
+    except EOFError:
+        return ""
+
+
 def prompt_user():
-    sys.stdout.write(f"\n{GREEN}{BOLD}  {YOU} {ARROW}{RESET} ")
+    sys.stdout.write("\n")
     sys.stdout.flush()
-    line = sys.stdin.readline()
-    return line.strip() if line else ""
+    return _read_line(f"{GREEN}{BOLD}  {YOU} {ARROW}{RESET} ").strip()
 
 
 def confirm(question):
     """Ask a y/N question. Accepts English and Spanish affirmatives."""
-    sys.stdout.write(f"{YELLOW}  {question} [y/N]: {RESET}")
-    sys.stdout.flush()
-    return sys.stdin.readline().strip().lower() in ("y", "yes", "s", "si", "sí")
+    return _read_line(f"{YELLOW}  {question} [y/N]: {RESET}").strip().lower() in (
+        "y", "yes", "s", "si", "sí")
+
+
+def _ask_menu(title, options, default=0):
+    """Numbered menu on the TTY. Empty input keeps the default."""
+    print()
+    print(f"{WHITE}{BOLD}  {title}{RESET}")
+    print()
+    for i, option in enumerate(options, 1):
+        marker = f"  {DIM}(default){RESET}" if i - 1 == default else ""
+        print(f"  {CYAN}{i}){RESET} {option}{marker}")
+    print()
+    raw = _read_line(f"{YELLOW}  Option [1-{len(options)}]: {RESET}").strip()
+    if not raw:
+        return default
+    if raw.isdigit() and 1 <= int(raw) <= len(options):
+        return int(raw) - 1
+    info(f"Invalid option; using default ({default + 1}).")
+    return default
+
+
+def _env_choice(name, allowed):
+    value = os.environ.get(name, "").strip().lower()
+    return value if value in allowed else None
+
+
+def _has_existing_target():
+    if os.path.isfile(os.path.join(INSTALL_DIR, ".launcher-state")):
+        return True
+    return any(
+        os.path.isdir(os.path.join(INSTALL_DIR, name))
+        for name in ("BugTraceAI-CLI", "BugTraceAI-WEB")
+    )
+
+
+def _choose_provider():
+    env = _env_choice("BTAI_INSTALLER_PROVIDER",
+                      (core.PROVIDER_OPENROUTER, core.PROVIDER_ANTHROPIC))
+    if env:
+        return env
+    idx = _ask_menu(
+        "Which LLM provider should power the assistant?",
+        (
+            "OpenRouter    (DeepSeek V4.1 Flash, Qwen 3.8 Max fallback)  — recommended",
+            "Anthropic     (Claude Haiku 4.5, direct API, key starts with sk-ant-)",
+        ),
+        default=0,
+    )
+    return (core.PROVIDER_OPENROUTER, core.PROVIDER_ANTHROPIC)[idx]
+
+
+def _choose_action(existing):
+    env = _env_choice("BTAI_INSTALLER_ACTION", ("install", "repair"))
+    if env:
+        return env
+    default = 1 if existing else 0
+    idx = _ask_menu(
+        "What would you like to do?",
+        (
+            "Install BugTraceAI",
+            "Repair or diagnose an existing installation",
+        ),
+        default=default,
+    )
+    return ("install", "repair")[idx]
+
+
+def _choose_mode(action):
+    env = _env_choice("BTAI_INSTALLER_MODE", ("full", "cli", "web"))
+    if env:
+        return env
+    title = ("Which part do you want to review?"
+             if action == "repair" else "What do you want to install?")
+    idx = _ask_menu(
+        title,
+        (
+            "Full platform        (WEB + CLI — recommended)",
+            "CLI only             (scanner API, no web interface)",
+            "WEB only             (web interface — needs the CLI API elsewhere)",
+        ),
+        default=0,
+    )
+    return ("full", "cli", "web")[idx]
+
+
+def _choose_mcp(mode):
+    """Match the wizard extras: Full pack / Kali / recon / none. CLI-only skips this."""
+    if mode == "cli":
+        return False, False, False
+    env_recon = os.environ.get("BTAI_INSTALLER_MCP_RECON", "").strip().lower()
+    env_kali = os.environ.get("BTAI_INSTALLER_MCP_KALI", "").strip().lower()
+    if env_recon in ("0", "1", "true", "false", "yes", "no") or env_kali in (
+            "0", "1", "true", "false", "yes", "no"):
+        recon = env_recon in ("1", "true", "yes")
+        kali = env_kali in ("1", "true", "yes")
+        return (mode == "full" or recon or kali), recon, kali
+    idx = _ask_menu(
+        "Would you like to add chat MCPs or the Kali toolbox?",
+        (
+            "Add Full Pack (reconFTW MCP + Kali toolbox)",
+            "Add Kali Linux toolbox (full pentest toolkit — 3GB+)",
+            "Add reconFTW MCP (OSINT & subdomains by @six2dez)",
+            "NONE (only BugTraceAI core components)",
+        ),
+        default=0,
+    )
+    recon = idx in (0, 2)
+    kali = idx in (0, 1)
+    mcp_cli = mode == "full" or recon or kali
+    return mcp_cli, recon, kali
 
 
 def reconnect_tty_or_exit():
@@ -363,7 +579,7 @@ class Spinner:
             sys.stdout.flush()
             time.sleep(0.08)
             i += 1
-        sys.stdout.write(f"\r{' ' * (len(self.label) + 30)}\r")
+        sys.stdout.write(f"\r{' ' * (len(self.label) + 30)}\r\033[?25h")
         sys.stdout.flush()
 
     def update(self, label):
@@ -391,6 +607,7 @@ class spinner_running:
 
     def __exit__(self, *exc):
         self.spinner.stop()
+        _restore_cooked_tty()
         return False
 
 
@@ -847,16 +1064,21 @@ if not _privilege_session.authenticate():
     sys.exit(1)
 ok("Temporary sudo session is active for this launcher only.")
 
-# Disclaimer
-print()
-print(f"{YELLOW}{BOLD}  {WARN}  RISKS BEFORE CONTINUING:{RESET}")
-print(f"{YELLOW}  1. The AI can install packages and modify system configuration.{RESET}")
-print(f"{YELLOW}  2. A mistake could affect other services on this machine.{RESET}")
-print(f"{YELLOW}  3. This consumes credits from your LLM provider account.{RESET}")
-print()
-if not confirm("Continue?"):
-    print("\n  Cancelled.\n")
-    sys.exit(0)
+_REEXECED_DOCKER_GROUP = os.environ.get("BTAI_DOCKER_GROUP_REEXEC") == "1"
+
+# Disclaimer (skip on the sg docker re-exec — already confirmed).
+if not _REEXECED_DOCKER_GROUP:
+    print()
+    print(f"{YELLOW}{BOLD}  {WARN}  RISKS BEFORE CONTINUING:{RESET}")
+    print(f"{YELLOW}  1. The AI can install packages and modify system configuration.{RESET}")
+    print(f"{YELLOW}  2. A mistake could affect other services on this machine.{RESET}")
+    print(f"{YELLOW}  3. This consumes credits from your LLM provider account.{RESET}")
+    print()
+    if not confirm("Continue?"):
+        print("\n  Cancelled.\n")
+        sys.exit(0)
+else:
+    ok("Docker group is active in this session.")
 
 if sys.platform != "darwin" and not _docker_info_ok():
     info("Docker Engine is not ready; installing or starting it...")
@@ -868,17 +1090,16 @@ if sys.platform != "darwin" and not _docker_info_ok():
     else:
         info("Docker is installed; privileged commands will be used until this user is in the docker group.")
 
-# ── Resolve existing state and choose safe defaults ───────────────────────────
-# No wizard is needed for the usual path.  A fresh target gets the full
-# deployment and an existing/partial target gets diagnosis first.  Advanced
-# callers may override either through explicit environment variables.
-deployment_context = _resolve_deployment_context()
-PROVIDER = deployment_context.provider
+_maybe_reexec_with_docker_group()
+
+# Interactive choices — same questions the AI installer asked before the
+# autonomous pass. Environment overrides skip the matching menu.
+PROVIDER = _choose_provider()
 MODEL_CHAIN = _build_model_chain(PROVIDER)
 _provider_name = "Anthropic" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter"
 _key_label = "Anthropic API key (sk-ant-...)" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter API key"
 _chain_label = " -> ".join(core.model_display_name(model) for model in MODEL_CHAIN)
-ok(f"Assistant provider: {_provider_name}  {DOT}  Models: {_chain_label}")
+ok(f"Provider: {_provider_name}  {DOT}  Models: {_chain_label}")
 
 api_key = _load_saved_api_key(INSTALL_DIR, PROVIDER)
 if api_key:
@@ -907,15 +1128,33 @@ if not _valid:
 ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
 hr()
 
-_requested_action = os.environ.get("BTAI_INSTALLER_ACTION", "").strip().lower()
-_existing_target = deployment_context.has_state or any(
-    os.path.isdir(os.path.join(INSTALL_DIR, name))
-    for name in ("BugTraceAI-CLI", "BugTraceAI-WEB")
+_existing_target = _has_existing_target()
+setup_action = _choose_action(_existing_target)
+install_mode = _choose_mode(setup_action)
+mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
+ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
+if mcp_recon_enabled or mcp_kali_enabled:
+    extras = []
+    if mcp_recon_enabled:
+        extras.append("reconFTW")
+    if mcp_kali_enabled:
+        extras.append("Kali")
+    ok("Extras: " + " + ".join(extras))
+elif install_mode != "cli":
+    ok("Extras: none")
+
+os.environ["BTAI_INSTALLER_MODE"] = install_mode
+os.environ["BTAI_INSTALLER_PROVIDER"] = PROVIDER
+os.environ["BTAI_INSTALLER_ACTION"] = setup_action
+deployment_context = _resolve_deployment_context()
+deployment_context = replace(
+    deployment_context,
+    mode=install_mode,
+    provider=PROVIDER,
+    mcp_cli_enabled=mcp_cli_enabled,
+    mcp_recon_enabled=mcp_recon_enabled,
+    mcp_kali_enabled=mcp_kali_enabled,
 )
-setup_action = (_requested_action if _requested_action in ("install", "repair")
-                else ("repair" if _existing_target else "install"))
-install_mode = deployment_context.mode
-ok(f"Detected plan: {setup_action}  {DOT}  mode: {install_mode}")
 print()
 hr()
 print()
@@ -926,16 +1165,23 @@ print()
 SYSTEM = core.build_system_prompt(PromptSpec(
     mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
     api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
-    provider=PROVIDER, ports=deployment_context.ports))
+    provider=PROVIDER, ports=deployment_context.ports,
+    mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
 
 messages = [
     {"role": "system", "content": SYSTEM},
     {"role": "user", "content": (
         f"Action: {setup_action}. Install mode: {install_mode}. "
         f"Install directory: {INSTALL_DIR}. "
+        f"Components: WEB={'yes' if install_mode in ('full', 'web') else 'no'}, "
+        f"CLI={'yes' if install_mode in ('full', 'cli') else 'no'}, "
+        f"MCP={'yes' if mcp_cli_enabled else 'no'}, "
+        f"reconFTW={'yes' if mcp_recon_enabled else 'no'}, "
+        f"Kali={'yes' if mcp_kali_enabled else 'no'}. "
         f"The host holds the API key privately — do NOT ask for it. "
         f"If action is repair, diagnose first and do not reinstall without asking. "
-        f"If action is install, start by assessing the system (Step 0), then follow the playbook."
+        f"If action is install, start by assessing the system (Step 0), then follow the playbook. "
+        f"Ask the user when a real choice appears."
     )},
 ]
 
@@ -1163,42 +1409,59 @@ def run_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
 
 
 # ── Tool dispatch and autonomous agent loop ──────────────────────────────────
+_AUTH_REQUIRED = (
+    "[AUTH_REQUIRED] sudo authentication was cancelled or expired. "
+    "Do not retry run_privileged_command in a loop. Use ask_user if a "
+    "visible re-authentication is needed, or run_command when the docker "
+    "group is already active."
+)
+
+
 def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
     """Run one root-required command through sudo's cached ticket.
 
     It deliberately uses a fresh process rather than the persistent user shell:
     a sudo expiry can then trigger the native terminal prompt in ``ensure()``
     rather than blocking invisibly behind the shell pipe.  No password enters
-    Python memory or a command string.
+    Python memory or a command string.  The child stays in the installer TTY
+    session so Ubuntu tty_tickets still apply.
     """
     safe_cmd, was_followed = core.harden_command(cmd)
     if _privilege_session is None or not _privilege_session.ensure():
-        return 1, "[AUTH_REQUIRED] sudo authentication was cancelled or expired."
+        return 1, _AUTH_REQUIRED
 
     argv = (["/bin/bash", "-lc", safe_cmd] if os.geteuid() == 0
             else ["sudo", "-n", "/bin/bash", "-lc", safe_cmd])
-    try:
-        proc = subprocess.Popen(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, start_new_session=True,
-        )
-    except OSError as exc:
-        return 1, str(exc)
 
-    try:
-        output, _ = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_bash_group(proc)
+    def _run_once():
         try:
-            output, _ = proc.communicate(timeout=5)
-        except Exception:
-            output = ""
-        return 124, f"[TIMEOUT after {timeout}s — process killed]\n{output or ''}"
+            proc = spawn_killable_process(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+        except OSError as exc:
+            return 1, str(exc)
+        try:
+            output, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_bash_group(proc)
+            try:
+                output, _ = proc.communicate(timeout=5)
+            except Exception:
+                output = ""
+            return 124, f"[TIMEOUT after {timeout}s — process killed]\n{output or ''}"
+        return proc.returncode, output or ""
 
-    output = output or ""
+    rc, output = _run_once()
+    if rc != 0 and sudo_ticket_unusable(output):
+        info("Sudo needs a visible re-authentication on this terminal.")
+        if _privilege_session.authenticate():
+            rc, output = _run_once()
+    if rc != 0 and sudo_ticket_unusable(output):
+        return 1, _AUTH_REQUIRED + "\n" + output
+
     if was_followed:
         output = "[note] removed -f/--follow so the command can terminate.\n" + output
-    return proc.returncode, output
+    return rc, output
 
 
 def _tool_result(tc_id, name, content):
@@ -1374,8 +1637,9 @@ def _report_turn_limit(limit):
     print()
 
 
-# Installer pass: tool results and status lines both request the model again.
-# Real questions go through ask_user (blocks in the tool). Enter is not continue.
+# Installer pass: status lines continue; a real question waits for an answer.
+# Enter is not "continue" except as a reply to a question (then we nudge).
+# ask_user also blocks inside the tool.
 agent_loop = AgentLoop(
     messages=messages,
     request=request_assistant,
@@ -1387,18 +1651,32 @@ agent_loop = AgentLoop(
     on_turn=_render_turn,
 )
 
+_EXIT_ANSWERS = ("exit", "quit", "bye", "salir")
 outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
+while outcome == LoopOutcome.WAITING_FOR_USER:
+    answer = prompt_user()
+    if answer.lower() in _EXIT_ANSWERS:
+        print(f"\n{CYAN}  Done. See you later.{RESET}\n")
+        _close_persistent_shell()
+        sys.exit(0)
+    if answer:
+        bubble_user(answer)
+        messages.append({"role": "user", "content": answer})
+    else:
+        messages.append({"role": "user", "content": CONTINUE_NUDGE})
+    outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
+
 if outcome == LoopOutcome.ERROR:
     info("The provider session stopped. You can run ./launcher.sh to start a new one.")
 elif outcome == LoopOutcome.TURN_LIMIT:
     _report_turn_limit(MAX_TURNS)
 
-# Prompt only after the installer has stopped (verified, or out of turns).
-# Empty Enter exits; a typed question is optional post-verify support.
+# After verify (or turn limit), empty Enter exits; a typed question is support.
 if outcome in (LoopOutcome.FINISHED, LoopOutcome.TURN_LIMIT):
+    agent_loop.turns_used = 0
     while True:
         answer = prompt_user()
-        if not answer or answer.lower() in ("exit", "quit", "bye", "salir"):
+        if not answer or answer.lower() in _EXIT_ANSWERS:
             print(f"\n{CYAN}  Done. See you later.{RESET}\n")
             break
         bubble_user(answer)
