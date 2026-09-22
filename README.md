@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="BTAI_Logo_GitHub.png" alt="BugTraceAI" width="180" />
+  <img src="logo.png" alt="BugTraceAI" width="120" />
 </p>
 
 <h1 align="center">BugTraceAI Launcher</h1>
@@ -12,9 +12,8 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <a href="https://discord.gg/5HjujkScC"><img src="https://img.shields.io/badge/Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Community on Discord" /></a>
-  <img src="https://img.shields.io/badge/Version-2.9.1-blue" />
-  <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
+  <img src="https://img.shields.io/badge/Version-2.9.2-blue" />
+  <img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
 </p>
@@ -25,7 +24,7 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB, CLI, or both with a single command.
 
-**New in v2.9.1**: the **AI Setup & Repair Assistant** is interactive again (provider, install/repair, Full/CLI/WEB, optional reconFTW/Kali). Ubuntu sudo uses the same TTY as the cached ticket and re-enters the `docker` group, so it no longer loops on `sudo: a password is required`. The AI chat restores cooked TTY + GNU readline so Backspace and arrows edit the line instead of printing control characters. Status lines still continue on their own; a real question waits for an answer. The standard guided installer is unchanged.
+**New in v2.9.2**: the **AI Setup & Repair Assistant** is interactive again (provider, install/repair, Full/CLI/WEB, optional reconFTW/Kali). Ubuntu sudo uses the same TTY as the cached ticket and re-enters the `docker` group, so it no longer loops on `sudo: a password is required`. The AI chat restores cooked TTY + GNU readline so Backspace and arrows edit the line instead of printing `^H`. Status lines still continue on their own; a real question waits for an answer. The standard guided installer is unchanged.
 
 **v2.9.0**: DeepSeek V4.1 Flash via OpenRouter with sticky Qwen 3.8 Max (0902) failover; one visible native `sudo` ticket (never stored); host-held API key; dynamic ports; Docker Engine bootstrap on Linux; reconFTW built from local source; Kali in a separate Compose step; `install.log` next to `launcher.sh`.
 
@@ -106,8 +105,8 @@ The wizard presents three deployment options:
 
 | Mode                          | What gets deployed               | Use case                              |
 | ----------------------------- | -------------------------------- | ------------------------------------- |
-| **Full Platform** (WEB + CLI) | Both stacks, auto-connected      | Complete security workflow with UI    |
-| **Standalone WEB**            | Browser-based dashboard only     | Manual analysis, report management    |
+| **Full Platform** (WEB + API + CLI) | All stacks, auto-connected  | Complete security workflow with UI    |
+| **Standalone WEB**            | WEB dashboard + BugTraceAI-API   | API testing and report management     |
 | **Standalone CLI**            | Headless autonomous scanner only | CI/CD pipelines, automation, API-only |
 
 In **Full** mode the launcher automatically configures CORS and points the WEB frontend to the CLI API — no manual wiring needed.
@@ -136,7 +135,7 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
 │                      User Browser                        │
 └─────────┬────────────────────────────────┬───────────────┘
           │                                │
-          │ http://localhost:6869          │ http://localhost:8000
+          │ http://localhost:<WEB_PORT>    │ http://localhost:<CLI_PORT>
           │                                │
 ┌─────────▼─────────────────┐     ┌────────▼──────────────────┐
 │   WEB Stack (Docker)      │     │   CLI Stack (Docker)      │
@@ -155,18 +154,29 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
 └───────────────────────────┘     └───────────────────────────┘
 ```
 
-Each stack runs its own independent Docker Compose project. In **Full** mode, the WEB frontend sends scan requests to the CLI API endpoint.
+Each stack runs its own independent Docker Compose project. In **Full** mode, the WEB frontend can send scans to both the CLI API and BugTraceAI-API; the API engine is also enabled for Standalone WEB deployments.
 
-### Default Ports
+The Launcher writes the same `BTAI_SHARED_NETWORK` into the WEB and API
+Compose environments. Both projects therefore join one named Docker bridge;
+the WEB proxy reaches the API as `bugtrace-api:<selected API REST port>` while
+the host-facing REST and MCP ports remain entirely selected by the wizard.
+
+### Selected Ports
 
 | Service               | Port            | Stack |
 | --------------------- | --------------- | ----- |
-| WEB Frontend (Nginx)  | **6869**        | WEB   |
+| WEB Frontend (Nginx)  | selected by wizard | WEB   |
 | WEB Backend (Express) | 3001 (internal) | WEB   |
 | PostgreSQL            | 5432 (internal) | WEB   |
-| CLI API (FastAPI)     | **8000**        | CLI   |
+| CLI API (FastAPI)     | selected by wizard | CLI   |
+| BugTraceAI-API REST   | selected by wizard | API   |
+| BugTraceAI-API MCP    | selected by wizard | API   |
 
-Ports marked **(internal)** are only accessible between containers. The wizard auto-detects busy ports and proposes the next available one.
+Ports marked **(internal)** are only accessible between containers. The wizard
+selects every host-facing port, auto-detects conflicts and proposes the next
+available one; the API and WEB proxy receive those selected values at runtime.
+The numeric values shown during setup are proposals only, never service
+contracts or hardcoded host bindings.
 
 ## What Gets Installed
 
@@ -178,6 +188,8 @@ The launcher installs the platform to:
 │   └── .env.docker               ← generated config (ports, DB password, CLI URL)
 ├── BugTraceAI-CLI/               ← cloned repo (if CLI selected)
 │   └── .env                      ← generated config (API key, CORS origins)
+├── BugTraceAI-API/               ← cloned repo (if WEB selected)
+│   └── .env                      ← generated provider configuration
 └── .launcher-state               ← JSON with deployment mode, ports, version
 ```
 
@@ -335,7 +347,7 @@ cd ~/bugtraceai-launcher
 
 ## License
 
-Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+AGPL-3.0 License. See the [LICENSE](LICENSE) file for details.
 
 ## Links
 

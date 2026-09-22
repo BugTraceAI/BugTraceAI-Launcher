@@ -11,7 +11,7 @@
 #   start         Start all services
 #   stop          Stop all services
 #   restart       Restart all services
-#   logs [web|cli|mcp] View logs
+#   logs [web|api|cli|mcp] View logs
 #   update        Pull latest & rebuild
 #   uninstall     Remove everything
 #
@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.1')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.2')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -28,15 +28,18 @@ INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
 CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
+BTAI_DIR="$INSTALL_DIR/BugTraceAI-API"
 RECON_DIR="$INSTALL_DIR/reconftw-mcp"
 WEB_REPO="https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 CLI_REPO="https://github.com/BugTraceAI/BugTraceAI-CLI.git"
+BTAI_REPO="${BUGTRACEAI_API_REPO:-https://github.com/BugTraceAI/BugTraceAI-API.git}"
 RECON_REPO="https://github.com/BugTraceAI/reconftw-mcp.git"
 
 # GitHub repos for version checks
 GITHUB_API_BASE="https://api.github.com/repos/BugTraceAI"
 REPOS_CLI="BugTraceAI-CLI"
 REPOS_WEB="BugTraceAI-WEB"
+REPOS_BTAI="BugTraceAI-API"
 REPOS_RECON="reconftw-mcp"
 REPOS_LAUNCHER="BugTraceAI-Launcher"
 CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
@@ -51,6 +54,9 @@ IS_MACOS=false
 DEPLOY_MODE=""
 WEB_PORT=""
 CLI_PORT=""
+BTAI_PORT=""
+BTAI_MCP_PORT=""
+BTAI_SHARED_NETWORK="bugtraceai-platform"
 MCP_PORT=""
 API_KEY=""
 API_KEY_ENV_VAR=""
@@ -60,6 +66,7 @@ MENU_SELECTION=0
 # MCP Selection state
 INSTALL_WEB=false
 INSTALL_CLI=false
+INSTALL_BTAI=false
 MCP_CLI_ENABLED=false
 MCP_RECON_ENABLED=false
 MCP_KALI_ENABLED=false
@@ -1311,6 +1318,20 @@ check_for_updates() {
         fi
     fi
 
+    # Check the standalone API version when it is part of this installation.
+    if [[ -d "$BTAI_DIR" ]]; then
+        local btai_ver=""
+        btai_ver=$(tr -d '[:space:]' < "$BTAI_DIR/VERSION" 2>/dev/null || true)
+        if [[ -n "$btai_ver" ]]; then
+            local latest_btai
+            latest_btai=$(_get_latest_version "$REPOS_BTAI")
+            if _version_is_newer "$btai_ver" "$latest_btai"; then
+                has_update=true
+                lines+=("     API:      ${btai_ver} → ${latest_btai}")
+            fi
+        fi
+    fi
+
     # Check Recon version. reconftw-mcp has no parseable local version, so we
     # cannot compare installed-vs-latest. Rather than flag an "update available"
     # on every run (alert fatigue), only surface the latest release as an
@@ -1549,6 +1570,7 @@ wizard_select_components() {
 
     INSTALL_WEB=false
     INSTALL_CLI=false
+    INSTALL_BTAI=false
     MCP_CLI_ENABLED=false
     MCP_RECON_ENABLED=false
     MCP_KALI_ENABLED=false
@@ -1557,6 +1579,7 @@ wizard_select_components() {
         0) # Web + CLI
             INSTALL_WEB=true
             INSTALL_CLI=true
+            INSTALL_BTAI=true
             MCP_CLI_ENABLED=true
             DEPLOY_MODE="full"
             ;;
@@ -1566,6 +1589,7 @@ wizard_select_components() {
             ;;
         2) # Solo WEB
             INSTALL_WEB=true
+            INSTALL_BTAI=true
             DEPLOY_MODE="web"
             ;;
     esac
@@ -1721,6 +1745,11 @@ wizard_configure_ports() {
         propose_port "CLI API port" 8000 CLI_PORT
     fi
 
+    if $INSTALL_BTAI; then
+        propose_port "BugTraceAI-API REST port" 8005 BTAI_PORT
+        propose_port "BugTraceAI-API MCP port" 8004 BTAI_MCP_PORT
+    fi
+
     # MCP ports based on selection
     if $MCP_CLI_ENABLED; then
         propose_port "BugTraceAI MCP port" 8001 MCP_PORT
@@ -1748,6 +1777,9 @@ wizard_show_summary() {
     fi
     if [[ -n "$CLI_PORT" ]]; then
         echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
+    fi
+    if [[ -n "$BTAI_PORT" ]]; then
+        echo -e "  BugTraceAI-API: ${CYAN}http://localhost:$BTAI_PORT${NC}"
     fi
 
     # Show MCP agents
@@ -1957,6 +1989,29 @@ clone_repos() {
         echo -e "    ${OK} BugTraceAI-CLI"
     fi
 
+    # Clone the standalone BugTraceAI-API when WEB is installed.  WEB already
+    # ships a typed client and reverse-proxy route for this service; keeping the
+    # API lifecycle here makes a Full/WEB deployment self-contained.
+    if $INSTALL_BTAI; then
+        if [[ -d "$BTAI_DIR/.git" ]]; then
+            step "Updating BugTraceAI-API..."
+            (cd "$BTAI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
+            [[ -f "$WEB_DIR/nginx.conf" ]] && (cd "$WEB_DIR" && git checkout -- nginx.conf 2>/dev/null || true)
+            if ! (cd "$BTAI_DIR" && git pull --quiet) 2>/dev/null; then
+                warn "Failed to update BugTraceAI-API (will use existing version)"
+            fi
+        else
+            step "Cloning BugTraceAI-API..."
+            [[ -d "$BTAI_DIR" && ! -d "$BTAI_DIR/.git" ]] && rm -rf "$BTAI_DIR"
+            if ! git clone --depth 1 "$BTAI_REPO" "$BTAI_DIR"; then
+                error "Failed to clone BugTraceAI-API from $BTAI_REPO"
+                error "The public API repository must exist before deploying this mode."
+                exit 1
+            fi
+        fi
+        echo -e "    ${OK} BugTraceAI-API"
+    fi
+
     # Clone Recon repo if needed
     if [[ "$DEPLOY_MODE" == "recon" || "$DEPLOY_MODE" == "custom" ]] || $MCP_RECON_ENABLED; then
         if [[ -d "$RECON_DIR/.git" ]]; then
@@ -1977,6 +2032,12 @@ clone_repos() {
         fi
         echo -e "    ${OK} reconftw-mcp"
     fi
+}
+
+# API Compose reads both listener and host ports from the generated .env.
+# No source-file patch is needed, which keeps update/rebuild idempotent.
+patch_btai_compose() {
+    [[ -f "$BTAI_DIR/docker-compose.yml" ]] || return 0
 }
 
 # Point the freshly-cloned CLI at the selected provider by rewriting the ACTIVE
@@ -2032,6 +2093,10 @@ POSTGRES_DB=bugtraceai_web
 POSTGRES_PORT=${pg_port}
 FRONTEND_PORT=${WEB_PORT}
 VITE_CLI_API_URL=${cli_url}
+CLI_API_PORT=${CLI_PORT}
+VITE_BTAI_API_URL=/btai-api
+BTAI_API_PORT=${BTAI_PORT}
+BTAI_SHARED_NETWORK=${BTAI_SHARED_NETWORK}
 EOF
             )
 
@@ -2060,6 +2125,24 @@ EOF
         fi
     fi
 
+    # BugTraceAI-API configuration.  Provider credentials stay in this
+    # deployment-local file (0600) and are never written into WEB or CLI files.
+    if $INSTALL_BTAI; then
+        patch_btai_compose
+        ( umask 077
+          cat > "$BTAI_DIR/.env" << EOF
+# BugTraceAI-API — Generated by Launcher v${VERSION} ($(iso_date))
+APEX_PROVIDER=${LLM_PROVIDER}
+MCP_PORT=${BTAI_MCP_PORT}
+API_PORT=${BTAI_PORT}
+BTAI_SHARED_NETWORK=${BTAI_SHARED_NETWORK}
+${API_KEY_ENV_VAR}=${API_KEY}
+EOF
+        )
+        chmod 600 "$BTAI_DIR/.env" 2>/dev/null || true
+        echo -e "    ${OK} BugTraceAI-API config (.env, mode 600)"
+    fi
+
     # CLI configuration
     if $INSTALL_CLI || $MCP_CLI_ENABLED; then
         # Universal access: set CORS to '*' so the API accepts connections from both local and remote (VM) clients.
@@ -2071,8 +2154,11 @@ EOF
           cat > "$CLI_DIR/.env" << EOF
 # BugTraceAI-CLI — Generated by Launcher v${VERSION} ($(iso_date))
 PROVIDER=${LLM_PROVIDER}
+CLI_PORT=${CLI_PORT}
+MCP_PORT=${MCP_PORT}
 ${API_KEY_ENV_VAR}=${API_KEY}
 BUGTRACE_CORS_ORIGINS=${cors}
+BTAI_SHARED_NETWORK=${BTAI_SHARED_NETWORK}
 EOF
         )
         chmod 600 "$CLI_DIR/.env" 2>/dev/null || true
@@ -2213,6 +2299,11 @@ _cli_compose() {
     (cd "$CLI_DIR" && $COMPOSE_CMD "$@")
 }
 
+_btai_compose() {
+    if [[ -z "$COMPOSE_CMD" ]]; then error "Docker Compose not found. Run: ./launcher.sh"; return 1; fi
+    (cd "$BTAI_DIR" && $COMPOSE_CMD "$@")
+}
+
 # Run a docker compose command, streaming its OWN output to the terminal.
 # Usage: _build_with_progress "label" compose_fn [extra_args...]
 #   compose_fn: _web_compose or _cli_compose
@@ -2252,6 +2343,23 @@ _start_web_profile() {
 start_services() {
     local build_log="$INSTALL_DIR/.build.log"
     : > "$build_log"
+
+    # Start the standalone API before WEB so its reverse-proxy target is ready
+    # while the frontend container is booting.
+    if $INSTALL_BTAI; then
+        if [[ ! -f "$BTAI_DIR/docker-compose.yml" ]]; then
+            error "BugTraceAI-API docker-compose.yml not found — clone may have failed."
+            exit 1
+        fi
+        docker rm -f bugtrace-api 2>/dev/null || true
+        echo ""
+        step "Building & starting BugTraceAI-API..."
+        if ! _build_with_progress "BugTraceAI-API" _btai_compose up -d --build; then
+            error "Failed to start BugTraceAI-API."
+            exit 1
+        fi
+        echo -e "    ${OK} BugTraceAI-API started"
+    fi
 
     # Start WEB services
     if $INSTALL_WEB && [[ -n "$WEB_PORT" ]]; then
@@ -2376,6 +2484,10 @@ health_checks() {
         wait_for_url "http://localhost:${WEB_PORT}/kr-api/health" "API Discovery (Kiterunner)" 60 || all_ok=false
     fi
 
+    if [[ -n "$BTAI_PORT" ]]; then
+        wait_for_url "http://localhost:${BTAI_PORT}/health" "BugTraceAI-API (port ${BTAI_PORT})" 180 || all_ok=false
+    fi
+
     # CLI health check
     if [[ -n "$CLI_PORT" ]]; then
         wait_for_url "http://localhost:${CLI_PORT}/health" "CLI (port ${CLI_PORT})" 120 || all_ok=false
@@ -2424,11 +2536,14 @@ save_state() {
   "mode": "${DEPLOY_MODE}",
   "web_port": "${WEB_PORT}",
   "cli_port": "${CLI_PORT}",
+  "btai_port": "${BTAI_PORT}",
+  "btai_mcp_port": "${BTAI_MCP_PORT}",
   "mcp_port": "${MCP_PORT}",
   "recon_port": "${RECON_PORT}",
   "provider": "${LLM_PROVIDER}",
   "install_web": ${INSTALL_WEB},
   "install_cli": ${INSTALL_CLI},
+  "install_btai": ${INSTALL_BTAI},
   "mcp_cli_enabled": ${MCP_CLI_ENABLED},
   "mcp_recon_enabled": ${MCP_RECON_ENABLED},
   "mcp_kali_enabled": ${MCP_KALI_ENABLED},
@@ -2463,6 +2578,9 @@ show_success() {
     if [[ -n "$CLI_PORT" ]]; then
         echo -e "  ${ARROW} CLI API:       ${BOLD}${CYAN}http://localhost:${CLI_PORT}${NC}"
         echo -e "  ${ARROW} API Docs:      ${BOLD}${CYAN}http://localhost:${CLI_PORT}/docs${NC}"
+    fi
+    if [[ -n "$BTAI_PORT" ]]; then
+        echo -e "  ${ARROW} BugTraceAI-API: ${BOLD}${CYAN}http://localhost:${BTAI_PORT}${NC}"
     fi
 
     # Show remote access if IP detected and different from localhost
@@ -2536,6 +2654,8 @@ load_state() {
     DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
     WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    BTAI_PORT=$(awk -F'"' '/"btai_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
+    BTAI_MCP_PORT=$(awk -F'"' '/"btai_mcp_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     MCP_PORT=$(awk -F'"' '/"mcp_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     RECON_PORT=$(awk -F'"' '/"recon_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     LLM_PROVIDER=$(awk -F'"' '/"provider"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
@@ -2555,18 +2675,26 @@ load_state() {
     [[ "$mcp_kali" == "true" ]] && MCP_KALI_ENABLED=true || MCP_KALI_ENABLED=false
 
     # Load explicit install flags; fallback for legacy state files.
-    local install_web install_cli
+    local install_web install_cli install_btai
     install_web=$(grep -o '"install_web": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
     install_cli=$(grep -o '"install_cli": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    install_btai=$(grep -o '"install_btai": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
     if [[ -n "$install_web" || -n "$install_cli" ]]; then
         [[ "$install_web" == "true" ]] && INSTALL_WEB=true || INSTALL_WEB=false
         [[ "$install_cli" == "true" ]] && INSTALL_CLI=true || INSTALL_CLI=false
+        [[ "$install_btai" == "true" ]] && INSTALL_BTAI=true || INSTALL_BTAI=false
     else
         INSTALL_WEB=false
         INSTALL_CLI=false
         [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]] && INSTALL_WEB=true
         [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] && INSTALL_CLI=true
+        INSTALL_BTAI=false
     fi
+
+    # Older state files have no API fields.  Preserve their behavior until the
+    # user runs a new deployment, instead of silently cloning a new service.
+    [[ -z "$BTAI_PORT" ]] && BTAI_PORT=""
+    [[ -z "$BTAI_MCP_PORT" ]] && BTAI_MCP_PORT=""
 }
 
 cmd_status() {
@@ -2591,6 +2719,11 @@ cmd_status() {
         _print_container_status "bugtrace_api"
     fi
 
+    if $INSTALL_BTAI; then
+        echo -e "\n  ${BOLD}BugTraceAI-API${NC} (port ${BTAI_PORT})"
+        _print_container_status "bugtrace-api"
+    fi
+
     # MCP Agents
     if $MCP_CLI_ENABLED || $MCP_RECON_ENABLED || $MCP_KALI_ENABLED; then
         echo -e "\n  ${BOLD}MCP Agents${NC}"
@@ -2605,6 +2738,7 @@ cmd_status() {
     echo -e "  ${BOLD}Endpoints:${NC}"
     [[ -n "$WEB_PORT" ]] && echo -e "    WEB:  ${CYAN}http://localhost:${WEB_PORT}${NC}"
     [[ -n "$CLI_PORT" ]] && echo -e "    CLI:  ${CYAN}http://localhost:${CLI_PORT}${NC}"
+    [[ -n "$BTAI_PORT" ]] && echo -e "    BugTraceAI-API: ${CYAN}http://localhost:${BTAI_PORT}${NC}"
     $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]] && echo -e "    BugTraceAI MCP: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
     $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]] && echo -e "    reconFTW MCP:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
     echo ""
@@ -2652,6 +2786,11 @@ cmd_start() {
     info "Starting services..."
     local ok=true
     local recon_ready=true
+
+    if $INSTALL_BTAI && [[ -d "$BTAI_DIR" ]]; then
+        patch_btai_compose
+        _btai_compose up -d || { error "Failed to start BugTraceAI-API"; ok=false; }
+    fi
     
     # Start WEB services
     if [[ -d "$WEB_DIR" ]] && [[ -n "$WEB_PORT" ]]; then
@@ -2688,6 +2827,10 @@ cmd_start() {
 cmd_stop() {
     load_state
     info "Stopping services..."
+
+    if $INSTALL_BTAI && [[ -d "$BTAI_DIR" ]]; then
+        _btai_compose stop 2>/dev/null || true
+    fi
     
     # Stop optional WEB-owned agents first.
     resolve_web_mcp_profiles
@@ -2718,6 +2861,7 @@ cmd_logs() {
             echo ""
             echo "Specify which logs to view:"
             echo -e "  ${DIM}./launcher.sh logs web${NC}"
+            echo -e "  ${DIM}./launcher.sh logs api${NC}"
             echo -e "  ${DIM}./launcher.sh logs cli${NC}"
             echo -e "  ${DIM}./launcher.sh logs mcp${NC}"
             echo ""
@@ -2733,6 +2877,13 @@ cmd_logs() {
     fi
 
     case "$target" in
+        api|btai)
+            if [[ -d "$BTAI_DIR" ]]; then
+                _btai_compose logs -f --tail=100
+            else
+                error "BugTraceAI-API not installed"
+            fi
+            ;;
         web)
             if [[ -d "$WEB_DIR" ]]; then
                 _web_compose logs -f --tail=100
@@ -2770,6 +2921,26 @@ cmd_update() {
     local update_ok=true
     local recon_ready=true
 
+    if $INSTALL_BTAI && [[ -d "$BTAI_DIR/.git" ]]; then
+        step "Pulling BugTraceAI-API updates..."
+        # Restore launcher-owned deployment patches before pulling upstream.
+        (cd "$BTAI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
+        [[ -f "$WEB_DIR/nginx.conf" ]] && (cd "$WEB_DIR" && git checkout -- nginx.conf 2>/dev/null || true)
+        if ! (cd "$BTAI_DIR" && git pull --quiet); then
+            warn "Failed to pull BugTraceAI-API updates"
+            update_ok=false
+        else
+            patch_btai_compose
+            step "Rebuilding BugTraceAI-API..."
+            if ! _btai_compose up -d --build; then
+                error "Failed to rebuild BugTraceAI-API"
+                update_ok=false
+            else
+                echo -e "    ${OK} BugTraceAI-API updated"
+            fi
+        fi
+    fi
+
     # WEB's recon profile needs this source directory during its image build.
     # Do this before rebuilding WEB, not afterwards, so an old/partial install
     # repairs itself instead of failing with "../reconftw-mcp not found".
@@ -2791,7 +2962,7 @@ cmd_update() {
     if [[ -d "$WEB_DIR/.git" ]] && [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
         step "Pulling WEB updates..."
         # Reset launcher-patched compose before pull, then re-apply patches.
-        (cd "$WEB_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
+        (cd "$WEB_DIR" && git checkout -- docker-compose.yml nginx.conf 2>/dev/null || true)
         if ! (cd "$WEB_DIR" && git pull --quiet); then
             warn "Failed to pull WEB updates"
             update_ok=false
@@ -2884,6 +3055,10 @@ cmd_uninstall() {
 
 # Tear down all services and remove install directory
 _teardown_all() {
+    if [[ -d "$BTAI_DIR" ]]; then
+        step "Stopping BugTraceAI-API..."
+        (cd "$BTAI_DIR" && $COMPOSE_CMD down -v 2>/dev/null) || true
+    fi
     if [[ -d "$CLI_DIR" ]]; then
         step "Stopping CLI..."
         (cd "$CLI_DIR" && $COMPOSE_CMD down -v 2>/dev/null) || true
@@ -2971,7 +3146,7 @@ show_help() {
     echo "  start           Start all services"
     echo "  stop            Stop all services"
     echo "  restart         Restart all services"
-    echo "  logs [web|cli|mcp] View logs"
+    echo "  logs [web|api|cli|mcp] View logs"
     echo "  update          Pull latest & rebuild"
     echo "  uninstall       Remove everything"
     echo ""

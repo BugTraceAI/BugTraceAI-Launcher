@@ -1,0 +1,16 @@
+services:
+  kali-mcp:
+    image: kalilinux/kali-rolling:latest
+    container_name: kali-mcp-server
+    profiles:
+      - kali
+    command: ["bash", "-c", "old startup command"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+  reconftw-mcp:
+    image: example/reconftw-mcp
+    profiles:
+      - recon
+    environment:
+      - MCP_PORT=8002

@@ -1,0 +1,18 @@
+services:
+  reconftw-mcp:
+    image: ${RECONFTW_MCP_IMAGE:-reconftw-mcp:local}
+    container_name: reconftw-mcp
+    profiles:
+      - recon
+    command: ["mcp", "--sse"]
+    ports:
+      - "8002:8002"
+    networks:
+      - bugtraceai-network
+  kali-mcp:
+    image: kalilinux/kali-rolling:latest
+    profiles:
+      - kali
+    restart: unless-stopped
+networks:
+  bugtraceai-network:
