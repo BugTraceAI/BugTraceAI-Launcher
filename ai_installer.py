@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v2.9.1
+BugTraceAI — AI Setup & Repair Assistant v2.9.2
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -212,7 +212,7 @@ INSTALL_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
 CLI_REPO = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks
 # the provider from a menu, unless BTAI_INSTALLER_PROVIDER is set).
