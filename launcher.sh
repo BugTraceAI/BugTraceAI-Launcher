@@ -433,6 +433,10 @@ ensure_recon_local_build() {
         emit_missing()
         in_recon=0
     }
+    in_recon && /^[^[:space:]]/ {
+        emit_missing()
+        in_recon=0
+    }
     { print }
     END { if (in_recon) emit_missing() }
     ' "$compose_file" > "$tmp_file"
