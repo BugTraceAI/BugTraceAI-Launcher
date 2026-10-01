@@ -2302,6 +2302,51 @@ patch_optional_web_cli_proxy() {
     mv "$tmp_file" "$WEB_DIR/nginx.conf"
 }
 
+# Make the long first WEB image build resilient to transient npm registry
+# resets.  This is deliberately applied by the Launcher because it also has to
+# work when the selected WEB snapshot predates the upstream Dockerfile fix.
+patch_web_npm_resilience() {
+    local dockerfile="$WEB_DIR/backend/Dockerfile"
+    local tmp_file
+
+    [[ -f "$dockerfile" ]] || return 0
+
+    # Do not rewrite a WEB snapshot that already carries the fix.
+    if grep -q 'npm config set fetch-retries' "$dockerfile"; then
+        return 0
+    fi
+
+    # Only patch the known Dockerfile commands.  If WEB changes its install
+    # strategy, leave it alone rather than applying a broad or unsafe rewrite.
+    if ! grep -Eq '^RUN npm ci( --omit=dev)?[[:space:]]*$' "$dockerfile"; then
+        return 0
+    fi
+
+    tmp_file="$(mktemp)" || return 1
+    if ! awk '
+        /^RUN npm ci --omit=dev[[:space:]]*$/ {
+            print "RUN npm config set fetch-retries 5 && npm config set fetch-retry-mintimeout 20000 && npm config set fetch-retry-maxtimeout 120000 && npm ci --omit=dev --no-audit --no-fund"
+            next
+        }
+        /^RUN npm ci[[:space:]]*$/ {
+            print "RUN npm config set fetch-retries 5 && npm config set fetch-retry-mintimeout 20000 && npm config set fetch-retry-maxtimeout 120000 && npm ci --no-audit --no-fund"
+            next
+        }
+        { print }
+    ' "$dockerfile" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Copy over the existing file so its original permissions remain intact.
+    if ! cp "$tmp_file" "$dockerfile"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    rm -f "$tmp_file"
+    info "Applied npm registry retry settings to the WEB Dockerfile."
+}
+
 # Patch docker-compose files to use .env values and enable MCP profiles
 patch_compose() {
     # Migrate installations produced by older launcher versions, which wrote
@@ -2373,6 +2418,16 @@ patch_compose() {
             sed_inplace "s/\"8001:8001\"/\"${MCP_PORT}:8001\"/" "$web_compose"
         fi
 
+    fi
+
+    # A first WEB build can spend several minutes resolving npm packages.  A
+    # transient registry reset (ECONNRESET/network aborted) must not make the
+    # whole launcher report that WEB installation failed.  Apply this small,
+    # idempotent compatibility patch to older/public WEB snapshots before the
+    # first build; newer snapshots that already contain the retry settings are
+    # left untouched.
+    if [[ -f "$WEB_DIR/backend/Dockerfile" ]]; then
+        patch_web_npm_resilience || return 1
     fi
 }
 

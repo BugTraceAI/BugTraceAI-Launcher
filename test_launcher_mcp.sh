@@ -58,6 +58,24 @@ fi
 scratch_dir="$(mktemp -d)"
 trap 'rm -rf -- "$scratch_dir"' EXIT
 
+# Older/public WEB snapshots are patched by the launcher before their first
+# long Docker build so transient npm registry resets do not abort deployment.
+npm_fixture="$scratch_dir/npm-resilience/BugTraceAI-WEB"
+mkdir -p "$npm_fixture/backend"
+printf '%s\n' \
+    'FROM node:22-alpine AS builder' \
+    'RUN npm ci' \
+    'FROM node:22-alpine AS production' \
+    'RUN npm ci --omit=dev' \
+    > "$npm_fixture/backend/Dockerfile"
+WEB_DIR="$npm_fixture"
+patch_web_npm_resilience
+grep -Fq 'fetch-retries 5' "$WEB_DIR/backend/Dockerfile" || fail "WEB Dockerfile did not receive npm retries"
+grep -Fq 'npm ci --omit=dev --no-audit --no-fund' "$WEB_DIR/backend/Dockerfile" || fail "production npm install was not hardened"
+retry_count="$(grep -c 'fetch-retries 5' "$WEB_DIR/backend/Dockerfile")"
+patch_web_npm_resilience
+[[ "$(grep -c 'fetch-retries 5' "$WEB_DIR/backend/Dockerfile")" == "$retry_count" ]] || fail "npm retry patch is not idempotent"
+
 # Exercise the actual env generation with arbitrary selected ports. This is
 # stronger than checking source text: Compose-facing files must receive the
 # values chosen by the launcher, not the wizard's proposal defaults.
