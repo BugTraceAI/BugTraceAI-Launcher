@@ -711,7 +711,7 @@ def _capture_host_command(argv, timeout=5):
     try:
         proc = subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout,
+            text=True, errors="replace", timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as ex:
         return 1, str(ex)
@@ -725,7 +725,7 @@ def _capture_host_command(argv, timeout=5):
     try:
         privileged = subprocess.run(
             ["sudo", "-n", *argv], stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, timeout=timeout,
+            stderr=subprocess.STDOUT, text=True, errors="replace", timeout=timeout,
         )
         return privileged.returncode, privileged.stdout or ""
     except (OSError, subprocess.TimeoutExpired) as ex:
@@ -1546,7 +1546,7 @@ def _spawn_bash():
     return subprocess.Popen(
         ["/bin/bash", "-o", "pipefail"], env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, start_new_session=True)
+        encoding="utf-8", errors="replace", bufsize=1, start_new_session=True)
 
 
 
@@ -1668,6 +1668,7 @@ def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
         try:
             proc = spawn_killable_process(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                errors="replace",
             )
         except OSError as exc:
             return 1, str(exc)
