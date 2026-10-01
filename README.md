@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-2.9.3-blue" />
+  <img src="https://img.shields.io/badge/Version-2.9.4-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
@@ -24,7 +24,9 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB + API, CLI, or the full platform with a single command.
 
-**New in v2.9.3**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary.
+**New in v2.9.4**: a reinstall re-enters its newly-created target directory before cloning components, so an installation started from a replaced directory can continue through WEB, CLI, BugTraceAI-API, and optional agents. Interrupted installs now state that remaining components were not installed.
+
+**v2.9.3**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary.
 
 **v2.9.2**: the **AI Setup & Repair Assistant** is interactive again (provider, install/repair, Full/CLI/WEB, optional reconFTW/Kali). Ubuntu sudo uses the same TTY as the cached ticket and re-enters the `docker` group, so it no longer loops on `sudo: a password is required`. The AI chat restores cooked TTY + GNU readline so Backspace and arrows edit the line instead of printing `^H`. Status lines still continue on their own; a real question waits for an answer. The standard guided installer is unchanged.
 

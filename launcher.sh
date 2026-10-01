@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.3')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.4')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -102,6 +102,8 @@ _cleanup_terminal() {
 # first so _cleanup_terminal runs exactly once.
 _on_interrupt() {
     trap - EXIT
+    printf '\n%s[WARN]%s BugTraceAI installation interrupted. No later components were installed.\n' "$YELLOW" "$NC" >&2
+    _log_event WARN "Installation interrupted by signal"
     _cleanup_terminal
     exit 130
 }
@@ -1937,6 +1939,14 @@ deploy() {
 
     step "Creating $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
+    # A reinstall can remove the directory from which the launcher was
+    # invoked. Re-enter the newly-created target before running Git so every
+    # clone has a valid working directory and deployment continues through
+    # WEB, CLI, API, and optional agents.
+    if ! cd "$INSTALL_DIR"; then
+        error "Cannot enter installation directory: $INSTALL_DIR"
+        exit 1
+    fi
 
     clone_repos
     generate_env
