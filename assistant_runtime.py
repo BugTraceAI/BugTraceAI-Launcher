@@ -376,19 +376,41 @@ def rewrite_service_host_port(compose_path: str, container_name: str, host_port:
     return False
 
 
-def rewrite_web_cli_proxy(nginx_path: str, cli_port: int) -> bool:
-    """Point the WEB nginx CLI proxy at a resolved local CLI host endpoint."""
+def rewrite_web_cli_proxy(nginx_path: str, cli_port: Optional[int]) -> bool:
+    """Wire the WEB CLI proxy for a resolved CLI or make it optional.
+
+    Current WEB snapshots use the shared-network service name and the
+    ``${CLI_API_PORT}`` entrypoint variable. Older snapshots used a literal
+    host.docker.internal port, so both forms remain supported.
+    """
     try:
         with open(nginx_path, encoding="utf-8") as f:
             content = f.read()
     except OSError:
         return False
-    updated, changed = re.subn(
-        r"(?m)^(?P<prefix>\s*proxy_pass\s+http://host\.docker\.internal:)\d+(?P<suffix>/;\s*)$",
-        lambda match: f"{match.group('prefix')}{cli_port}{match.group('suffix')}",
-        content,
-        count=1,
-    )
+    if cli_port is None:
+        if "set $cli_api_host bugtrace-cli-api;" in content:
+            return True
+        updated, changed = re.subn(
+            r"(?m)^(?P<indent>\s*)proxy_pass\s+http://bugtrace-cli-api:\$\{CLI_API_PORT\}/;\s*$",
+            lambda match: (
+                f"{match.group('indent')}set $cli_api_host bugtrace-cli-api;\n"
+                f"{match.group('indent')}proxy_pass http://$cli_api_host:${{CLI_API_PORT}}/;"
+            ),
+            content,
+            count=1,
+        )
+    else:
+        updated, changed = re.subn(
+            r"(?m)^(?P<prefix>\s*proxy_pass\s+http://host\.docker\.internal:)\d+(?P<suffix>/;\s*)$",
+            lambda match: f"{match.group('prefix')}{cli_port}{match.group('suffix')}",
+            content,
+            count=1,
+        )
+        # Current Compose files already receive the selected port through
+        # ${CLI_API_PORT}; no source rewrite is needed in that case.
+        if changed == 0 and "proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;" in content:
+            return True
     if changed != 1:
         return False
     try:

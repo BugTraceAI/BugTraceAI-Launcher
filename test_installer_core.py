@@ -304,6 +304,8 @@ class TestVerification(unittest.TestCase):
         self.assertFalse(core.evaluate_check("health", 0, "down"))
         self.assertTrue(core.evaluate_check("http200", 0, "200\n"))
         self.assertFalse(core.evaluate_check("http200", 0, "500"))
+        self.assertTrue(core.evaluate_check("mcp", 0, "405\n"))
+        self.assertFalse(core.evaluate_check("mcp", 0, "000"))
         self.assertTrue(core.evaluate_check("sse", 0, ""))
         self.assertTrue(core.evaluate_check("sse", 28, ""))
         self.assertFalse(core.evaluate_check("sse", 7, ""))
@@ -315,12 +317,12 @@ class TestVerification(unittest.TestCase):
         full = core.verification_checks("full", "/home/u/bugtraceai", ports)
         cli = core.verification_checks("cli", "/home/u/bugtraceai", ports)
         web = core.verification_checks("web", "/home/u/bugtraceai", ports)
-        # full = docker + cli(3) + web(5) + WEB-to-CLI proxy(1)
-        self.assertEqual(len(full), 1 + 3 + 5 + 1)
+        # full = docker + cli(3) + web(5) + API(2) + WEB-to-CLI proxy(1)
+        self.assertEqual(len(full), 1 + 3 + 5 + 2 + 1)
         self.assertEqual(len(cli), 1 + 3)
-        self.assertEqual(len(web), 1 + 5)
+        self.assertEqual(len(web), 1 + 5 + 2)
         # all checks are immutable Check instances with a known predicate
-        valid = {"rc0_nonempty", "rc0", "nonempty", "health", "http200", "exists", "sse"}
+        valid = {"rc0_nonempty", "rc0", "nonempty", "health", "http200", "exists", "sse", "mcp"}
         for c in full:
             self.assertIsInstance(c, Check)
             self.assertIn(c.predicate, valid)
@@ -358,6 +360,8 @@ class TestSystemPrompt(unittest.TestCase):
         self.assertNotIn("sk-or-TESTKEY", p)
         self.assertIn("/home/u/bugtraceai", p)
         self.assertIn("configure_cli", p)
+        self.assertIn("configure_api", p)
+        self.assertIn("BugTraceAI-API", p)
 
     def test_host_managed_secret_hardening_present(self):
         p = core.build_system_prompt(self.spec())

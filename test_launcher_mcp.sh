@@ -42,10 +42,11 @@ MCP_KALI_ENABLED=true
 resolve_web_mcp_profiles
 assert_array "full-install profiles" --profile recon --profile kali
 
-# WEB-only installs need all three WEB-owned profiles explicitly.
+# WEB installs with extras still run the core MCP from the CLI Compose project;
+# WEB owns only recon and Kali profiles.
 INSTALL_CLI=false
 resolve_web_mcp_profiles
-assert_array "web-only profiles" --profile cli --profile recon --profile kali
+assert_array "web-only profiles" --profile recon --profile kali
 
 # The launcher must never persist a non-empty Compose profile selection. An
 # empty one-shot override inside _web_compose is intentional: it neutralizes
@@ -73,7 +74,7 @@ MCP_RECON_ENABLED=false
 WEB_PORT=39169
 CLI_PORT=39104
 BTAI_PORT=39105
-BTAI_MCP_PORT=39104
+BTAI_MCP_PORT=39106
 LLM_PROVIDER=openrouter
 API_KEY_ENV_VAR=OPENROUTER_API_KEY
 API_KEY=fixture-key
@@ -82,9 +83,49 @@ grep -Fq 'FRONTEND_PORT=39169' "$WEB_DIR/.env.docker" || fail "WEB frontend port
 grep -Fq 'BTAI_API_PORT=39105' "$WEB_DIR/.env.docker" || fail "WEB API port was not generated"
 grep -Fq 'CLI_API_PORT=39104' "$WEB_DIR/.env.docker" || fail "WEB CLI API port was not generated"
 grep -Fq 'BTAI_SHARED_NETWORK=bugtraceai-platform' "$WEB_DIR/.env.docker" || fail "WEB/API shared network was not generated"
-grep -Fq 'MCP_PORT=39104' "$BTAI_DIR/.env" || fail "API MCP port was not generated"
+grep -Fq 'MCP_PORT=39106' "$BTAI_DIR/.env" || fail "API MCP port was not generated"
 grep -Fq 'API_PORT=39105' "$BTAI_DIR/.env" || fail "API REST port was not generated"
 grep -Fq 'BTAI_SHARED_NETWORK=bugtraceai-platform' "$BTAI_DIR/.env" || fail "API shared network was not generated"
+
+# WEB+API without a local CLI still satisfies the public Compose contract with
+# a numeric placeholder. The optional CLI proxy is made lazy so nginx does not
+# fail during configuration just because no CLI container was selected.
+web_only_dir="$scratch_dir/web-only"
+WEB_DIR="$web_only_dir/BugTraceAI-WEB"
+BTAI_DIR="$web_only_dir/BugTraceAI-API"
+mkdir -p "$WEB_DIR" "$BTAI_DIR"
+cat > "$WEB_DIR/nginx.conf" <<'EOF'
+http {
+    resolver 127.0.0.11;
+    location ^~ /cli-api/ {
+        proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;
+    }
+}
+EOF
+INSTALL_WEB=true
+INSTALL_BTAI=true
+INSTALL_CLI=false
+MCP_CLI_ENABLED=false
+WEB_PORT=39169
+CLI_PORT=""
+BTAI_PORT=39105
+BTAI_MCP_PORT=39106
+generate_env >/dev/null
+grep -Fq 'CLI_API_PORT=8000' "$WEB_DIR/.env.docker" || fail "WEB-only CLI placeholder was not generated"
+patch_optional_web_cli_proxy
+grep -Fq 'set $cli_api_host bugtrace-cli-api;' "$WEB_DIR/nginx.conf" || fail "WEB-only CLI proxy was not made lazy"
+
+# A bare curl timeout is not proof that an SSE listener answered.
+curl() { return 28; }
+if wait_for_url http://127.0.0.1:1/sse "unresponsive SSE" 1 sse >/dev/null 2>&1; then
+    fail "unresponsive SSE timeout was accepted as healthy"
+fi
+unset -f curl
+
+# API ports are selected before the other MCP ports. They must reserve their
+# values so a later prompt cannot accept a duplicate host binding.
+port_available "$BTAI_PORT" && fail "BugTraceAI-API REST port was not reserved"
+port_available "$BTAI_MCP_PORT" && fail "BugTraceAI-API MCP port was not reserved"
 
 fixture="$scratch_dir/kali-compose.yml"
 cp "$test_dir/testdata/kali-compose-inline.yml" "$fixture"
@@ -125,8 +166,55 @@ build_count="$(grep -c 'context: ../reconftw-mcp' "$private_recon")"
 [[ "$build_count" -eq 1 ]] || fail "existing recon build context was duplicated"
 grep -Fq 'pull_policy: build' "$private_recon" || fail "private recon compose did not get pull_policy"
 
+# ARM hosts exercise the boundary case where the recon service is immediately
+# followed by the root-level volumes/networks mappings. The injected service
+# keys must stay inside reconftw-mcp; otherwise Compose reports the same
+# go-yaml block-mapping error seen during a real WEB startup.
+arm_web_dir="$scratch_dir/arm-web"
+mkdir -p "$arm_web_dir"
+cat > "$arm_web_dir/docker-compose.yml" <<'EOF'
+services:
+  reconftw-mcp:
+    image: reconftw-mcp:local
+    container_name: reconftw-mcp
+    profiles:
+      - recon
+    command: ["mcp", "--sse"]
+    environment:
+      - MCP_PORT=8002
+    healthcheck:
+      test: ["CMD", "true"]
+      retries: 3
+      start_period: 60s
+    networks:
+      - bugtraceai-network
+volumes:
+  reconftw-output:
+networks:
+  bugtraceai-network:
+EOF
+INSTALL_WEB=true
+WEB_DIR="$arm_web_dir"
+INSTALL_CLI=false
+MCP_CLI_ENABLED=false
+MCP_RECON_ENABLED=true
+MCP_KALI_ENABLED=false
+RECON_PORT=41002
+MCP_PORT=41001
+(
+    uname() { printf 'arm64\n'; }
+    patch_compose
+)
+grep -Fq '    platform: linux/amd64' "$arm_web_dir/docker-compose.yml" || fail "ARM recon platform was not kept inside the service"
+grep -Fq '    pull_policy: build' "$arm_web_dir/docker-compose.yml" || fail "ARM recon pull policy was not kept inside the service"
+volumes_line="$(grep -n '^volumes:$' "$arm_web_dir/docker-compose.yml" | head -1 | cut -d: -f1)"
+if [[ -n "$volumes_line" ]] && tail -n +"$volumes_line" "$arm_web_dir/docker-compose.yml" | grep -q 'platform:'; then
+    fail "ARM recon patch leaked service keys into volumes"
+fi
+
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     docker compose -f "$fixture" config --quiet
+    docker compose -f "$arm_web_dir/docker-compose.yml" config --quiet
 
     # Even if a caller exports COMPOSE_PROFILES, the base helper must leave
     # optional profiles disabled until explicit --profile flags are supplied.
@@ -194,10 +282,64 @@ MCP_KALI_ENABLED=true
 generate_mcp_config >/dev/null
 config_file="$scratch_dir/mcp-config.json"
 grep -Fq '"bugtraceai"' "$config_file" || fail "core MCP endpoint missing"
+grep -Fq '"bugtraceai-api"' "$config_file" || fail "BugTraceAI-API MCP endpoint missing"
+grep -Fq 'http://localhost:39106/mcp' "$config_file" || fail "BugTraceAI-API MCP endpoint has wrong URL"
 grep -Fq '"reconftw"' "$config_file" || fail "recon MCP endpoint missing"
 if grep -Fq '"kali"' "$config_file"; then
     fail "Kali toolbox was emitted as an MCP endpoint"
 fi
+
+# Full mode starts the standalone API first. CLI cleanup may remove old CLI
+# names, but must not remove the API container it has just started.
+service_fixture="$scratch_dir/service-startup"
+mkdir -p "$service_fixture/BugTraceAI-API" "$service_fixture/BugTraceAI-CLI"
+: > "$service_fixture/BugTraceAI-API/docker-compose.yml"
+: > "$service_fixture/BugTraceAI-CLI/docker-compose.yml"
+BTAI_DIR="$service_fixture/BugTraceAI-API"
+CLI_DIR="$service_fixture/BugTraceAI-CLI"
+INSTALL_DIR="$service_fixture"
+INSTALL_WEB=false
+INSTALL_CLI=true
+INSTALL_BTAI=true
+MCP_CLI_ENABLED=true
+MCP_RECON_ENABLED=false
+MCP_KALI_ENABLED=false
+api_started=false
+docker() {
+    if [[ "$1" == "rm" && "$api_started" == true && " $* " == *" bugtrace-api "* ]]; then
+        fail "CLI startup removed the standalone BugTraceAI-API container"
+    fi
+    return 0
+}
+_build_with_progress() {
+    [[ "$1" == "BugTraceAI-API" ]] && api_started=true
+    return 0
+}
+start_services >/dev/null
+unset -f docker _build_with_progress
+
+# A failed health check must stop the deployment before state/success are
+# written. This reproduces the old false-success path with no Docker calls.
+failure_fixture="$scratch_dir/health-failure"
+INSTALL_DIR="$failure_fixture"
+STATE_FILE="$failure_fixture/.launcher-state"
+INSTALL_BTAI=true
+INSTALL_WEB=false
+INSTALL_CLI=false
+BTAI_PORT=39105
+BTAI_MCP_PORT=39106
+clone_repos() { :; }
+generate_env() { :; }
+patch_compose() { :; }
+start_services() { :; }
+wait_for_url() { return 1; }
+show_success() { fail "success banner was shown after failed health checks"; }
+if deploy >/dev/null 2>&1; then
+    fail "deployment returned success after failed health checks"
+fi
+[[ ! -e "$STATE_FILE" ]] || fail "state was saved after failed health checks"
+unset -f clone_repos generate_env patch_compose start_services wait_for_url show_success
+cd "$test_dir"
 
 # Installer event log is opt-in when this file is sourced. A real run calls
 # _init_install_log from main() and writes next to launcher.sh.
