@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.2')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.3')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -1564,9 +1564,9 @@ offer_installer_mode() {
 wizard_select_components() {
     # Step 1: Select Base Installation Mode
     select_option "What would you like to install?" \
-        "BugTraceAI Web + CLI (Full Platform - Recommended)" \
+        "BugTraceAI Web + API + CLI (Full Platform - Recommended)" \
         "Solo BugTraceAI CLI (Engine Only - Standalone)" \
-        "Solo BugTraceAI WEB (UI Only)"
+        "BugTraceAI WEB + API (UI + API)"
 
     INSTALL_WEB=false
     INSTALL_CLI=false
@@ -1576,7 +1576,7 @@ wizard_select_components() {
     MCP_KALI_ENABLED=false
 
     case $MENU_SELECTION in
-        0) # Web + CLI
+        0) # Web + API + CLI
             INSTALL_WEB=true
             INSTALL_CLI=true
             INSTALL_BTAI=true
@@ -1587,7 +1587,7 @@ wizard_select_components() {
             INSTALL_CLI=true
             DEPLOY_MODE="cli"
             ;;
-        2) # Solo WEB
+        2) # WEB + API
             INSTALL_WEB=true
             INSTALL_BTAI=true
             DEPLOY_MODE="web"
@@ -1626,6 +1626,7 @@ wizard_select_components() {
     echo ""
     echo -e "${BOLD}Selected Components:${NC}"
     $INSTALL_WEB && echo -e "  ${OK} WEB Dashboard"
+    $INSTALL_BTAI && echo -e "  ${OK} BugTraceAI-API (REST + MCP)"
     $INSTALL_CLI && echo -e "  ${OK} CLI Scanner"
     $MCP_CLI_ENABLED && echo -e "  ${OK} BugTraceAI MCP (Core Agent)"
     $MCP_RECON_ENABLED && echo -e "  ${OK} reconFTW MCP (by @six2dez)"
