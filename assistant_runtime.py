@@ -409,8 +409,10 @@ def rewrite_web_cli_proxy(nginx_path: str, cli_port: Optional[int]) -> bool:
         )
         # Current Compose files already receive the selected port through
         # ${CLI_API_PORT}; no source rewrite is needed in that case.
-        if changed == 0 and "proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;" in content:
-            return True
+        if changed == 0:
+            if ("proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;" in content
+                    or "proxy_pass http://$cli_api_host:${CLI_API_PORT}/;" in content):
+                return True
     if changed != 1:
         return False
     try:
