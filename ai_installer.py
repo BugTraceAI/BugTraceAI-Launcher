@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v3.0.1
+BugTraceAI — AI Setup & Repair Assistant v3.0.2
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -217,9 +217,9 @@ BTAI_REPO = os.environ.get("BUGTRACEAI_API_REPO", "https://github.com/BugTraceAI
 _VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
 try:
     with open(_VERSION_FILE, encoding="utf-8") as _version_handle:
-        VERSION = _version_handle.read().strip() or "3.0.1"
+        VERSION = _version_handle.read().strip() or "3.0.2"
 except OSError:
-    VERSION = "3.0.1"
+    VERSION = "3.0.2"
 BTAI_SHARED_NETWORK = "bugtraceai-platform"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks

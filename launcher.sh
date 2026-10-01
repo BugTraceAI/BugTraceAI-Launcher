@@ -601,6 +601,46 @@ patch_recon_entrypoint_startup() {
     info "Applied reconftw-mcp startup bootstrap compatibility patch."
 }
 
+patch_recon_mcp_dependency() {
+    local dockerfile="$RECON_DIR/Dockerfile"
+    local requirements="$RECON_DIR/requirements.txt"
+    local tmp_file
+    local changed=false
+
+    # reconFTW MCP currently imports the v1 FastMCP API.  The unbounded
+    # dependency accepted mcp 2.x, which removed that import and left the
+    # optional agent in a restart loop during the install health check.
+    if [[ -f "$requirements" ]] && grep -Eq '^mcp\[cli\]>=1\.0\.0[[:space:]]*$' "$requirements"; then
+        sed_inplace -E 's|^mcp\[cli\]>=1\.0\.0[[:space:]]*$|mcp[cli]>=1.0.0,<2|' "$requirements"
+        changed=true
+    fi
+
+    if [[ -f "$dockerfile" ]] && grep -Eq '^[[:space:]]*mcp\[cli\]>=1\.0\.0[[:space:]]*\\[[:space:]]*$' "$dockerfile"; then
+        tmp_file="$(mktemp)"
+        awk '
+        /^[[:space:]]*mcp\[cli\]>=1\.0\.0[[:space:]]*\\[[:space:]]*$/ {
+            match($0, /^[[:space:]]*/)
+            printf "%s\"mcp[cli]>=1.0.0,<2\" \\\n", substr($0, 1, RLENGTH)
+            next
+        }
+        { print }
+        ' "$dockerfile" > "$tmp_file" || {
+            rm -f "$tmp_file"
+            return 1
+        }
+        if grep -Fq '"mcp[cli]>=1.0.0,<2" \' "$tmp_file"; then
+            mv "$tmp_file" "$dockerfile"
+            changed=true
+        else
+            rm -f "$tmp_file"
+        fi
+    fi
+
+    if $changed; then
+        info "Pinned reconftw-mcp to the compatible MCP v1 dependency range."
+    fi
+}
+
 patch_recon_dockerfile_venv() {
     local dockerfile="$RECON_DIR/Dockerfile"
     local host_arch
@@ -616,6 +656,7 @@ patch_recon_dockerfile_venv() {
         fi
     fi
 
+    patch_recon_mcp_dependency
     patch_recon_entrypoint_startup
 
     # Already patched or upstream fixed.
