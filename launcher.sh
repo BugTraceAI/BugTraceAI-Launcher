@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.0.0')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.0.3')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -395,29 +395,37 @@ ensure_recon_env_defaults() {
     tmp_file="$(mktemp)"
 
     awk '
-    BEGIN { in_recon=0; has_auto=0; inserted=0 }
-    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; has_auto=0; inserted=0; print; next }
-    in_recon && /^[[:space:]]+- RECONFTW_AUTO_INSTALL=/ { has_auto=1 }
-    in_recon && /^[[:space:]]+- MCP_PORT=8002[[:space:]]*$/ {
-        print
-        if (!has_auto && !inserted) {
-            print "      - RECONFTW_AUTO_INSTALL=false"
-            inserted=1
+    BEGIN { in_recon=0; count=0 }
+    function emit_service(    i, has_auto, env_start, env_end, mapping) {
+        has_auto=0; env_start=0; env_end=count+1; mapping=0
+        for (i=1; i<=count; i++) {
+            if (lines[i] !~ /^[[:space:]]*#/ && lines[i] ~ /RECONFTW_AUTO_INSTALL[=:]/) has_auto=1
+            if (lines[i] ~ /^    environment:[[:space:]]*$/) env_start=i
         }
-        next
+        if (env_start) {
+            for (i=env_start+1; i<=count; i++) {
+                if (lines[i] ~ /^    [^[:space:]]/) { env_end=i; break }
+                if (lines[i] ~ /^      [^[:space:]#-]+:[[:space:]]/) mapping=1
+            }
+        }
+        for (i=1; i<=count+1; i++) {
+            if (!has_auto && i==env_end) {
+                if (!env_start) print "    environment:"
+                if (mapping) print "      RECONFTW_AUTO_INSTALL: \"false\""
+                else print "      - RECONFTW_AUTO_INSTALL=false"
+            }
+            if (i<=count) print lines[i]
+        }
+        count=0
     }
-    in_recon && /^  [^[:space:]]/ {
-        if (!has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
+    /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; lines[++count]=$0; next }
+    in_recon && (/^  [^[:space:]]/ || /^[^[:space:]]/) {
+        emit_service()
         in_recon=0
     }
-    in_recon && /^[^[:space:]]/ {
-        if (!has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
-        in_recon=0
-    }
+    in_recon { lines[++count]=$0; next }
     { print }
-    END {
-        if (in_recon && !has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
-    }
+    END { if (in_recon) emit_service() }
     ' "$compose_file" > "$tmp_file"
 
     mv "$tmp_file" "$compose_file"
@@ -507,7 +515,7 @@ ensure_kali_startup_command() {
         print
         next
     }
-    in_kali && /^  [^[:space:]]/ {
+    in_kali && (/^  [^[:space:]]/ || /^[^[:space:]]/) {
         if (!emitted) emit_command()
         in_kali=0
         skip_command=0

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v3.0.2
+BugTraceAI — AI Setup & Repair Assistant v3.0.3
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -33,7 +33,6 @@ import secrets
 import shlex
 import shutil
 import socket
-import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
@@ -108,8 +107,6 @@ def _on_signal_exit(code):
     sys.exit(code)
 
 
-atexit.register(_terminate_bash)
-atexit.register(_cleanup_terminal)
 
 
 def _close_privilege_session():
@@ -189,9 +186,6 @@ def _ensure_linux_docker_engine():
     return proc.returncode == 0
 
 
-atexit.register(_close_privilege_session)
-signal.signal(signal.SIGINT, lambda *_: _on_signal_exit(130))
-signal.signal(signal.SIGTERM, lambda *_: _on_signal_exit(143))
 
 
 def _positive_env_int(name, default):
@@ -207,7 +201,7 @@ def _positive_env_int(name, default):
 MAX_TURNS = _positive_env_int("BTAI_INSTALLER_MAX_TURNS", 80)
 SUPPORT_TURNS = _positive_env_int("BTAI_INSTALLER_SUPPORT_TURNS", 32)
 CMD_TIMEOUT_DEFAULT = 60
-CMD_TIMEOUT_DOCKER_BUILD = 600
+CMD_TIMEOUT_DOCKER_BUILD = _positive_env_int("BTAI_INSTALLER_BUILD_TIMEOUT", 3600)
 API_MAX_ATTEMPTS = 4
 INSTALL_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
@@ -217,9 +211,9 @@ BTAI_REPO = os.environ.get("BUGTRACEAI_API_REPO", "https://github.com/BugTraceAI
 _VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
 try:
     with open(_VERSION_FILE, encoding="utf-8") as _version_handle:
-        VERSION = _version_handle.read().strip() or "3.0.2"
+        VERSION = _version_handle.read().strip() or "3.0.3"
 except OSError:
-    VERSION = "3.0.2"
+    VERSION = "3.0.3"
 BTAI_SHARED_NETWORK = "bugtraceai-platform"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks
@@ -532,7 +526,7 @@ def _choose_mode(action):
 def _choose_mcp(mode):
     """Match the wizard extras: Full pack / Kali / recon / none. CLI-only skips this."""
     if mode == "cli":
-        return False, False, False
+        return True, False, False
     env_recon = os.environ.get("BTAI_INSTALLER_MCP_RECON", "").strip().lower()
     env_kali = os.environ.get("BTAI_INSTALLER_MCP_KALI", "").strip().lower()
     if env_recon in ("0", "1", "true", "false", "yes", "no") or env_kali in (
@@ -682,9 +676,12 @@ def _read_env_values(path):
 def _load_saved_api_key(install_dir, provider):
     """Read an already-private deployed key locally without exposing it to the
     assistant transcript.  A missing key simply means we must ask once."""
-    values = _read_env_values(os.path.join(install_dir, "BugTraceAI-CLI", ".env"))
-    key = values.get(core.cli_key_env(provider), "").strip()
-    return key or None
+    for repo in ("BugTraceAI-CLI", "BugTraceAI-API"):
+        values = _read_env_values(os.path.join(install_dir, repo, ".env"))
+        key = values.get(core.cli_key_env(provider), "").strip()
+        if key:
+            return key
+    return None
 
 
 def _read_launcher_state(install_dir):
@@ -749,20 +746,28 @@ def _published_port(container):
     return None
 
 
-def _published_ports(container):
-    """Return all published host ports for a multi-listener container."""
-    rc, output = _capture_host_command(["docker", "port", container])
+def _api_published_ports():
+    """Identify API listeners by their configured role, not Docker's ordering."""
+    rc, output = _capture_host_command([
+        "docker", "inspect", "--format", "{{json .}}", "bugtrace-api",
+    ])
     if rc != 0:
-        return []
-    ports = []
-    for line in output.splitlines():
-        candidate = line.split("->", 1)[-1].strip()
-        _, sep, tail = candidate.rpartition(":")
-        if sep:
-            port = _as_port(tail)
-            if port is not None and port not in ports:
-                ports.append(port)
-    return ports
+        return {}
+    try:
+        data = json.loads(output)
+        listeners = dict(item.split("=", 1) for item in data["Config"]["Env"] if "=" in item)
+        bindings = data["NetworkSettings"]["Ports"]
+        ports = {}
+        for role, key in (("btai", "API_PORT"), ("btai_mcp", "MCP_PORT")):
+            listener = _as_port(listeners.get(key))
+            for binding in bindings.get(f"{listener}/tcp") or []:
+                host_port = _as_port(binding.get("HostPort"))
+                if host_port is not None:
+                    ports[role] = host_port
+                    break
+        return ports
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {}
 
 
 def _first_published_port(*containers):
@@ -821,14 +826,12 @@ def _resolve_deployment_context():
 def _refresh_deployment_context(context, allocate_web=False):
     """Prefer actual published Docker ports over possibly stale saved state."""
     web = _published_port("bugtraceai-web-frontend") or context.ports.web
-    cli = _first_published_port("bugtrace_api", "bugtrace-api") or context.ports.cli
+    cli = _published_port("bugtrace_api") or context.ports.cli
     mcp = _first_published_port("bugtrace_mcp", "bugtrace-mcp", "bugtrace-cli-mcp") or context.ports.mcp
     recon = _published_port("reconftw-mcp") or context.ports.recon
-    btai_ports = _published_ports("bugtrace-api")
-    btai_mcp = context.ports.btai_mcp
-    btai = context.ports.btai
-    if len(btai_ports) >= 2:
-        btai_mcp, btai = btai_ports[0], btai_ports[1]
+    btai_ports = _api_published_ports()
+    btai_mcp = btai_ports.get("btai_mcp") or context.ports.btai_mcp
+    btai = btai_ports.get("btai") or context.ports.btai
     if allocate_web and context.mode in ("full", "web") and web is None:
         web = _allocate_host_port()
     return replace(context, ports=core.DeploymentPorts(
@@ -901,11 +904,7 @@ def _configure_cli():
     # Determine ports for both a fresh install and a repair. In a repair,
     # prefer saved/live deployment state, then the existing .env, and only
     # allocate a new endpoint when neither source has one.
-    reserved = [port for port in (
-        deployment_context.ports.web, deployment_context.ports.cli,
-        deployment_context.ports.mcp, deployment_context.ports.recon,
-        deployment_context.ports.kali,
-    ) if port is not None]
+    reserved = [port for port in vars(deployment_context.ports).values() if port is not None]
     cli_port = (deployment_context.ports.cli
                 or _as_port(existing_env.get("CLI_PORT"))
                 or _allocate_host_port(reserved))
@@ -923,6 +922,7 @@ def _configure_cli():
         deployment_context = replace(
             deployment_context,
             ports=replace(deployment_context.ports, cli=cli_port, mcp=mcp_port),
+            mcp_cli_enabled=True,
         )
     else:
         # Legacy snapshots have hardcoded mappings, so preserve compatibility
@@ -944,16 +944,11 @@ def _configure_cli():
 
     key_env = core.cli_key_env(PROVIDER)
     try:
-        env_lines = [
-            f"# Generated by BugTraceAI Launcher v{VERSION}\n"
-            f"PROVIDER={PROVIDER}\n"
-            f"{key_env}={api_key}\n"
-            "BUGTRACE_CORS_ORIGINS=*\n"
-        ]
-        for key in ("CLI_PORT", "MCP_PORT", "BTAI_SHARED_NETWORK"):
-            if key in cli_env_values:
-                env_lines.append(f"{key}={cli_env_values[key]}\n")
-        _write_private_file(env_path, "".join(env_lines))
+        _update_private_env(env_path, {
+            "PROVIDER": PROVIDER, key_env: api_key,
+            "BUGTRACE_CORS_ORIGINS": existing_env.get("BUGTRACE_CORS_ORIGINS", "*"),
+            **cli_env_values,
+        })
         _set_cli_provider_active(os.path.join(cli_dir, "bugtraceaicli.conf"), PROVIDER)
     except OSError as exc:
         return False, f"Could not write CLI configuration: {exc}"
@@ -985,98 +980,113 @@ def _configure_api():
     key_env = core.cli_key_env(PROVIDER)
     env_path = os.path.join(btai_dir, ".env")
     try:
-        _write_private_file(env_path, (
-            f"# Generated by BugTraceAI AI Installer v{VERSION}\n"
-            f"APEX_PROVIDER={PROVIDER}\n"
-            f"MCP_PORT={btai_mcp}\n"
-            f"API_PORT={btai_port}\n"
-            f"BTAI_SHARED_NETWORK={BTAI_SHARED_NETWORK}\n"
-            f"{key_env}={api_key}\n"
-        ))
+        _update_private_env(env_path, {
+            "APEX_PROVIDER": PROVIDER, "MCP_PORT": str(btai_mcp),
+            "API_PORT": str(btai_port), "BTAI_SHARED_NETWORK": BTAI_SHARED_NETWORK,
+            key_env: api_key,
+        })
     except OSError as exc:
         return False, f"Could not write BugTraceAI-API configuration: {exc}"
     return True, "BugTraceAI-API configuration was written with restricted permissions."
 
 
-def _harden_web_npm_installs(web_dir):
-    """Make older WEB snapshots retry transient npm registry resets.
-
-    The standard shell installer applies the same compatibility patch.  The AI
-    path configures the checkout independently, so it needs this small,
-    idempotent equivalent before the model runs the Compose build.
-    """
-    dockerfile = os.path.join(web_dir, "backend", "Dockerfile")
-    if not os.path.isfile(dockerfile):
-        return False
+def _update_private_env(path, updates):
+    """Update selected keys while preserving database secrets and user settings."""
     try:
-        with open(dockerfile, encoding="utf-8") as handle:
-            content = handle.read()
-    except OSError:
-        return False
-    if "npm config set fetch-retries" in content:
-        return False
-
-    builder = (
-        "RUN npm config set fetch-retries 5 && "
-        "npm config set fetch-retry-mintimeout 20000 && "
-        "npm config set fetch-retry-maxtimeout 120000 && "
-        "npm ci --no-audit --no-fund\n"
-    )
-    production = (
-        "RUN npm config set fetch-retries 5 && "
-        "npm config set fetch-retry-mintimeout 20000 && "
-        "npm config set fetch-retry-maxtimeout 120000 && "
-        "npm ci --omit=dev --no-audit --no-fund\n"
-    )
-    lines = content.splitlines(keepends=True)
-    rewritten = []
-    changed = False
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        lines = []
+    remaining = dict(updates)
+    output = []
     for line in lines:
-        stripped = line.rstrip("\r\n")
-        if stripped == "RUN npm ci --omit=dev":
-            rewritten.append(production)
-            changed = True
-        elif stripped == "RUN npm ci":
-            rewritten.append(builder)
-            changed = True
+        key = line.strip().split("=", 1)[0]
+        if not line.lstrip().startswith("#") and "=" in line and key in updates:
+            if key in remaining:
+                output.append(f"{key}={remaining.pop(key)}\n")
         else:
-            rewritten.append(line)
-    if not changed:
-        return False
+            output.append(line)
+    if output and not output[-1].endswith("\n"):
+        output[-1] += "\n"
+    output.extend(f"{key}={value}\n" for key, value in remaining.items())
+    _write_private_file(path, "".join(output))
 
-    temporary = None
+
+def _prepare_web_sources():
+    """Use the standard Launcher's compatibility patches in the AI path too."""
+    launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh")
+    context = deployment_context
+    script = """
+source "$1"
+trap - EXIT INT TERM
+set -e
+INSTALL_WEB=true
+INSTALL_CLI="$2"
+MCP_CLI_ENABLED="$3"
+MCP_RECON_ENABLED="$4"
+MCP_KALI_ENABLED="$5"
+CLI_PORT="$6"
+MCP_PORT="$7"
+RECON_PORT="$8"
+if "$MCP_RECON_ENABLED"; then
+    ensure_recon_source
+fi
+patch_compose
+"""
+    env = os.environ.copy()
+    env["BUGTRACEAI_DIR"] = context.install_dir
+    env["COMPOSE_PROFILES"] = ""
+    if _INSTALL_LOG_FILE:
+        env["BUGTRACEAI_INSTALL_LOG"] = _INSTALL_LOG_FILE
     try:
-        mode = os.stat(dockerfile).st_mode
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=os.path.dirname(dockerfile),
-            prefix=".Dockerfile.", delete=False,
-        ) as handle:
-            handle.write("".join(rewritten))
-            temporary = handle.name
-        os.chmod(temporary, mode)
-        os.replace(temporary, dockerfile)
-    except OSError:
-        if temporary:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-        return False
-    return True
+        proc = subprocess.run([
+            "bash", "-c", script, "bash", launcher,
+            str(context.mode == "full").lower(),
+            str(context.mcp_cli_enabled).lower(),
+            str(context.mcp_recon_enabled).lower(),
+            str(context.mcp_kali_enabled).lower(),
+            str(context.ports.cli or ""),
+            str(context.ports.mcp or ""),
+            str(context.ports.recon or ""),
+        ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Could not prepare WEB/agent sources: {exc}"
+    if proc.returncode != 0:
+        return False, "WEB/agent preparation failed:\n" + core.redact_sensitive_output(
+            proc.stdout or "", (api_key,))
+    return True, "WEB and selected agents received the standard Launcher compatibility patches."
+
+
+def _configure_agents():
+    """Prepare reconFTW and Kali deterministically before their Compose builds."""
+    global deployment_context
+    web_dir = os.path.join(INSTALL_DIR, "BugTraceAI-WEB")
+    env_path = os.path.join(web_dir, ".env.docker")
+    if not os.path.isfile(env_path):
+        return False, "Call configure_web before configure_agents."
+    if deployment_context.mcp_recon_enabled:
+        reserved = [port for port in vars(deployment_context.ports).values() if port is not None]
+        existing = _read_env_values(env_path)
+        database_port = _as_port(existing.get("POSTGRES_PORT"))
+        if database_port is not None:
+            reserved.append(database_port)
+        recon = (deployment_context.ports.recon
+                 or _as_port(existing.get("RECON_MCP_PORT"))
+                 or _allocate_host_port(reserved))
+        deployment_context = replace(
+            deployment_context, ports=replace(deployment_context.ports, recon=recon))
+        _update_private_env(env_path, {
+            "RECON_MCP_PORT": str(recon), "RECON_SSE_MODE": "true",
+        })
+    return _prepare_web_sources()
 
 
 def _configure_web():
     global deployment_context
     web_dir = os.path.join(INSTALL_DIR, "BugTraceAI-WEB")
-    if not os.path.isdir(web_dir):
-        return False, "WEB directory is missing. Clone BugTraceAI-WEB first."
-    if setup_action == "repair" and os.path.isfile(os.path.join(web_dir, ".env.docker")):
-        npm_hardened = _harden_web_npm_installs(web_dir)
-        detail = "Existing WEB configuration was preserved during repair."
-        if npm_hardened:
-            detail += " npm registry retry protection was applied to the WEB Dockerfile."
-        return True, detail
-
+    if not os.path.isfile(os.path.join(web_dir, "docker-compose.yml")):
+        return False, "WEB Compose is missing. Clone BugTraceAI-WEB first."
     if deployment_context.mode == "full" and deployment_context.ports.cli is None:
         return False, "Full mode needs configure_cli before WEB configuration so its proxy has a resolved CLI endpoint."
     if deployment_context.ports.btai is None or deployment_context.ports.btai_mcp is None:
@@ -1086,41 +1096,38 @@ def _configure_web():
     web_port = deployment_context.ports.web
     if web_port is None:
         return False, "Could not allocate a WEB host port."
-    reserved = [port for port in (
-        deployment_context.ports.web, deployment_context.ports.cli,
-        deployment_context.ports.mcp, deployment_context.ports.recon,
-        deployment_context.ports.kali,
-    ) if port is not None]
-    database_port = _allocate_host_port(reserved)
-    database_password = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-                                for _ in range(24))
-    npm_hardened = _harden_web_npm_installs(web_dir)
+
+    env_path = os.path.join(web_dir, ".env.docker")
+    existing = _read_env_values(env_path)
+    reserved = [port for port in vars(deployment_context.ports).values() if port is not None]
+    database_port = _as_port(existing.get("POSTGRES_PORT")) or _allocate_host_port(reserved)
+    database_password = existing.get("POSTGRES_PASSWORD") or "".join(
+        secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        for _ in range(24))
     try:
-        _write_private_file(os.path.join(web_dir, ".env.docker"), (
-            f"# Generated by BugTraceAI Launcher v{VERSION}\n"
-            "POSTGRES_USER=bugtraceai\n"
-            f"POSTGRES_PASSWORD={database_password}\n"
-            "POSTGRES_DB=bugtraceai_web\n"
-            f"POSTGRES_PORT={database_port}\n"
-            f"FRONTEND_PORT={web_port}\n"
-            "VITE_CLI_API_URL=/cli-api\n"
-            "VITE_BTAI_API_URL=/btai-api\n"
-            f"CLI_API_PORT={deployment_context.ports.cli or 8000}\n"
-            f"BTAI_API_PORT={deployment_context.ports.btai}\n"
-            f"BTAI_SHARED_NETWORK={BTAI_SHARED_NETWORK}\n"
-        ))
+        _update_private_env(env_path, {
+            "POSTGRES_USER": existing.get("POSTGRES_USER", "bugtraceai"),
+            "POSTGRES_PASSWORD": database_password,
+            "POSTGRES_DB": existing.get("POSTGRES_DB", "bugtraceai_web"),
+            "POSTGRES_PORT": str(database_port),
+            "FRONTEND_PORT": str(web_port),
+            "VITE_CLI_API_URL": "/cli-api",
+            "VITE_BTAI_API_URL": "/btai-api",
+            "CLI_API_PORT": str(deployment_context.ports.cli or 8000),
+            "BTAI_API_PORT": str(deployment_context.ports.btai),
+            "BTAI_SHARED_NETWORK": BTAI_SHARED_NETWORK,
+            "COMPOSE_PROFILES": "",
+        })
         nginx_path = os.path.join(web_dir, "nginx.conf")
-        if deployment_context.mode == "full":
-            if not rewrite_web_cli_proxy(nginx_path, deployment_context.ports.cli):
-                return False, "Could not point the WEB proxy at the resolved CLI endpoint."
-        elif not rewrite_web_cli_proxy(nginx_path, None):
-            return False, "Could not make the optional WEB CLI proxy lazy."
+        if not rewrite_web_cli_proxy(nginx_path, deployment_context.ports.cli):
+            return False, "Could not wire the WEB CLI proxy."
+        prepared, detail = _configure_agents()
+        if not prepared:
+            return False, detail
     except OSError as exc:
         return False, f"Could not write WEB configuration: {exc}"
-    detail = f"WEB configuration was written for the resolved host endpoint {core.endpoint_url(web_port)}."
-    if npm_hardened:
-        detail += " npm registry retry protection was applied to the WEB Dockerfile."
-    return True, detail
+    return True, (f"WEB configuration was written for {core.endpoint_url(web_port)}. "
+                  "Existing database settings were preserved. " + detail)
 
 
 def _save_ai_state(context):
@@ -1169,8 +1176,12 @@ def run_verification(run_fn, context):
     # claim that the user can reach the service.  Do not substitute a familiar
     # port number here; make the unresolved mapping visible to the agent.
     required_ports = []
-    if context.mode in ("full", "cli"):
+    if context.mode in ("full", "cli") or context.mcp_cli_enabled:
         required_ports.append(("CLI host port", context.ports.cli))
+    if context.mcp_cli_enabled:
+        required_ports.append(("BugTraceAI MCP host port", context.ports.mcp))
+    if context.mcp_recon_enabled:
+        required_ports.append(("reconFTW MCP host port", context.ports.recon))
     if context.mode in ("full", "web"):
         required_ports.append(("WEB host port", context.ports.web))
         required_ports.append(("BugTraceAI-API REST host port", context.ports.btai))
@@ -1184,7 +1195,8 @@ def run_verification(run_fn, context):
     for check in core.verification_checks(
             context.mode, context.install_dir, context.ports,
             mcp_enabled=context.mcp_cli_enabled,
-            recon_enabled=context.mcp_recon_enabled):
+            recon_enabled=context.mcp_recon_enabled,
+            kali_enabled=context.mcp_kali_enabled):
         rc, out = run_fn(check.command)
         out = core.redact_sensitive_output(out, (api_key,))
         passed = core.evaluate_check(check.predicate, rc, out)
@@ -1231,163 +1243,166 @@ def print_success_next_steps(context, action):
     print(f"{DIM}  You can type a question now, or press ENTER to exit.{RESET}")
 
 
-# ── Boot ──────────────────────────────────────────────────────────────────────
-reconnect_tty_or_exit()
-_init_install_log()
-os.system("clear")
-print()
-bw = 56
-if _UTF8_ENABLED:
-    print(f"{CYAN}{BOLD}  ┌{'─' * bw}┐{RESET}")
-    print(f"{CYAN}{BOLD}  │{'BugTraceAI  ·  AI Setup & Repair Assistant  v' + VERSION:^{bw}}│{RESET}")
-    print(f"{CYAN}{BOLD}  │{_BANNER_SUBTITLE:^{bw}}│{RESET}")
-    print(f"{CYAN}{BOLD}  └{'─' * bw}┘{RESET}")
-else:
-    print(f"{CYAN}{BOLD}  {'-' * bw}{RESET}")
-    print(f"{CYAN}{BOLD}  {'BugTraceAI - AI Setup & Repair Assistant v' + VERSION:^{bw}}{RESET}")
-    print(f"{CYAN}{BOLD}  {_BANNER_SUBTITLE_ASCII:^{bw}}{RESET}")
-    print(f"{CYAN}{BOLD}  {'-' * bw}{RESET}")
-print()
-print(f"{GREY}  Assisted agent with shell access. It can install BugTraceAI,{RESET}")
-print(f"{GREY}  diagnose services, Docker, ports, database and configuration,{RESET}")
-print(f"{GREY}  and verify the result automatically.{RESET}")
-print(f"{GREY}  Recommended for clean VMs, VPS or controlled environments.{RESET}")
-if _INSTALL_LOG_FILE:
-    print(f"{GREY}  Install log: {_INSTALL_LOG_FILE}{RESET}")
-print()
-hr()
-
-# Privilege is intentionally acquired through the native terminal prompt.  We
-# retain no password: sudo owns a temporary ticket, refreshed only while this
-# process lives and explicitly invalidated on exit.
-_privilege_session = PrivilegeSession()
-info("Authenticate once with sudo if required; its native prompt will appear below.")
-if not _privilege_session.authenticate():
-    err("Sudo access is required to continue.")
-    sys.exit(1)
-ok("Temporary sudo session is active for this launcher only.")
-
-_REEXECED_DOCKER_GROUP = os.environ.get("BTAI_DOCKER_GROUP_REEXEC") == "1"
-
-# Disclaimer (skip on the sg docker re-exec — already confirmed).
-if not _REEXECED_DOCKER_GROUP:
+def _boot():
+    global _privilege_session, PROVIDER, MODEL_CHAIN, api_key, setup_action
+    global install_mode, deployment_context, SYSTEM, messages
+    # ── Boot ──────────────────────────────────────────────────────────────────────
+    reconnect_tty_or_exit()
+    _init_install_log()
+    os.system("clear")
     print()
-    print(f"{YELLOW}{BOLD}  {WARN}  RISKS BEFORE CONTINUING:{RESET}")
-    print(f"{YELLOW}  1. The AI can install packages and modify system configuration.{RESET}")
-    print(f"{YELLOW}  2. A mistake could affect other services on this machine.{RESET}")
-    print(f"{YELLOW}  3. This consumes credits from your LLM provider account.{RESET}")
-    print()
-    if not confirm("Continue?"):
-        print("\n  Cancelled.\n")
-        sys.exit(0)
-else:
-    ok("Docker group is active in this session.")
-
-if sys.platform != "darwin" and not _docker_info_ok():
-    info("Docker Engine is not ready; installing or starting it...")
-    if not _ensure_linux_docker_engine() and not _docker_info_ok():
-        err("Docker Engine is required. Install it and rerun this installer.")
-        sys.exit(1)
-    if _docker_info_ok():
-        ok("Docker Engine is ready.")
+    bw = 56
+    if _UTF8_ENABLED:
+        print(f"{CYAN}{BOLD}  ┌{'─' * bw}┐{RESET}")
+        print(f"{CYAN}{BOLD}  │{'BugTraceAI  ·  AI Setup & Repair Assistant  v' + VERSION:^{bw}}│{RESET}")
+        print(f"{CYAN}{BOLD}  │{_BANNER_SUBTITLE:^{bw}}│{RESET}")
+        print(f"{CYAN}{BOLD}  └{'─' * bw}┘{RESET}")
     else:
-        info("Docker is installed; privileged commands will be used until this user is in the docker group.")
-
-_maybe_reexec_with_docker_group()
-
-# Interactive choices — same questions the AI installer asked before the
-# autonomous pass. Environment overrides skip the matching menu.
-PROVIDER = _choose_provider()
-MODEL_CHAIN = _build_model_chain(PROVIDER)
-_provider_name = "Anthropic" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter"
-_key_label = "Anthropic API key (sk-ant-...)" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter API key"
-_chain_label = " -> ".join(core.model_display_name(model) for model in MODEL_CHAIN)
-ok(f"Provider: {_provider_name}  {DOT}  Models: {_chain_label}")
-
-api_key = _load_saved_api_key(INSTALL_DIR, PROVIDER)
-if api_key:
-    ok(f"Using the locally saved API key: {core.mask_secret(api_key, mask_width=8)}")
-else:
+        print(f"{CYAN}{BOLD}  {'-' * bw}{RESET}")
+        print(f"{CYAN}{BOLD}  {'BugTraceAI - AI Setup & Repair Assistant v' + VERSION:^{bw}}{RESET}")
+        print(f"{CYAN}{BOLD}  {_BANNER_SUBTITLE_ASCII:^{bw}}{RESET}")
+        print(f"{CYAN}{BOLD}  {'-' * bw}{RESET}")
     print()
-    try:
-        api_key = getpass.getpass(f"  {_key_label} (hidden input): ").strip()
-    except Exception:
-        # getpass could not disable echo (odd PTY / no controlling TTY). Warn loudly
-        # rather than silently reading the key in cleartext.
-        err("WARNING: input could not be hidden — the API key WILL be visible on screen.")
-        sys.stdout.write(f"{WHITE}{BOLD}  {_key_label}:{RESET} ")
-        sys.stdout.flush()
-        api_key = sys.stdin.readline().strip()
-    if not api_key:
-        err("The API key is required.")
+    print(f"{GREY}  Assisted agent with shell access. It can install BugTraceAI,{RESET}")
+    print(f"{GREY}  diagnose services, Docker, ports, database and configuration,{RESET}")
+    print(f"{GREY}  and verify the result automatically.{RESET}")
+    print(f"{GREY}  Recommended for clean VMs, VPS or controlled environments.{RESET}")
+    if _INSTALL_LOG_FILE:
+        print(f"{GREY}  Install log: {_INSTALL_LOG_FILE}{RESET}")
+    print()
+    hr()
+
+    # Privilege is intentionally acquired through the native terminal prompt.  We
+    # retain no password: sudo owns a temporary ticket, refreshed only while this
+    # process lives and explicitly invalidated on exit.
+    _privilege_session = PrivilegeSession()
+    info("Authenticate once with sudo if required; its native prompt will appear below.")
+    if not _privilege_session.authenticate():
+        err("Sudo access is required to continue.")
         sys.exit(1)
-    ok(f"API key received: {core.mask_secret(api_key, mask_width=8)}")
+    ok("Temporary sudo session is active for this launcher only.")
 
-hr()
-with spinner_running("Validating API key"):
-    _valid = validate_key(PROVIDER, api_key)
-if not _valid:
-    sys.exit(1)
-ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
-hr()
+    _REEXECED_DOCKER_GROUP = os.environ.get("BTAI_DOCKER_GROUP_REEXEC") == "1"
 
-_existing_target = _has_existing_target()
-setup_action = _choose_action(_existing_target)
-install_mode = _choose_mode(setup_action)
-mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
-ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
-if mcp_recon_enabled or mcp_kali_enabled:
-    extras = []
-    if mcp_recon_enabled:
-        extras.append("reconFTW")
-    if mcp_kali_enabled:
-        extras.append("Kali")
-    ok("Extras: " + " + ".join(extras))
-elif install_mode != "cli":
-    ok("Extras: none")
+    # Disclaimer (skip on the sg docker re-exec — already confirmed).
+    if not _REEXECED_DOCKER_GROUP:
+        print()
+        print(f"{YELLOW}{BOLD}  {WARN}  RISKS BEFORE CONTINUING:{RESET}")
+        print(f"{YELLOW}  1. The AI can install packages and modify system configuration.{RESET}")
+        print(f"{YELLOW}  2. A mistake could affect other services on this machine.{RESET}")
+        print(f"{YELLOW}  3. This consumes credits from your LLM provider account.{RESET}")
+        print()
+        if not confirm("Continue?"):
+            print("\n  Cancelled.\n")
+            sys.exit(0)
+    else:
+        ok("Docker group is active in this session.")
 
-os.environ["BTAI_INSTALLER_MODE"] = install_mode
-os.environ["BTAI_INSTALLER_PROVIDER"] = PROVIDER
-os.environ["BTAI_INSTALLER_ACTION"] = setup_action
-deployment_context = _resolve_deployment_context()
-deployment_context = replace(
-    deployment_context,
-    mode=install_mode,
-    provider=PROVIDER,
-    mcp_cli_enabled=mcp_cli_enabled,
-    mcp_recon_enabled=mcp_recon_enabled,
-    mcp_kali_enabled=mcp_kali_enabled,
-)
-print()
-hr()
-print()
-info(f"Starting AI agent — action: {setup_action}, mode: {install_mode}, target: {INSTALL_DIR}")
-print()
+    if sys.platform != "darwin" and not _docker_info_ok():
+        info("Docker Engine is not ready; installing or starting it...")
+        if not _ensure_linux_docker_engine() and not _docker_info_ok():
+            err("Docker Engine is required. Install it and rerun this installer.")
+            sys.exit(1)
+        if _docker_info_ok():
+            ok("Docker Engine is ready.")
+        else:
+            info("Docker is installed; privileged commands will be used until this user is in the docker group.")
 
-# ── Build prompt & messages ──────────────────────────────────────────────────
-SYSTEM = core.build_system_prompt(PromptSpec(
-    mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
-    api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
-    btai_repo=BTAI_REPO,
-    provider=PROVIDER, ports=deployment_context.ports,
-    mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
+    _maybe_reexec_with_docker_group()
 
-messages = [
-    {"role": "system", "content": SYSTEM},
-    {"role": "user", "content": (
-        f"Action: {setup_action}. Install mode: {install_mode}. "
-        f"Install directory: {INSTALL_DIR}. "
-        f"Components: WEB={'yes' if install_mode in ('full', 'web') else 'no'}, "
-        f"CLI={'yes' if install_mode in ('full', 'cli') or mcp_cli_enabled else 'no'}, "
-        f"MCP={'yes' if mcp_cli_enabled else 'no'}, "
-        f"reconFTW={'yes' if mcp_recon_enabled else 'no'}, "
-        f"Kali={'yes' if mcp_kali_enabled else 'no'}. "
-        f"The host holds the API key privately — do NOT ask for it. "
-        f"If action is repair, diagnose first and do not reinstall without asking. "
-        f"If action is install, start by assessing the system (Step 0), then follow the playbook. "
-        f"Ask the user when a real choice appears."
-    )},
-]
+    # Interactive choices — same questions the AI installer asked before the
+    # autonomous pass. Environment overrides skip the matching menu.
+    PROVIDER = _choose_provider()
+    MODEL_CHAIN = _build_model_chain(PROVIDER)
+    _provider_name = "Anthropic" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter"
+    _key_label = "Anthropic API key (sk-ant-...)" if PROVIDER == core.PROVIDER_ANTHROPIC else "OpenRouter API key"
+    _chain_label = " -> ".join(core.model_display_name(model) for model in MODEL_CHAIN)
+    ok(f"Provider: {_provider_name}  {DOT}  Models: {_chain_label}")
+
+    api_key = _load_saved_api_key(INSTALL_DIR, PROVIDER)
+    if api_key:
+        ok(f"Using the locally saved API key: {core.mask_secret(api_key, mask_width=8)}")
+    else:
+        print()
+        try:
+            api_key = getpass.getpass(f"  {_key_label} (hidden input): ").strip()
+        except Exception:
+            # getpass could not disable echo (odd PTY / no controlling TTY). Warn loudly
+            # rather than silently reading the key in cleartext.
+            err("WARNING: input could not be hidden — the API key WILL be visible on screen.")
+            sys.stdout.write(f"{WHITE}{BOLD}  {_key_label}:{RESET} ")
+            sys.stdout.flush()
+            api_key = sys.stdin.readline().strip()
+        if not api_key:
+            err("The API key is required.")
+            sys.exit(1)
+        ok(f"API key received: {core.mask_secret(api_key, mask_width=8)}")
+
+    hr()
+    with spinner_running("Validating API key"):
+        _valid = validate_key(PROVIDER, api_key)
+    if not _valid:
+        sys.exit(1)
+    ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
+    hr()
+
+    _existing_target = _has_existing_target()
+    setup_action = _choose_action(_existing_target)
+    install_mode = _choose_mode(setup_action)
+    mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
+    ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
+    if mcp_recon_enabled or mcp_kali_enabled:
+        extras = []
+        if mcp_recon_enabled:
+            extras.append("reconFTW")
+        if mcp_kali_enabled:
+            extras.append("Kali")
+        ok("Extras: " + " + ".join(extras))
+    elif install_mode != "cli":
+        ok("Extras: none")
+
+    os.environ["BTAI_INSTALLER_MODE"] = install_mode
+    os.environ["BTAI_INSTALLER_PROVIDER"] = PROVIDER
+    os.environ["BTAI_INSTALLER_ACTION"] = setup_action
+    deployment_context = _resolve_deployment_context()
+    deployment_context = replace(
+        deployment_context,
+        mode=install_mode,
+        provider=PROVIDER,
+        mcp_cli_enabled=mcp_cli_enabled,
+        mcp_recon_enabled=mcp_recon_enabled,
+        mcp_kali_enabled=mcp_kali_enabled,
+    )
+    print()
+    hr()
+    print()
+    info(f"Starting AI agent — action: {setup_action}, mode: {install_mode}, target: {INSTALL_DIR}")
+    print()
+
+    # ── Build prompt & messages ──────────────────────────────────────────────────
+    SYSTEM = core.build_system_prompt(PromptSpec(
+        mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
+        api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
+        btai_repo=BTAI_REPO,
+        provider=PROVIDER, ports=deployment_context.ports,
+        mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
+
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": (
+            f"Action: {setup_action}. Install mode: {install_mode}. "
+            f"Install directory: {INSTALL_DIR}. "
+            f"Components: WEB={'yes' if install_mode in ('full', 'web') else 'no'}, "
+            f"CLI={'yes' if install_mode in ('full', 'cli') or mcp_cli_enabled else 'no'}, "
+            f"MCP={'yes' if mcp_cli_enabled else 'no'}, "
+            f"reconFTW={'yes' if mcp_recon_enabled else 'no'}, "
+            f"Kali={'yes' if mcp_kali_enabled else 'no'}. "
+            f"The host holds the API key privately — do NOT ask for it. "
+            f"If action is repair, diagnose first and do not reinstall without asking. "
+            f"If action is install, start by assessing the system (Step 0), then follow the playbook. "
+            f"Ask the user when a real choice appears."
+        )},
+    ]
 
 tools = [
     {"type": "function", "function": {
@@ -1418,6 +1433,12 @@ tools = [
         "name": "configure_web",
         "description": ("Configure the cloned WEB locally. The host chooses dynamic ports, creates the database secret, "
                         "and connects the WEB proxy to the resolved CLI endpoint in Full mode."),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "configure_agents",
+        "description": ("Prepare the selected reconFTW and Kali sources before building them. Restores missing "
+                        "reconFTW sources, pins MCP v1, applies venv/ARM/startup fixes and chooses the recon port. "
+                        "Use after configure_web and during repairs before rebuilding agents."),
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "ask_user",
@@ -1520,13 +1541,14 @@ def call_api():
 # anything). After a timeout we respawn a fresh shell so no stale output can
 # corrupt the next command. State (cd/env) is only lost on the rare timeout path.
 def _spawn_bash():
+    env = os.environ.copy()
+    env["COMPOSE_PROFILES"] = ""
     return subprocess.Popen(
-        ["/bin/bash"],
+        ["/bin/bash", "-o", "pipefail"], env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, start_new_session=True)
 
 
-_bash = _spawn_bash()
 
 
 def _kill_bash_group(proc):
@@ -1639,8 +1661,8 @@ def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
     if _privilege_session is None or not _privilege_session.ensure():
         return 1, _AUTH_REQUIRED
 
-    argv = (["/bin/bash", "-lc", safe_cmd] if os.geteuid() == 0
-            else ["sudo", "-n", "/bin/bash", "-lc", safe_cmd])
+    shell = ["/bin/bash", "-o", "pipefail", "-lc", "export COMPOSE_PROFILES=\n" + safe_cmd]
+    argv = shell if os.geteuid() == 0 else ["sudo", "-n", *shell]
 
     def _run_once():
         try:
@@ -1749,8 +1771,6 @@ def _finish_tool(tc, args):
     summary = args.get("summary", "")
     if not isinstance(summary, str):
         return _protocol_error(tc, "'summary' must be a string.")
-    if summary.strip():
-        bubble_ai(summary)
 
     deployment_context = _refresh_deployment_context(deployment_context)
     all_ok, report = run_verification(_verification_command, deployment_context)
@@ -1767,6 +1787,8 @@ def _finish_tool(tc, args):
             tc.id, tc.name,
             f"VERIFICATION PASSED but state could not be saved: {exc}. Fix that and call finish again."))
     _log_event("OK", "verification passed")
+    if summary.strip():
+        bubble_ai(summary)
     print_success_next_steps(deployment_context, setup_action)
     return ToolOutcome(_tool_result(tc.id, tc.name, "VERIFICATION PASSED.\n" + report), finished=True)
 
@@ -1804,6 +1826,13 @@ def _dispatch_tool(tc):
             success, detail = _configure_web()
         except Exception as exc:
             success, detail = False, f"WEB configuration failed: {exc}"
+        return ToolOutcome(_tool_result(tc.id, tc.name,
+                                        ("OK: " if success else "ERROR: ") + detail))
+    if tc.name == "configure_agents":
+        try:
+            success, detail = _configure_agents()
+        except Exception as exc:
+            success, detail = False, f"Agent configuration failed: {exc}"
         return ToolOutcome(_tool_result(tc.id, tc.name,
                                         ("OK: " if success else "ERROR: ") + detail))
     if tc.name == "ask_user":
@@ -1853,54 +1882,68 @@ def _report_turn_limit(limit):
     print()
 
 
-# Installer pass: status lines continue; a real question waits for an answer.
-# Enter is not "continue" except as a reply to a question (then we nudge).
-# ask_user also blocks inside the tool.
-agent_loop = AgentLoop(
-    messages=messages,
-    request=request_assistant,
-    is_error=core.is_err,
-    assistant_message=core.assistant_message_dict,
-    dispatch_tool=_dispatch_tool,
-    render_assistant=bubble_ai,
-    on_error=_report_agent_error,
-    on_turn=_render_turn,
-)
+def main():
+    global _bash
+    atexit.register(_terminate_bash)
+    atexit.register(_cleanup_terminal)
+    atexit.register(_close_privilege_session)
+    signal.signal(signal.SIGINT, lambda *_: _on_signal_exit(130))
+    signal.signal(signal.SIGTERM, lambda *_: _on_signal_exit(143))
+    _boot()
+    _bash = _spawn_bash()
 
-_EXIT_ANSWERS = ("exit", "quit", "bye", "salir")
-outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
-while outcome == LoopOutcome.WAITING_FOR_USER:
-    answer = prompt_user()
-    if answer.lower() in _EXIT_ANSWERS:
-        print(f"\n{CYAN}  Done. See you later.{RESET}\n")
-        _close_persistent_shell()
-        sys.exit(0)
-    if answer:
-        bubble_user(answer)
-        messages.append({"role": "user", "content": answer})
-    else:
-        messages.append({"role": "user", "content": CONTINUE_NUDGE})
+    # Installer pass: status lines continue; a real question waits for an answer.
+    # Enter is not "continue" except as a reply to a question (then we nudge).
+    # ask_user also blocks inside the tool.
+    agent_loop = AgentLoop(
+        messages=messages,
+        request=request_assistant,
+        is_error=core.is_err,
+        assistant_message=core.assistant_message_dict,
+        dispatch_tool=_dispatch_tool,
+        render_assistant=bubble_ai,
+        on_error=_report_agent_error,
+        on_turn=_render_turn,
+    )
+
+    _EXIT_ANSWERS = ("exit", "quit", "bye", "salir")
     outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
-
-if outcome == LoopOutcome.ERROR:
-    info("The provider session stopped. You can run ./launcher.sh to start a new one.")
-elif outcome == LoopOutcome.TURN_LIMIT:
-    _report_turn_limit(MAX_TURNS)
-
-# After verify (or turn limit), empty Enter exits; a typed question is support.
-if outcome in (LoopOutcome.FINISHED, LoopOutcome.TURN_LIMIT):
-    agent_loop.turns_used = 0
-    while True:
+    while outcome == LoopOutcome.WAITING_FOR_USER:
         answer = prompt_user()
-        if not answer or answer.lower() in _EXIT_ANSWERS:
+        if answer.lower() in _EXIT_ANSWERS:
             print(f"\n{CYAN}  Done. See you later.{RESET}\n")
-            break
-        bubble_user(answer)
-        messages.append({"role": "user", "content": answer})
-        outcome = agent_loop.advance(SUPPORT_TURNS, wait_on_text=True)
-        if outcome == LoopOutcome.ERROR:
-            break
-        if outcome == LoopOutcome.TURN_LIMIT:
-            _report_turn_limit(SUPPORT_TURNS)
+            _close_persistent_shell()
+            sys.exit(0)
+        if answer:
+            bubble_user(answer)
+            messages.append({"role": "user", "content": answer})
+        else:
+            messages.append({"role": "user", "content": CONTINUE_NUDGE})
+        outcome = agent_loop.advance(MAX_TURNS, wait_on_text=False)
 
-_close_persistent_shell()
+    if outcome == LoopOutcome.ERROR:
+        info("The provider session stopped. You can run ./launcher.sh to start a new one.")
+    elif outcome == LoopOutcome.TURN_LIMIT:
+        _report_turn_limit(MAX_TURNS)
+
+    # After verify (or turn limit), empty Enter exits; a typed question is support.
+    if outcome in (LoopOutcome.FINISHED, LoopOutcome.TURN_LIMIT):
+        agent_loop.turns_used = 0
+        while True:
+            answer = prompt_user()
+            if not answer or answer.lower() in _EXIT_ANSWERS:
+                print(f"\n{CYAN}  Done. See you later.{RESET}\n")
+                break
+            bubble_user(answer)
+            messages.append({"role": "user", "content": answer})
+            outcome = agent_loop.advance(SUPPORT_TURNS, wait_on_text=True)
+            if outcome == LoopOutcome.ERROR:
+                break
+            if outcome == LoopOutcome.TURN_LIMIT:
+                _report_turn_limit(SUPPORT_TURNS)
+
+    _close_persistent_shell()
+
+
+if __name__ == "__main__":
+    main()

@@ -807,7 +807,7 @@ def parse_response(provider, raw_text: str):
 class Check:
     label: str
     command: str
-    predicate: str  # one of: rc0_nonempty | nonempty | health | http200 | exists | mcp
+    predicate: str  # rc0_nonempty | container | health | http200 | exists | sse | mcp
     critical: bool = True
 
 
@@ -823,7 +823,9 @@ def evaluate_check(predicate: str, rc: int, out: str) -> bool:
     if predicate == "sse":
         # A healthy SSE endpoint commonly stays open until curl reaches its
         # client timeout, which is exit 28 rather than a transport failure.
-        return rc in (0, 28)
+        return rc in (0, 28) and bool(re.fullmatch(r"2\d\d", text))
+    if predicate == "container":
+        return rc == 0 and text in {"running", "running healthy"}
     if predicate == "mcp":
         # Streamable HTTP GET can return a protocol-level 400/405/406 before
         # a client sends JSON-RPC. Those statuses still prove the listener is
@@ -832,12 +834,23 @@ def evaluate_check(predicate: str, rc: int, out: str) -> bool:
     if predicate == "nonempty":
         return bool(text)
     if predicate == "health":
-        low = out.lower()
-        return rc == 0 and bool(text) and any(token in low for token in HEALTHY_TOKENS)
+        if rc != 0 or not text:
+            return False
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return text.lower() in HEALTHY_TOKENS
+        # WEB wraps successful responses in {success: true, data: {...}},
+        # whereas CLI and BugTraceAI-API expose status at the top level.
+        if isinstance(payload, dict) and "success" in payload:
+            if payload["success"] is not True:
+                return False
+            payload = payload.get("data")
+        return isinstance(payload, dict) and str(payload.get("status", "")).lower() in HEALTHY_TOKENS
     if predicate == "http200":
-        return text == "200"
+        return rc == 0 and text == "200"
     if predicate == "exists":
-        return text == "exists"
+        return rc == 0 and text == "exists"
     return False
 
 
@@ -869,11 +882,17 @@ def endpoint_url(port: Optional[int], path: str = "") -> Optional[str]:
 def verification_checks(mode: str, install_dir: str,
                         ports: Optional[DeploymentPorts] = None,
                         mcp_enabled: bool = False,
-                        recon_enabled: bool = False) -> Tuple[Check, ...]:
+                        recon_enabled: bool = False,
+                        kali_enabled: bool = False) -> Tuple[Check, ...]:
     """The verification plan as immutable data, derived purely from the install
     mode and directory. The shell iterates this, runs each command, and applies
     evaluate_check."""
     ports = ports or DeploymentPorts()
+    def container_check(label, name):
+        return Check(label,
+                     "docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "
+                     + shlex.quote(name), "container")
+
     checks = [
         Check("Docker daemon",
               "docker info --format '{{.ServerVersion}}'",
@@ -881,11 +900,9 @@ def verification_checks(mode: str, install_dir: str,
     ]
     if mode in ("full", "cli") or mcp_enabled:
         checks += [
-            Check("CLI container (bugtrace_api)",
-                  "docker ps --filter 'name=^bugtrace_api$' --format '{{.Names}} {{.Status}}'",
-                  "nonempty"),
+            container_check("CLI container (bugtrace_api)", "bugtrace_api"),
             Check("CLI configuration (.env)",
-                  f"test -f {install_dir}/BugTraceAI-CLI/.env && echo exists",
+                  f"test -f {shlex.quote(install_dir + '/BugTraceAI-CLI/.env')} && echo exists",
                   "exists"),
         ]
         cli_health = endpoint_url(ports.cli, "/health")
@@ -897,25 +914,24 @@ def verification_checks(mode: str, install_dir: str,
             ("bugtraceai-web-backend", "Backend WEB"),
             ("bugtraceai-web-frontend", "Frontend WEB"),
         ):
-            checks.append(Check(
-                f"{label} ({cname})",
-                f"docker ps --filter 'name=^{cname}$' --format '{{{{.Names}}}} {{{{.Status}}}}'",
-                "nonempty"))
+            checks.append(container_check(f"{label} ({cname})", cname))
         checks += [
             Check("WEB configuration (.env.docker)",
-                  f"test -f {install_dir}/BugTraceAI-WEB/.env.docker && echo exists",
+                  f"test -f {shlex.quote(install_dir + '/BugTraceAI-WEB/.env.docker')} && echo exists",
                   "exists"),
         ]
         web_url = endpoint_url(ports.web)
         if web_url:
             checks.append(Check("WEB frontend", f"curl -sf --max-time 5 -o /dev/null -w '%{{http_code}}' {web_url} 2>/dev/null", "http200"))
+            for label, path in (("WEB backend health", "/health"),
+                                ("WEB to BugTraceAI-API proxy", "/btai-api/health"),
+                                ("API Discovery (Kiterunner)", "/kr-api/health")):
+                checks.append(Check(label, f"curl -sf --max-time 5 {web_url}{path} 2>/dev/null", "health"))
 
         checks += [
-            Check("BugTraceAI-API container (bugtrace-api)",
-                  "docker ps --filter 'name=^bugtrace-api$' --format '{{.Names}} {{.Status}}'",
-                  "nonempty"),
+            container_check("BugTraceAI-API container (bugtrace-api)", "bugtrace-api"),
             Check("BugTraceAI-API configuration (.env)",
-                  f"test -f {install_dir}/BugTraceAI-API/.env && echo exists",
+                  f"test -f {shlex.quote(install_dir + '/BugTraceAI-API/.env')} && echo exists",
                   "exists"),
         ]
         btai_health = endpoint_url(ports.btai, "/health")
@@ -935,13 +951,23 @@ def verification_checks(mode: str, install_dir: str,
             checks.append(Check("WEB to CLI proxy", f"curl -sf --max-time 5 {proxy_health} 2>/dev/null", "health"))
 
     if mcp_enabled:
+        checks.append(container_check("BugTraceAI MCP container", "bugtrace_mcp"))
         mcp_url = endpoint_url(ports.mcp, "/sse")
         if mcp_url:
-            checks.append(Check("BugTraceAI MCP endpoint", f"curl -sf --max-time 3 {mcp_url} >/dev/null 2>&1", "sse", critical=False))
+            checks.append(Check("BugTraceAI MCP endpoint", f"curl -sS -N --max-time 3 -o /dev/null -w '%{{http_code}}' {mcp_url} 2>/dev/null", "sse"))
     if recon_enabled:
+        checks.append(container_check("reconFTW MCP container", "reconftw-mcp"))
         recon_url = endpoint_url(ports.recon, "/sse")
         if recon_url:
-            checks.append(Check("reconFTW MCP endpoint", f"curl -sf --max-time 3 {recon_url} >/dev/null 2>&1", "sse", critical=False))
+            checks.append(Check("reconFTW MCP endpoint", f"curl -sS -N --max-time 3 -o /dev/null -w '%{{http_code}}' {recon_url} 2>/dev/null", "sse"))
+    if kali_enabled:
+        checks.append(container_check("Kali toolbox container", "kali-mcp-server"))
+        checks.append(Check("Kali toolbox tools",
+                            "docker exec kali-mcp-server bash -lc " + shlex.quote(
+                                'for tool in nmap ffuf sqlmap dirb gobuster nikto hydra john hashcat '
+                                'curl wget nc python3 pip3 git vim; do '
+                                'command -v "$tool" >/dev/null || exit 1; done; echo ready'),
+                            "health"))
     return tuple(checks)
 
 
@@ -991,12 +1017,12 @@ STEP 1: INSTALL CLI
 4. Call configure_cli. It writes the provider configuration and API secret
    locally with mode 600. Never create or print the secret yourself.
 5. Build and start (this takes 5-15 min on first run):
-     docker compose up -d --build
+     COMPOSE_PROFILES= docker compose up -d --build
 6. Inspect build/startup output WITHOUT following forever:
      docker compose logs --tail=30
    (Never use -f/--follow — it blocks indefinitely.)
-7. Call finish when the service is ready. The launcher resolves actual published
-   ports from Docker and verifies the real endpoints.
+7. In Full/WEB mode continue to BugTraceAI-API and WEB before calling finish.
+   finish verifies every selected component, including all selected agents.
 
 Expected containers after CLI install:
   - bugtrace_api — FastAPI scanner API
@@ -1020,7 +1046,7 @@ STEP {step_num}: INSTALL BugTraceAI-API
 4. Call configure_api. It writes the provider configuration and the selected
    REST/MCP ports locally with mode 600. Never create or print the API key file.
 5. Build and start:
-     docker compose up -d --build
+     COMPOSE_PROFILES= docker compose up -d --build
 6. Inspect progress without following forever:
      docker compose logs --tail=30
 
@@ -1041,15 +1067,16 @@ STEP {step_num}: INSTALL WEB
 1. cd {install_dir}
 2. git clone --depth 1 {spec.web_repo} BugTraceAI-WEB
 3. cd BugTraceAI-WEB
-4. Call configure_web. It chooses an available host port at runtime, creates a
-   random database password locally, and writes .env.docker with mode 600.
+4. Call configure_web. It preserves existing database settings, chooses ports
+   and writes .env.docker with mode 600. It also applies the standard Launcher's
+   npm, Compose, reconFTW MCP v1, venv, ARM and Kali startup fixes.
 5. Build and start (this takes 5-10 min on first run):
-     docker compose --env-file .env.docker up -d --build
+     COMPOSE_PROFILES= docker compose --env-file .env.docker up -d --build
 6. Inspect progress WITHOUT following forever:
      docker compose --env-file .env.docker logs --tail=30
    (Never use -f/--follow.)
-7. Call finish when ready. The launcher verifies the discovered WEB endpoint
-   and, in Full mode, the WEB-to-CLI proxy.
+7. Start all selected optional agents below before calling finish.
+   The launcher verifies WEB, API, proxies and every selected agent.
 
 Expected containers after WEB install:
   - bugtraceai-web-db
@@ -1059,13 +1086,16 @@ Expected containers after WEB install:
         mcp_steps = []
         if spec.mcp_recon:
             mcp_steps.append(
-                "reconFTW MCP: after WEB is up, start it separately with "
-                "`docker compose --env-file .env.docker --profile recon up -d --build`. "
+                "reconFTW MCP: call configure_agents first. The host restores the "
+                "sibling reconftw-mcp source, pins mcp<2 and configures its build/port. "
+                "After WEB is up, start it separately with "
+                "`COMPOSE_PROFILES= docker compose --env-file .env.docker --profile recon up -d --build reconftw-mcp`. "
                 "Do not fold recon into the first WEB up.")
         if spec.mcp_kali:
             mcp_steps.append(
-                "Kali toolbox: after WEB is up, start it separately with "
-                "`docker compose --env-file .env.docker --profile kali up -d`. "
+                "Kali toolbox: call configure_agents before its first startup, then "
+                "after WEB is up, start it separately with "
+                "`COMPOSE_PROFILES= docker compose --env-file .env.docker --profile kali up -d kali-mcp`. "
                 "Do not fold Kali into the first WEB up.")
         if mcp_steps:
             numbered = "\n".join(f"{i}. {step}" for i, step in enumerate(mcp_steps, 1))
@@ -1090,6 +1120,9 @@ REPAIR MODE RULES:
 - Do NOT reinstall immediately.
 - First inspect containers, logs, ports, disk space, Docker status, and env files.
 - Prefer small fixes: restart services, rebuild one stack, repair env/config, explain what failed.
+- Call configure_web to repair wiring while preserving database credentials.
+- Call configure_agents before rebuilding reconFTW or Kali; the host applies
+  the current dependency, venv, ARM, Compose and startup compatibility fixes.
 - Ask the user before deleting containers, volumes, databases, or reinstalling from scratch.
 """
     else:
@@ -1103,7 +1136,7 @@ INSTALL MODE RULES:
     bar = "=" * 60
     return f"""You are the BugTraceAI Autonomous Setup & Repair agent.
 Use run_command as the installation user and run_privileged_command for
-root-required work. configure_cli and configure_web are host-managed setup
+root-required work. configure_cli, configure_api, configure_web and configure_agents are host-managed setup
 tools that handle secrets and dynamic endpoint wiring. Never type sudo yourself
 and never ask the user for their root password. Beyond installing, diagnose and
 fix problems with an existing deployment when the user asks.
@@ -1124,7 +1157,7 @@ RESOLVED ENDPOINTS (never invent fixed ports):
 {endpoint_context}
 
 The host holds the API key privately. Do NOT ask for it, print it, search for it,
-or create an API-key line manually. Use configure_cli when CLI configuration is needed.
+or create an API-key line manually. Use configure_cli or configure_api for secrets.
 
 {bar}
 INSTALLATION PLAYBOOK — Follow these steps IN ORDER
