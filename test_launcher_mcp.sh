@@ -76,6 +76,19 @@ retry_count="$(grep -c 'fetch-retries 5' "$WEB_DIR/backend/Dockerfile")"
 patch_web_npm_resilience
 [[ "$(grep -c 'fetch-retries 5' "$WEB_DIR/backend/Dockerfile")" == "$retry_count" ]] || fail "npm retry patch is not idempotent"
 
+# The optional reconFTW agent uses the MCP v1 FastMCP import path. Pin both
+# dependency declarations so a fresh build cannot resolve incompatible MCP v2.
+recon_fixture="$scratch_dir/reconftw-mcp-dependency"
+mkdir -p "$recon_fixture"
+printf '%s\n' 'mcp[cli]>=1.0.0' 'fastmcp>=0.1.0' > "$recon_fixture/requirements.txt"
+printf '%s\n' "RUN pip install --no-cache-dir \\" "    mcp[cli]>=1.0.0 \\" "    fastmcp>=0.1.0" > "$recon_fixture/Dockerfile"
+RECON_DIR="$recon_fixture"
+patch_recon_mcp_dependency
+grep -Fq 'mcp[cli]>=1.0.0,<2' "$recon_fixture/requirements.txt" || fail "recon requirements were not pinned"
+grep -Fq '"mcp[cli]>=1.0.0,<2"' "$recon_fixture/Dockerfile" || fail "recon Dockerfile was not pinned"
+patch_recon_mcp_dependency
+[[ "$(grep -Fc 'mcp[cli]>=1.0.0,<2' "$recon_fixture/requirements.txt")" == 1 ]] || fail "recon dependency patch is not idempotent"
+
 # Exercise the actual env generation with arbitrary selected ports. This is
 # stronger than checking source text: Compose-facing files must receive the
 # values chosen by the launcher, not the wizard's proposal defaults.
