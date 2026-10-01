@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v2.9.2
+BugTraceAI — AI Setup & Repair Assistant v3.0.0
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -212,7 +212,9 @@ INSTALL_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
 CLI_REPO = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
-VERSION = "2.9.2"
+BTAI_REPO = os.environ.get("BUGTRACEAI_API_REPO", "https://github.com/BugTraceAI/BugTraceAI-API.git")
+VERSION = "3.0.0"
+BTAI_SHARED_NETWORK = "bugtraceai-platform"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks
 # the provider from a menu, unless BTAI_INSTALLER_PROVIDER is set).
@@ -741,6 +743,22 @@ def _published_port(container):
     return None
 
 
+def _published_ports(container):
+    """Return all published host ports for a multi-listener container."""
+    rc, output = _capture_host_command(["docker", "port", container])
+    if rc != 0:
+        return []
+    ports = []
+    for line in output.splitlines():
+        candidate = line.split("->", 1)[-1].strip()
+        _, sep, tail = candidate.rpartition(":")
+        if sep:
+            port = _as_port(tail)
+            if port is not None and port not in ports:
+                ports.append(port)
+    return ports
+
+
 def _first_published_port(*containers):
     for container in containers:
         port = _published_port(container)
@@ -771,12 +789,15 @@ def _resolve_deployment_context():
         provider = core.PROVIDER_OPENROUTER
 
     web_env = _read_env_values(os.path.join(INSTALL_DIR, "BugTraceAI-WEB", ".env.docker"))
+    btai_env = _read_env_values(os.path.join(INSTALL_DIR, "BugTraceAI-API", ".env"))
     ports = core.DeploymentPorts(
         web=_as_port(state.get("web_port")) or _as_port(web_env.get("FRONTEND_PORT")),
         cli=_as_port(state.get("cli_port")),
         mcp=_as_port(state.get("mcp_port")) or _as_port(web_env.get("CLI_MCP_PORT")),
         recon=_as_port(state.get("recon_port")) or _as_port(web_env.get("RECON_MCP_PORT")),
         kali=_as_port(state.get("kali_port")),
+        btai=_as_port(state.get("btai_port")) or _as_port(btai_env.get("API_PORT")),
+        btai_mcp=_as_port(state.get("btai_mcp_port")) or _as_port(btai_env.get("MCP_PORT")),
     )
     context = DeploymentContext(
         install_dir=INSTALL_DIR,
@@ -797,10 +818,16 @@ def _refresh_deployment_context(context, allocate_web=False):
     cli = _first_published_port("bugtrace_api", "bugtrace-api") or context.ports.cli
     mcp = _first_published_port("bugtrace_mcp", "bugtrace-mcp", "bugtrace-cli-mcp") or context.ports.mcp
     recon = _published_port("reconftw-mcp") or context.ports.recon
+    btai_ports = _published_ports("bugtrace-api")
+    btai_mcp = context.ports.btai_mcp
+    btai = context.ports.btai
+    if len(btai_ports) >= 2:
+        btai_mcp, btai = btai_ports[0], btai_ports[1]
     if allocate_web and context.mode in ("full", "web") and web is None:
         web = _allocate_host_port()
     return replace(context, ports=core.DeploymentPorts(
         web=web, cli=cli, mcp=mcp, recon=recon, kali=context.ports.kali,
+        btai=btai, btai_mcp=btai_mcp,
     ))
 
 
@@ -852,21 +879,56 @@ def _configure_cli():
     if not os.path.isdir(cli_dir):
         return False, "CLI directory is missing. Clone BugTraceAI-CLI first."
 
-    if setup_action == "install":
-        reserved = [port for port in (
-            deployment_context.ports.web, deployment_context.ports.cli,
-            deployment_context.ports.mcp, deployment_context.ports.recon,
-            deployment_context.ports.kali,
-        ) if port is not None]
-        cli_port = deployment_context.ports.cli or _allocate_host_port(reserved)
-        if not rewrite_service_host_port(
-                os.path.join(cli_dir, "docker-compose.yml"), "bugtrace_api", cli_port):
+    env_path = os.path.join(cli_dir, ".env")
+    existing_env = _read_env_values(env_path)
+    cli_env_values = {}
+    compose_path = os.path.join(cli_dir, "docker-compose.yml")
+    use_variable_ports = False
+    try:
+        with open(compose_path, encoding="utf-8") as f:
+            # Variable-based Compose works for both standalone CLI and Launcher
+            # installs; older snapshots still need the legacy rewrite below.
+            use_variable_ports = "${CLI_PORT" in f.read()
+    except OSError:
+        pass
+
+    # Determine ports for both a fresh install and a repair. In a repair,
+    # prefer saved/live deployment state, then the existing .env, and only
+    # allocate a new endpoint when neither source has one.
+    reserved = [port for port in (
+        deployment_context.ports.web, deployment_context.ports.cli,
+        deployment_context.ports.mcp, deployment_context.ports.recon,
+        deployment_context.ports.kali,
+    ) if port is not None]
+    cli_port = (deployment_context.ports.cli
+                or _as_port(existing_env.get("CLI_PORT"))
+                or _allocate_host_port(reserved))
+    mcp_port = (deployment_context.ports.mcp
+                or _as_port(existing_env.get("MCP_PORT"))
+                or _allocate_host_port(reserved + [cli_port]))
+
+    if use_variable_ports:
+        # Compose reads the selected ports and shared network from .env.
+        cli_env_values.update({
+            "CLI_PORT": str(cli_port),
+            "MCP_PORT": str(mcp_port),
+            "BTAI_SHARED_NETWORK": BTAI_SHARED_NETWORK,
+        })
+        deployment_context = replace(
+            deployment_context,
+            ports=replace(deployment_context.ports, cli=cli_port, mcp=mcp_port),
+        )
+    else:
+        # Legacy snapshots have hardcoded mappings, so preserve compatibility
+        # by patching those mappings while still writing the resolved values.
+        if not rewrite_service_host_port(compose_path, "bugtrace_api", cli_port):
             return False, "Could not assign a dynamic host port to the CLI Compose service."
 
-        reserved.append(cli_port)
-        mcp_port = deployment_context.ports.mcp or _allocate_host_port(reserved)
         mcp_patched = rewrite_service_host_port(
-            os.path.join(cli_dir, "docker-compose.yml"), "bugtrace_mcp", mcp_port)
+            compose_path, "bugtrace_mcp", mcp_port)
+        cli_env_values["CLI_PORT"] = str(cli_port)
+        if mcp_patched:
+            cli_env_values["MCP_PORT"] = str(mcp_port)
         deployment_context = replace(
             deployment_context,
             ports=replace(deployment_context.ports, cli=cli_port,
@@ -874,19 +936,60 @@ def _configure_cli():
             mcp_cli_enabled=mcp_patched or deployment_context.mcp_cli_enabled,
         )
 
-    env_path = os.path.join(cli_dir, ".env")
     key_env = core.cli_key_env(PROVIDER)
     try:
-        _write_private_file(env_path, (
+        env_lines = [
             f"# Generated by BugTraceAI Launcher v{VERSION}\n"
             f"PROVIDER={PROVIDER}\n"
             f"{key_env}={api_key}\n"
             "BUGTRACE_CORS_ORIGINS=*\n"
-        ))
+        ]
+        for key in ("CLI_PORT", "MCP_PORT", "BTAI_SHARED_NETWORK"):
+            if key in cli_env_values:
+                env_lines.append(f"{key}={cli_env_values[key]}\n")
+        _write_private_file(env_path, "".join(env_lines))
         _set_cli_provider_active(os.path.join(cli_dir, "bugtraceaicli.conf"), PROVIDER)
     except OSError as exc:
         return False, f"Could not write CLI configuration: {exc}"
     return True, "CLI configuration was written with restricted permissions."
+
+
+def _configure_api():
+    """Write the standalone BugTraceAI-API configuration and reserve ports."""
+    global deployment_context
+    btai_dir = os.path.join(INSTALL_DIR, "BugTraceAI-API")
+    if not os.path.isdir(btai_dir):
+        return False, "BugTraceAI-API directory is missing. Clone it first."
+    if not os.path.isfile(os.path.join(btai_dir, "docker-compose.yml")):
+        return False, "BugTraceAI-API docker-compose.yml is missing."
+
+    reserved = [port for port in (
+        deployment_context.ports.web, deployment_context.ports.cli,
+        deployment_context.ports.mcp, deployment_context.ports.recon,
+        deployment_context.ports.kali, deployment_context.ports.btai,
+        deployment_context.ports.btai_mcp,
+    ) if port is not None]
+    btai_mcp = deployment_context.ports.btai_mcp or _allocate_host_port(reserved)
+    btai_port = deployment_context.ports.btai or _allocate_host_port(reserved + [btai_mcp])
+    deployment_context = replace(
+        deployment_context,
+        ports=replace(deployment_context.ports, btai=btai_port, btai_mcp=btai_mcp),
+    )
+
+    key_env = core.cli_key_env(PROVIDER)
+    env_path = os.path.join(btai_dir, ".env")
+    try:
+        _write_private_file(env_path, (
+            f"# Generated by BugTraceAI AI Installer v{VERSION}\n"
+            f"APEX_PROVIDER={PROVIDER}\n"
+            f"MCP_PORT={btai_mcp}\n"
+            f"API_PORT={btai_port}\n"
+            f"BTAI_SHARED_NETWORK={BTAI_SHARED_NETWORK}\n"
+            f"{key_env}={api_key}\n"
+        ))
+    except OSError as exc:
+        return False, f"Could not write BugTraceAI-API configuration: {exc}"
+    return True, "BugTraceAI-API configuration was written with restricted permissions."
 
 
 def _configure_web():
@@ -899,6 +1002,8 @@ def _configure_web():
 
     if deployment_context.mode == "full" and deployment_context.ports.cli is None:
         return False, "Full mode needs configure_cli before WEB configuration so its proxy has a resolved CLI endpoint."
+    if deployment_context.ports.btai is None or deployment_context.ports.btai_mcp is None:
+        return False, "WEB configuration needs configure_api first so its API endpoints are resolved."
     if deployment_context.ports.web is None:
         deployment_context = _refresh_deployment_context(deployment_context, allocate_web=True)
     web_port = deployment_context.ports.web
@@ -921,10 +1026,17 @@ def _configure_web():
             f"POSTGRES_PORT={database_port}\n"
             f"FRONTEND_PORT={web_port}\n"
             "VITE_CLI_API_URL=/cli-api\n"
+            "VITE_BTAI_API_URL=/btai-api\n"
+            f"CLI_API_PORT={deployment_context.ports.cli or 8000}\n"
+            f"BTAI_API_PORT={deployment_context.ports.btai}\n"
+            f"BTAI_SHARED_NETWORK={BTAI_SHARED_NETWORK}\n"
         ))
-        if deployment_context.mode == "full" and not rewrite_web_cli_proxy(
-                os.path.join(web_dir, "nginx.conf"), deployment_context.ports.cli):
-            return False, "Could not point the WEB proxy at the resolved CLI endpoint."
+        nginx_path = os.path.join(web_dir, "nginx.conf")
+        if deployment_context.mode == "full":
+            if not rewrite_web_cli_proxy(nginx_path, deployment_context.ports.cli):
+                return False, "Could not point the WEB proxy at the resolved CLI endpoint."
+        elif not rewrite_web_cli_proxy(nginx_path, None):
+            return False, "Could not make the optional WEB CLI proxy lazy."
     except OSError as exc:
         return False, f"Could not write WEB configuration: {exc}"
     return True, f"WEB configuration was written for the resolved host endpoint {core.endpoint_url(web_port)}."
@@ -941,6 +1053,8 @@ def _save_ai_state(context):
         "mode": context.mode,
         "web_port": str(context.ports.web or ""),
         "cli_port": str(context.ports.cli or ""),
+        "btai_port": str(context.ports.btai or ""),
+        "btai_mcp_port": str(context.ports.btai_mcp or ""),
         "mcp_port": str(context.ports.mcp or ""),
         "recon_port": str(context.ports.recon or ""),
         "kali_port": str(context.ports.kali or ""),
@@ -949,6 +1063,7 @@ def _save_ai_state(context):
         "fallback_model": MODEL_CHAIN[1] if len(MODEL_CHAIN) > 1 else "",
         "install_web": context.mode in ("full", "web"),
         "install_cli": context.mode in ("full", "cli"),
+        "install_btai": context.mode in ("full", "web"),
         "mcp_cli_enabled": context.mcp_cli_enabled,
         "mcp_recon_enabled": context.mcp_recon_enabled,
         "mcp_kali_enabled": context.mcp_kali_enabled,
@@ -977,6 +1092,8 @@ def run_verification(run_fn, context):
         required_ports.append(("CLI host port", context.ports.cli))
     if context.mode in ("full", "web"):
         required_ports.append(("WEB host port", context.ports.web))
+        required_ports.append(("BugTraceAI-API REST host port", context.ports.btai))
+        required_ports.append(("BugTraceAI-API MCP host port", context.ports.btai_mcp))
     for label, port in required_ports:
         passed = port is not None
         check_row(label, passed, str(port) if passed else "not discovered")
@@ -1018,8 +1135,13 @@ def print_success_next_steps(context, action):
     print(f"{WHITE}{BOLD}  Check it now on your machine:{RESET}")
     if context.mode in ("full", "web") and context.ports.web is not None:
         print(f"  {CYAN}- WEB:{RESET} {core.endpoint_url(context.ports.web)}")
-    if context.mode in ("full", "cli") and context.ports.cli is not None:
+    if (context.mode in ("full", "cli") or context.mcp_cli_enabled) and context.ports.cli is not None:
         print(f"  {CYAN}- CLI health:{RESET} {core.endpoint_url(context.ports.cli, '/health')}")
+    if context.mode in ("full", "web"):
+        if context.ports.btai is not None:
+            print(f"  {CYAN}- BugTraceAI-API REST:{RESET} {core.endpoint_url(context.ports.btai, '/health')}")
+        if context.ports.btai_mcp is not None:
+            print(f"  {CYAN}- BugTraceAI-API MCP:{RESET} {core.endpoint_url(context.ports.btai_mcp, '/mcp')}")
     print(f"  {CYAN}- Status:{RESET} ./launcher.sh status")
     print(f"  {CYAN}- Logs:{RESET} ./launcher.sh logs")
     if _INSTALL_LOG_FILE:
@@ -1165,6 +1287,7 @@ print()
 SYSTEM = core.build_system_prompt(PromptSpec(
     mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
     api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
+    btai_repo=BTAI_REPO,
     provider=PROVIDER, ports=deployment_context.ports,
     mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
 
@@ -1174,7 +1297,7 @@ messages = [
         f"Action: {setup_action}. Install mode: {install_mode}. "
         f"Install directory: {INSTALL_DIR}. "
         f"Components: WEB={'yes' if install_mode in ('full', 'web') else 'no'}, "
-        f"CLI={'yes' if install_mode in ('full', 'cli') else 'no'}, "
+        f"CLI={'yes' if install_mode in ('full', 'cli') or mcp_cli_enabled else 'no'}, "
         f"MCP={'yes' if mcp_cli_enabled else 'no'}, "
         f"reconFTW={'yes' if mcp_recon_enabled else 'no'}, "
         f"Kali={'yes' if mcp_kali_enabled else 'no'}. "
@@ -1204,6 +1327,11 @@ tools = [
         "name": "configure_cli",
         "description": ("Configure the cloned CLI locally. The host writes the API key securely and assigns dynamic "
                         "host port mappings; use this after cloning CLI and before building it."),
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "configure_api",
+        "description": ("Configure the cloned standalone BugTraceAI-API locally. The host writes the API key securely "
+                        "and assigns distinct REST and MCP host ports; use this after cloning the API and before building it."),
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
         "name": "configure_web",
@@ -1581,6 +1709,13 @@ def _dispatch_tool(tc):
             success, detail = _configure_cli()
         except Exception as exc:
             success, detail = False, f"CLI configuration failed: {exc}"
+        return ToolOutcome(_tool_result(tc.id, tc.name,
+                                        ("OK: " if success else "ERROR: ") + detail))
+    if tc.name == "configure_api":
+        try:
+            success, detail = _configure_api()
+        except Exception as exc:
+            success, detail = False, f"BugTraceAI-API configuration failed: {exc}"
         return ToolOutcome(_tool_result(tc.id, tc.name,
                                         ("OK: " if success else "ERROR: ") + detail))
     if tc.name == "configure_web":

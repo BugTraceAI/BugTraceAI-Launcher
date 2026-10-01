@@ -20,7 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '2.9.4')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.0.0')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -224,6 +224,8 @@ port_available() {
     # Check if port was already selected in THIS session
     [[ "$port" == "$WEB_PORT" ]] && return 1
     [[ "$port" == "$CLI_PORT" ]] && return 1
+    [[ "$port" == "$BTAI_PORT" ]] && return 1
+    [[ "$port" == "$BTAI_MCP_PORT" ]] && return 1
     [[ "$port" == "$MCP_PORT" ]] && return 1
     [[ "$port" == "$RECON_PORT" ]] && return 1
 
@@ -253,10 +255,9 @@ resolve_web_mcp_profiles() {
     WEB_MCP_PROFILE_ARGS=()
     WEB_MCP_PROFILE_NAMES=()
 
-    if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-        WEB_MCP_PROFILE_ARGS+=(--profile cli)
-        WEB_MCP_PROFILE_NAMES+=(cli)
-    fi
+    # The CLI Compose project owns the core BugTraceAI MCP whenever it is
+    # selected, including WEB installs with optional MCPs. The public WEB
+    # Compose has no guaranteed `cli` service, so do not start that profile.
     if $MCP_RECON_ENABLED; then
         WEB_MCP_PROFILE_ARGS+=(--profile recon)
         WEB_MCP_PROFILE_NAMES+=(recon)
@@ -350,11 +351,18 @@ ensure_recon_amd64_platform() {
     awk '
     BEGIN { in_recon=0; has_platform=0 }
     /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; print; next }
-    in_recon && /^  [^[:space:]]/ {
+    # The WEB compose file ends the services mapping with a root-level key
+    # (currently `volumes:`). Match that boundary too; otherwise injected
+    # keys land inside the volumes mapping and invalidate YAML.
+    in_recon && /^[^[:space:]]/ {
         if (!has_platform) print "    platform: linux/amd64"
         in_recon=0
     }
     in_recon && /^[[:space:]]+platform:[[:space:]]*linux\/amd64[[:space:]]*$/ { has_platform=1 }
+    in_recon && /^  [^[:space:]]/ {
+        if (!has_platform) print "    platform: linux/amd64"
+        in_recon=0
+    }
     { print }
     END {
         if (in_recon && !has_platform) print "    platform: linux/amd64"
@@ -371,6 +379,7 @@ ensure_recon_health_timing() {
     awk '
     BEGIN { in_recon=0 }
     /^  reconftw-mcp:[[:space:]]*$/ { in_recon=1; print; next }
+    in_recon && /^[^[:space:]]/ { in_recon=0 }
     in_recon && /^  [^[:space:]]/ { in_recon=0 }
     in_recon && /^[[:space:]]+retries:[[:space:]]*[0-9]+[[:space:]]*$/ { print "      retries: 10"; next }
     in_recon && /^[[:space:]]+start_period:[[:space:]]*[0-9]+s[[:space:]]*$/ { print "      start_period: 300s"; next }
@@ -398,6 +407,10 @@ ensure_recon_env_defaults() {
         next
     }
     in_recon && /^  [^[:space:]]/ {
+        if (!has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
+        in_recon=0
+    }
+    in_recon && /^[^[:space:]]/ {
         if (!has_auto && !inserted) print "      - RECONFTW_AUTO_INSTALL=false"
         in_recon=0
     }
@@ -432,6 +445,10 @@ ensure_recon_local_build() {
     in_recon && /^[[:space:]]+build:[[:space:]]*$/ { has_build=1 }
     in_recon && /^[[:space:]]+pull_policy:[[:space:]]*/ { has_pull=1 }
     in_recon && /^  [^[:space:]]/ {
+        emit_missing()
+        in_recon=0
+    }
+    in_recon && /^[^[:space:]]/ {
         emit_missing()
         in_recon=0
     }
@@ -1782,17 +1799,19 @@ wizard_show_summary() {
         echo -e "  CLI API:    ${CYAN}http://localhost:$CLI_PORT${NC}"
     fi
     if [[ -n "$BTAI_PORT" ]]; then
-        echo -e "  BugTraceAI-API: ${CYAN}http://localhost:$BTAI_PORT${NC}"
+        echo -e "  BugTraceAI-API REST: ${CYAN}http://localhost:$BTAI_PORT${NC}"
     fi
 
     # Show MCP agents
     local has_mcp_endpoints=false
+    $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && has_mcp_endpoints=true
     $MCP_CLI_ENABLED && has_mcp_endpoints=true
     $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
     if $has_mcp_endpoints; then
         echo ""
         echo -e "  ${BOLD}MCP endpoints:${NC}"
+        $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && echo -e "    ${OK} BugTraceAI-API: ${CYAN}http://localhost:${BTAI_MCP_PORT}/mcp${NC}"
         $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
         $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
     fi
@@ -1818,7 +1837,9 @@ wizard_show_summary() {
 run_wizard() {
     # Restore stdin if piped (e.g. curl | bash)
     if [ ! -t 0 ] && [ -c /dev/tty ]; then
-        exec </dev/tty 2>/dev/null || true
+        # Reconnect only stdin. Redirecting fd 2 here permanently hid Git,
+        # Docker, and launcher errors after curl | bash entered the wizard.
+        exec </dev/tty || true
     fi
 
     show_banner
@@ -1940,8 +1961,8 @@ deploy() {
     step "Creating $INSTALL_DIR..."
     mkdir -p "$INSTALL_DIR"
     # A reinstall can remove the directory from which the launcher was
-    # invoked. Re-enter the newly-created target before running Git so every
-    # clone has a valid working directory and deployment continues through
+    # invoked.  Re-enter the newly-created target before running Git so every
+    # clone has a valid working directory and the deployment can continue to
     # WEB, CLI, API, and optional agents.
     if ! cd "$INSTALL_DIR"; then
         error "Cannot enter installation directory: $INSTALL_DIR"
@@ -1949,10 +1970,22 @@ deploy() {
     fi
 
     clone_repos
-    generate_env
-    patch_compose
-    start_services
-    health_checks
+    if ! generate_env; then
+        error "Deployment stopped because configuration generation failed."
+        return 1
+    fi
+    if ! patch_compose; then
+        error "Deployment stopped because Compose configuration patching failed."
+        return 1
+    fi
+    if ! start_services; then
+        error "Deployment stopped because one or more selected services failed to start."
+        return 1
+    fi
+    if ! health_checks; then
+        error "Deployment stopped because one or more selected services failed health checks."
+        return 1
+    fi
     save_state
     show_success
 }
@@ -2084,6 +2117,12 @@ generate_env() {
         if [[ -n "$WEB_PORT" ]]; then
             # Universal access: use /cli-api for relative calls which works for both Local and VM/Remote.
             local cli_url="/cli-api"
+            # The current WEB Compose contract requires a numeric CLI_API_PORT
+            # even when WEB+API was selected without a local CLI. In that mode
+            # it is only a placeholder for the lazy optional proxy; no CLI
+            # container or host port is published.
+            local cli_api_port="$CLI_PORT"
+            [[ -n "$cli_api_port" ]] || cli_api_port=8000
 
             # Host port for PostgreSQL: default 5432, auto-bumped on conflict.
             # The backend reaches postgres over the docker network (postgres:5432);
@@ -2104,7 +2143,7 @@ POSTGRES_DB=bugtraceai_web
 POSTGRES_PORT=${pg_port}
 FRONTEND_PORT=${WEB_PORT}
 VITE_CLI_API_URL=${cli_url}
-CLI_API_PORT=${CLI_PORT}
+CLI_API_PORT=${cli_api_port}
 VITE_BTAI_API_URL=/btai-api
 BTAI_API_PORT=${BTAI_PORT}
 BTAI_SHARED_NETWORK=${BTAI_SHARED_NETWORK}
@@ -2188,6 +2227,7 @@ EOF
 # Generate MCP configuration file for AI assistants (mcporter, claude, etc.)
 generate_mcp_config() {
     local has_mcp_endpoints=false
+    $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && has_mcp_endpoints=true
     $MCP_CLI_ENABLED && has_mcp_endpoints=true
     $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
@@ -2198,6 +2238,10 @@ generate_mcp_config() {
     step "Generating MCP configuration..."
     local config_file="$INSTALL_DIR/mcp-config.json"
     local entries=()
+
+    if $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]]; then
+        entries+=("    \"bugtraceai-api\": { \"baseUrl\": \"http://localhost:${BTAI_MCP_PORT}/mcp\" }")
+    fi
 
     if $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]]; then
         entries+=("    \"bugtraceai\": { \"baseUrl\": \"http://localhost:${MCP_PORT}/sse\" }")
@@ -2225,6 +2269,37 @@ ${servers}  }
 }
 EOF
     echo -e "    ${OK} MCP config (mcp-config.json)"
+}
+
+# Make the optional CLI reverse-proxy DNS lookup lazy for WEB+API installs.
+# Nginx resolves literal upstream hostnames while loading its configuration;
+# without a CLI container that would prevent the whole WEB stack from starting.
+patch_optional_web_cli_proxy() {
+    if ! $INSTALL_WEB || $INSTALL_CLI || [[ ! -f "$WEB_DIR/nginx.conf" ]]; then
+        return 0
+    fi
+    if grep -Fq 'set $cli_api_host bugtrace-cli-api;' "$WEB_DIR/nginx.conf"; then
+        return 0
+    fi
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    awk '
+    index($0, "proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;") {
+        print "        set $cli_api_host bugtrace-cli-api;"
+        print "        proxy_pass http://$cli_api_host:${CLI_API_PORT}/;"
+        next
+    }
+    { print }
+    ' "$WEB_DIR/nginx.conf" > "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    if ! grep -Fq 'set $cli_api_host bugtrace-cli-api;' "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    mv "$tmp_file" "$WEB_DIR/nginx.conf"
 }
 
 # Patch docker-compose files to use .env values and enable MCP profiles
@@ -2287,6 +2362,11 @@ patch_compose() {
         if $MCP_KALI_ENABLED; then
             ensure_kali_startup_command "$web_compose"
         fi
+
+        # WEB-only installs do not have a CLI container. Keep the optional
+        # CLI route lazy so nginx can start while correctly returning 502 only
+        # if somebody requests a feature that needs the absent CLI.
+        patch_optional_web_cli_proxy
 
         # Patch CLI MCP port if non-default
         if $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" && "$MCP_PORT" != "8001" ]]; then
@@ -2351,6 +2431,39 @@ _start_web_profile() {
     return 1
 }
 
+_start_cli_service() {
+    local build_log="$INSTALL_DIR/.build.log"
+
+    if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
+        error "CLI docker-compose.yml not found — clone may have failed."
+        return 1
+    fi
+
+    # The standalone API owns the hyphenated `bugtrace-api` name. Do not
+    # remove it after starting it in Full/WEB mode; only clean that legacy
+    # name in a CLI-only deployment.
+    local cli_cleanup_containers=(bugtrace_api bugtrace_mcp bugtrace-mcp bugtrace-cli-mcp)
+    if ! $INSTALL_BTAI; then
+        cli_cleanup_containers+=(bugtrace-api)
+    fi
+    docker rm -f "${cli_cleanup_containers[@]}" 2>/dev/null || true
+    echo ""
+    step "Building & starting CLI service..."
+    echo -e "    ${DIM}(compiles Go tools + installs browser — may take 10-15 min on first run)${NC}"
+    if ! _build_with_progress "CLI" _cli_compose up -d --build; then
+        echo ""
+        error "Failed to start CLI service."
+        echo -e "    ${DIM}Last lines from build log:${NC}"
+        tail -5 "$build_log" 2>/dev/null | while IFS= read -r line; do
+            echo -e "    ${RED}│${NC} ${DIM}${line}${NC}"
+        done
+        echo -e "    ${DIM}Full log: ${build_log}${NC}"
+        echo -e "    ${DIM}Or run: ./launcher.sh logs cli${NC}"
+        return 1
+    fi
+    echo -e "    ${OK} CLI service started"
+}
+
 start_services() {
     local build_log="$INSTALL_DIR/.build.log"
     : > "$build_log"
@@ -2370,6 +2483,13 @@ start_services() {
             exit 1
         fi
         echo -e "    ${OK} BugTraceAI-API started"
+    fi
+
+    # Start CLI before WEB. The WEB nginx configuration references the CLI
+    # service on the shared Docker network and can fail at startup if DNS is
+    # resolved before the CLI container exists.
+    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
+        _start_cli_service || exit 1
     fi
 
     # Start WEB services
@@ -2397,55 +2517,26 @@ start_services() {
         echo -e "    ${OK} WEB services started"
     fi
 
-    # Start CLI service
-    if $INSTALL_CLI || $MCP_CLI_ENABLED; then
-        if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
-            error "CLI docker-compose.yml not found — clone may have failed."
-            exit 1
-        fi
-        # Force-remove any stale containers with these names (from ANY project/install method)
-        docker rm -f bugtrace_api bugtrace-api bugtrace_mcp bugtrace-mcp bugtrace-cli-mcp 2>/dev/null || true
-        echo ""
-        step "Building & starting CLI service..."
-        echo -e "    ${DIM}(compiles Go tools + installs browser — may take 10-15 min on first run)${NC}"
-        if ! _build_with_progress "CLI" _cli_compose up -d --build; then
-            echo ""
-            error "Failed to start CLI service."
-            echo -e "    ${DIM}Last lines from build log:${NC}"
-            tail -5 "$build_log" 2>/dev/null | while IFS= read -r line; do
-                echo -e "    ${RED}│${NC} ${DIM}${line}${NC}"
-            done
-            echo -e "    ${DIM}Full log: ${build_log}${NC}"
-            echo -e "    ${DIM}Or run: ./launcher.sh logs cli${NC}"
-            exit 1
-        fi
-        echo -e "    ${OK} CLI service started"
-    fi
-
     # Start optional WEB-owned agents only after the base services and CLI are
     # up. Each profile is a separate Compose invocation so a recon build cannot
     # cancel Kali's image pull (public WEB names recon `reconftw-mcp:local`).
     resolve_web_mcp_profiles
     if (( ${#WEB_MCP_PROFILE_ARGS[@]} > 0 )) && [[ -f "$WEB_DIR/docker-compose.yml" ]]; then
         local profile_label
+        local optional_ok=true
         profile_label="$(IFS=,; printf '%s' "${WEB_MCP_PROFILE_NAMES[*]}")"
         echo ""
         step "Starting optional agents (profiles: ${profile_label})..."
 
-        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            if _start_web_profile "MCP" --profile cli up -d --build; then
-                echo -e "    ${OK} BugTraceAI MCP started"
-            else
-                warn "BugTraceAI MCP failed to start. Core services are already up."
-            fi
-        fi
         if $MCP_RECON_ENABLED; then
             if ! ensure_recon_source; then
                 error "Cannot start reconFTW until its source is available."
+                optional_ok=false
             elif _start_web_profile "reconFTW" --profile recon up -d --build; then
                 echo -e "    ${OK} reconFTW MCP started"
             else
                 warn "reconFTW MCP failed to start. Core services are already up."
+                optional_ok=false
             fi
         fi
         if $MCP_KALI_ENABLED; then
@@ -2453,24 +2544,49 @@ start_services() {
                 echo -e "    ${OK} Kali Linux toolbox started"
             else
                 warn "Kali toolbox failed to start. Core services are already up."
+                optional_ok=false
             fi
+        fi
+        if ! $optional_ok; then
+            return 1
         fi
     fi
 }
 
 # Wait for a URL to respond, with visual feedback
-# Pass "sse" as $4 to treat curl timeout (code 28) as success for SSE endpoints
+# Pass "sse" as $4 for an SSE stream, or "mcp" for a Streamable HTTP endpoint.
 wait_for_url() {
     local url=$1 label=$2 timeout=${3:-120} type=${4:-http}
     local elapsed=0 interval=3
 
     while [[ $elapsed -lt $timeout ]]; do
-        curl -sf --max-time 2 "$url" &>/dev/null
-        local res=$?
-        # Code 0 = success. Code 28 = curl timeout, only valid for SSE (stream stays open).
-        if [[ $res -eq 0 ]] || [[ $res -eq 28 && "$type" == "sse" ]]; then
-            printf "\r    ${OK} %-30s\n" "$label"
-            return 0
+        if [[ "$type" == "sse" ]]; then
+            local sse_status
+            sse_status=$(curl -sS -N --max-time 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+            # A stream is healthy only when curl received an HTTP 2xx status;
+            # an arbitrary timeout from an unreachable endpoint is not enough.
+            if [[ "$sse_status" =~ ^2[0-9][0-9]$ ]]; then
+                printf "\r    ${OK} %-30s\n" "$label"
+                return 0
+            fi
+        elif [[ "$type" == "mcp" ]]; then
+            local mcp_status
+            mcp_status=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' \
+                -H 'Accept: application/json, text/event-stream' "$url" 2>/dev/null || true)
+            # GET /mcp may legitimately return 400/405 until a client sends a
+            # JSON-RPC request. Those statuses still prove the listener exists;
+            # 000 means no HTTP response was received.
+            if [[ "$mcp_status" =~ ^(2[0-9][0-9]|400|405|406)$ ]]; then
+                printf "\r    ${OK} %-30s\n" "$label"
+                return 0
+            fi
+        else
+            curl -sf --max-time 2 "$url" &>/dev/null
+            local res=$?
+            if [[ $res -eq 0 ]]; then
+                printf "\r    ${OK} %-30s\n" "$label"
+                return 0
+            fi
         fi
         printf "\r    ${DIM}waiting for %s... (%ds/%ds)${NC}" "$label" "$elapsed" "$timeout"
         sleep $interval
@@ -2497,6 +2613,11 @@ health_checks() {
 
     if [[ -n "$BTAI_PORT" ]]; then
         wait_for_url "http://localhost:${BTAI_PORT}/health" "BugTraceAI-API (port ${BTAI_PORT})" 180 || all_ok=false
+    fi
+
+    if $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]]; then
+        wait_for_url "http://localhost:${BTAI_MCP_PORT}/mcp" \
+            "BugTraceAI-API MCP (port ${BTAI_MCP_PORT})" 120 mcp || all_ok=false
     fi
 
     # CLI health check
@@ -2535,8 +2656,10 @@ health_checks() {
     echo ""
     if [[ "$all_ok" == true ]]; then
         success "All services healthy!"
+        return 0
     else
         warn "Some services didn't respond. Check logs: ./launcher.sh logs"
+        return 1
     fi
 }
 
@@ -2591,7 +2714,7 @@ show_success() {
         echo -e "  ${ARROW} API Docs:      ${BOLD}${CYAN}http://localhost:${CLI_PORT}/docs${NC}"
     fi
     if [[ -n "$BTAI_PORT" ]]; then
-        echo -e "  ${ARROW} BugTraceAI-API: ${BOLD}${CYAN}http://localhost:${BTAI_PORT}${NC}"
+        echo -e "  ${ARROW} BugTraceAI-API REST: ${BOLD}${CYAN}http://localhost:${BTAI_PORT}${NC}"
     fi
 
     # Show remote access if IP detected and different from localhost
@@ -2604,17 +2727,25 @@ show_success() {
         if [[ -n "$CLI_PORT" ]]; then
             echo -e "  ${ARROW} CLI API:       ${BOLD}${CYAN}http://${host_ip}:${CLI_PORT}${NC}"
         fi
+        if [[ -n "$BTAI_PORT" ]]; then
+            echo -e "  ${ARROW} BugTraceAI-API REST: ${BOLD}${CYAN}http://${host_ip}:${BTAI_PORT}${NC}"
+        fi
+        if $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]]; then
+            echo -e "  ${ARROW} BugTraceAI-API MCP:  ${BOLD}${CYAN}http://${host_ip}:${BTAI_MCP_PORT}/mcp${NC}"
+        fi
     fi
 
     # Show only real MCP endpoints here. Kali is rendered separately because
     # its upstream image is an interactive toolbox, not a network MCP server.
     local has_mcp_endpoints=false
+    $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && has_mcp_endpoints=true
     $MCP_CLI_ENABLED && has_mcp_endpoints=true
     $MCP_RECON_ENABLED && has_mcp_endpoints=true
 
     if $has_mcp_endpoints; then
         echo ""
         echo -e "  ${BOLD}MCP endpoints:${NC}"
+        $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && echo -e "    ${OK} BugTraceAI-API: ${CYAN}http://localhost:${BTAI_MCP_PORT}/mcp${NC}"
         $MCP_CLI_ENABLED && echo -e "    ${OK} BugTraceAI: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
         $MCP_RECON_ENABLED && echo -e "    ${OK} reconFTW:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC} (by @six2dez)"
 
@@ -2627,6 +2758,11 @@ show_success() {
         echo -e "  ${DIM}Add to your MCP client config:${NC}"
         echo ""
 
+        if $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]]; then
+            echo -e "    ${CYAN}\"bugtraceai-api\": {${NC}"
+            echo -e "    ${CYAN}  \"baseUrl\": \"http://${mcp_host}:${BTAI_MCP_PORT}/mcp\"${NC}"
+            echo -e "    ${CYAN}}${NC}"
+        fi
         if $MCP_CLI_ENABLED; then
             echo -e "    ${CYAN}\"bugtraceai\": {${NC}"
             echo -e "    ${CYAN}  \"baseUrl\": \"http://${mcp_host}:${MCP_PORT}/sse\"${NC}"
@@ -2749,7 +2885,8 @@ cmd_status() {
     echo -e "  ${BOLD}Endpoints:${NC}"
     [[ -n "$WEB_PORT" ]] && echo -e "    WEB:  ${CYAN}http://localhost:${WEB_PORT}${NC}"
     [[ -n "$CLI_PORT" ]] && echo -e "    CLI:  ${CYAN}http://localhost:${CLI_PORT}${NC}"
-    [[ -n "$BTAI_PORT" ]] && echo -e "    BugTraceAI-API: ${CYAN}http://localhost:${BTAI_PORT}${NC}"
+    [[ -n "$BTAI_PORT" ]] && echo -e "    BugTraceAI-API REST: ${CYAN}http://localhost:${BTAI_PORT}${NC}"
+    $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]] && echo -e "    BugTraceAI-API MCP:  ${CYAN}http://localhost:${BTAI_MCP_PORT}/mcp${NC}"
     $MCP_CLI_ENABLED && [[ -n "$MCP_PORT" ]] && echo -e "    BugTraceAI MCP: ${CYAN}http://localhost:${MCP_PORT}/sse${NC}"
     $MCP_RECON_ENABLED && [[ -n "$RECON_PORT" ]] && echo -e "    reconFTW MCP:   ${CYAN}http://localhost:${RECON_PORT}/sse${NC}"
     echo ""
@@ -2760,11 +2897,7 @@ _core_mcp_container_names() {
 }
 
 _core_mcp_container_name() {
-    if $INSTALL_CLI; then
-        printf '%s' "bugtrace_mcp"
-    else
-        printf '%s' "bugtrace-cli-mcp"
-    fi
+    printf '%s' "bugtrace_mcp"
 }
 
 _core_mcp_existing_name() {
@@ -2802,15 +2935,16 @@ cmd_start() {
         patch_btai_compose
         _btai_compose up -d || { error "Failed to start BugTraceAI-API"; ok=false; }
     fi
+
+    # Keep the same dependency order as a fresh deployment: CLI DNS must
+    # exist before nginx in WEB starts.
+    if [[ -d "$CLI_DIR" ]] && [[ -n "$CLI_PORT" ]]; then
+        _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
+    fi
     
     # Start WEB services
     if [[ -d "$WEB_DIR" ]] && [[ -n "$WEB_PORT" ]]; then
         _web_compose up -d || { error "Failed to start WEB services"; ok=false; }
-    fi
-    
-    # Start CLI services
-    if [[ -d "$CLI_DIR" ]] && [[ -n "$CLI_PORT" ]]; then
-        _cli_compose up -d || { error "Failed to start CLI service"; ok=false; }
     fi
     
     # Start optional WEB-owned agents with explicit profiles, one at a time.
@@ -2821,9 +2955,6 @@ cmd_start() {
         ok=false
     fi
     if [[ -d "$WEB_DIR" ]]; then
-        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            _web_compose --profile cli up -d --build || { error "Failed to start BugTraceAI MCP"; ok=false; }
-        fi
         if $MCP_RECON_ENABLED && $recon_ready; then
             _web_compose --profile recon up -d --build || { error "Failed to start reconFTW MCP"; ok=false; }
         fi
@@ -2832,7 +2963,12 @@ cmd_start() {
         fi
     fi
     
-    $ok && success "Services started" || warn "Some services failed to start. Run: ./launcher.sh logs"
+    if $ok; then
+        success "Services started"
+        return 0
+    fi
+    warn "Some services failed to start. Run: ./launcher.sh logs"
+    return 1
 }
 
 cmd_stop() {
@@ -2910,10 +3046,8 @@ cmd_logs() {
             fi
             ;;
         mcp)
-            if $INSTALL_CLI && [[ -d "$CLI_DIR" ]]; then
+            if $MCP_CLI_ENABLED && [[ -d "$CLI_DIR" ]]; then
                 _cli_compose logs -f --tail=100 mcp
-            elif $MCP_CLI_ENABLED && [[ -d "$WEB_DIR" ]]; then
-                _web_compose logs -f --tail=100 bugtrace-cli-mcp
             else
                 error "MCP not installed"
             fi
@@ -2970,6 +3104,25 @@ cmd_update() {
         fi
     fi
 
+    # Rebuild CLI before WEB so nginx never starts against a missing shared
+    # network target during an update.
+    if [[ -d "$CLI_DIR/.git" ]] && { $INSTALL_CLI || $MCP_CLI_ENABLED; }; then
+        step "Pulling CLI updates..."
+        (cd "$CLI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
+        if ! (cd "$CLI_DIR" && git pull --quiet); then
+            warn "Failed to pull CLI updates"
+            update_ok=false
+        fi
+        patch_compose
+        step "Rebuilding CLI..."
+        if ! _cli_compose up -d --build; then
+            error "Failed to rebuild CLI service"
+            update_ok=false
+        else
+            echo -e "    ${OK} CLI updated"
+        fi
+    fi
+
     if [[ -d "$WEB_DIR/.git" ]] && [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
         step "Pulling WEB updates..."
         # Reset launcher-patched compose before pull, then re-apply patches.
@@ -2989,9 +3142,6 @@ cmd_update() {
         else
             echo -e "    ${OK} WEB updated"
         fi
-        if $MCP_CLI_ENABLED && ! $INSTALL_CLI; then
-            _web_compose --profile cli up -d --build || { error "Failed to rebuild BugTraceAI MCP"; update_ok=false; }
-        fi
         if $MCP_RECON_ENABLED; then
             if ! $recon_ready; then
                 error "Skipping reconFTW rebuild; its build context is unavailable."
@@ -3006,32 +3156,16 @@ cmd_update() {
         fi
     fi
 
-    if [[ -d "$CLI_DIR/.git" ]] && { $INSTALL_CLI || $MCP_CLI_ENABLED; }; then
-        step "Pulling CLI updates..."
-        # Reset patched files before pull, then re-patch
-        (cd "$CLI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
-        if ! (cd "$CLI_DIR" && git pull --quiet); then
-            warn "Failed to pull CLI updates"
-            update_ok=false
-        fi
-        patch_compose
-        step "Rebuilding CLI..."
-        if ! _cli_compose up -d --build; then
-            error "Failed to rebuild CLI service"
-            update_ok=false
-        else
-            echo -e "    ${OK} CLI updated"
-        fi
-    fi
-
     # Clear version cache so next status check fetches fresh data
     rm -f "${VERSION_CACHE}".* 2>/dev/null
 
     echo ""
     if $update_ok; then
         success "Update complete!"
+        return 0
     else
         warn "Update finished with errors — review the messages above."
+        return 1
     fi
 }
 

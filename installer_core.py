@@ -807,7 +807,7 @@ def parse_response(provider, raw_text: str):
 class Check:
     label: str
     command: str
-    predicate: str  # one of: rc0_nonempty | nonempty | health | http200 | exists
+    predicate: str  # one of: rc0_nonempty | nonempty | health | http200 | exists | mcp
     critical: bool = True
 
 
@@ -824,6 +824,11 @@ def evaluate_check(predicate: str, rc: int, out: str) -> bool:
         # A healthy SSE endpoint commonly stays open until curl reaches its
         # client timeout, which is exit 28 rather than a transport failure.
         return rc in (0, 28)
+    if predicate == "mcp":
+        # Streamable HTTP GET can return a protocol-level 400/405/406 before
+        # a client sends JSON-RPC. Those statuses still prove the listener is
+        # reachable; transport failure is represented by rc != 0 or 000.
+        return rc == 0 and text in {"200", "201", "202", "204", "400", "405", "406"}
     if predicate == "nonempty":
         return bool(text)
     if predicate == "health":
@@ -850,6 +855,8 @@ class DeploymentPorts:
     mcp: Optional[int] = None
     recon: Optional[int] = None
     kali: Optional[int] = None
+    btai: Optional[int] = None
+    btai_mcp: Optional[int] = None
 
 
 def endpoint_url(port: Optional[int], path: str = "") -> Optional[str]:
@@ -872,7 +879,7 @@ def verification_checks(mode: str, install_dir: str,
               "docker info --format '{{.ServerVersion}}'",
               "rc0_nonempty"),
     ]
-    if mode in ("full", "cli"):
+    if mode in ("full", "cli") or mcp_enabled:
         checks += [
             Check("CLI container (bugtrace_api)",
                   "docker ps --filter 'name=^bugtrace_api$' --format '{{.Names}} {{.Status}}'",
@@ -902,6 +909,25 @@ def verification_checks(mode: str, install_dir: str,
         web_url = endpoint_url(ports.web)
         if web_url:
             checks.append(Check("WEB frontend", f"curl -sf --max-time 5 -o /dev/null -w '%{{http_code}}' {web_url} 2>/dev/null", "http200"))
+
+        checks += [
+            Check("BugTraceAI-API container (bugtrace-api)",
+                  "docker ps --filter 'name=^bugtrace-api$' --format '{{.Names}} {{.Status}}'",
+                  "nonempty"),
+            Check("BugTraceAI-API configuration (.env)",
+                  f"test -f {install_dir}/BugTraceAI-API/.env && echo exists",
+                  "exists"),
+        ]
+        btai_health = endpoint_url(ports.btai, "/health")
+        if btai_health:
+            checks.append(Check("BugTraceAI-API REST health",
+                                f"curl -sf --max-time 5 {btai_health} 2>/dev/null",
+                                "health"))
+        btai_mcp = endpoint_url(ports.btai_mcp, "/mcp")
+        if btai_mcp:
+            checks.append(Check("BugTraceAI-API MCP endpoint",
+                                f"curl -sS --max-time 5 -o /dev/null -w '%{{http_code}}' -H 'Accept: application/json, text/event-stream' {btai_mcp} 2>/dev/null",
+                                "mcp"))
 
     if mode == "full":
         proxy_health = endpoint_url(ports.web, "/cli-api/health")
@@ -936,23 +962,27 @@ class PromptSpec:
     mcp_cli: bool = False
     mcp_recon: bool = False
     mcp_kali: bool = False
+    btai_repo: str = ""
 
 
 def build_system_prompt(spec: PromptSpec) -> str:
     """Build the agent prompt without credentials or invented port numbers."""
     install_dir = spec.install_dir
-    cli_playbook = web_playbook = cli_verify = web_verify = ""
+    cli_playbook = web_playbook = btai_playbook = cli_verify = web_verify = btai_verify = ""
     provider_label = {"openrouter": "OPENROUTER", "anthropic": "ANTHROPIC",
                       "zai": "GLM/Z.AI"}.get(spec.provider, "OPENROUTER")
 
     endpoint_lines = []
     for label, port in (("WEB", spec.ports.web), ("CLI", spec.ports.cli),
+                        ("BugTraceAI-API REST", spec.ports.btai),
+                        ("BugTraceAI-API MCP", spec.ports.btai_mcp),
                         ("BugTraceAI MCP", spec.ports.mcp), ("reconFTW MCP", spec.ports.recon)):
         endpoint = endpoint_url(port)
         endpoint_lines.append(f"- {label}: {endpoint}" if endpoint else f"- {label}: not resolved yet")
     endpoint_context = "\n".join(endpoint_lines)
 
-    if spec.mode in ("full", "cli"):
+    needs_cli = spec.mode in ("full", "cli") or spec.mcp_cli
+    if needs_cli:
         cli_playbook = f"""
 STEP 1: INSTALL CLI
 1. mkdir -p {install_dir} && cd {install_dir}
@@ -980,7 +1010,32 @@ CLI checks:
 """.replace("{install_dir}", install_dir)
 
     if spec.mode in ("full", "web"):
-        step_num = "2" if spec.mode == "full" else "1"
+        step_num = "2" if needs_cli else "1"
+        btai_repo = spec.btai_repo or "https://github.com/BugTraceAI/BugTraceAI-API.git"
+        btai_playbook = f"""
+STEP {step_num}: INSTALL BugTraceAI-API
+1. cd {install_dir}
+2. git clone --depth 1 {btai_repo} BugTraceAI-API
+3. cd BugTraceAI-API
+4. Call configure_api. It writes the provider configuration and the selected
+   REST/MCP ports locally with mode 600. Never create or print the API key file.
+5. Build and start:
+     docker compose up -d --build
+6. Inspect progress without following forever:
+     docker compose logs --tail=30
+
+Expected container after API install:
+  - bugtrace-api — REST API and BugTraceAI-API MCP
+"""
+        btai_verify = """
+BugTraceAI-API checks:
+  - Container bugtrace-api is Up
+  - REST /health and MCP /mcp respond on their resolved host ports
+  - File {install_dir}/BugTraceAI-API/.env exists
+""".replace("{install_dir}", install_dir)
+
+    if spec.mode in ("full", "web"):
+        step_num = "3" if needs_cli else "2"
         web_playbook = f"""
 STEP {step_num}: INSTALL WEB
 1. cd {install_dir}
@@ -1059,7 +1114,8 @@ INSTALL DIRECTORY: {install_dir}
 DEPLOYED CLI PROVIDER: {provider_label}
 SELECTED COMPONENTS:
 - WEB: {"yes" if spec.mode in ("full", "web") else "no"}
-- CLI: {"yes" if spec.mode in ("full", "cli") else "no"}
+- CLI: {"yes" if needs_cli else "no"}
+- BugTraceAI-API: {"yes" if spec.mode in ("full", "web") else "no"}
 - BugTraceAI MCP: {"yes" if spec.mcp_cli else "no"}
 - reconFTW MCP: {"yes" if spec.mcp_recon else "no"}
 - Kali toolbox: {"yes" if spec.mcp_kali else "no"}
@@ -1085,11 +1141,11 @@ STEP 0: SYSTEM ASSESSMENT (do this first, silently)
   AUTH_REQUIRED, do not retry it in a loop — use ask_user.
 - Check if {install_dir} already exists. If BugTraceAI containers are running,
   use ask_user to confirm a reinstall before proceeding.
-{cli_playbook}{web_playbook}
+{cli_playbook}{btai_playbook}{web_playbook}
 {bar}
 VERIFICATION — What the system checks when you call finish
 {bar}
-{cli_verify}{web_verify}
+{cli_verify}{btai_verify}{web_verify}
 When you believe everything is running, call finish(summary).
 The system runs automated verification. If any check fails, you get the results
 and MUST fix the issues, then call finish again.

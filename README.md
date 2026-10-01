@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-2.9.4-blue" />
+  <img src="https://img.shields.io/badge/Version-3.0.0-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
@@ -24,7 +24,11 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB + API, CLI, or the full platform with a single command.
 
-**New in v2.9.4**: a reinstall re-enters its newly-created target directory before cloning components, so an installation started from a replaced directory can continue through WEB, CLI, BugTraceAI-API, and optional agents. Interrupted installs now state that remaining components were not installed.
+**New in v3.0.0**: the installer validates every selected service before reporting success, installs BugTraceAI-API REST + MCP, keeps CLI MCP ownership in the CLI Compose project, repairs reconFTW Compose YAML safely on ARM and x86, starts CLI before WEB, and supports WEB+API without a local CLI. The AI assistant now configures and verifies BugTraceAI-API too.
+
+**v2.9.7**: the CLI startup no longer removes the standalone `bugtrace-api` container in Full/WEB deployments, and API REST/MCP ports cannot be selected twice. BugTraceAI-API's REST and MCP endpoints are shown separately during setup, after deployment, and in `status`; its Streamable HTTP MCP endpoint is also added to `mcp-config.json` as `bugtraceai-api`.
+
+**v2.9.5**: a reinstall now re-enters its newly-created target directory before cloning components, so an installation started from a replaced directory can continue through WEB, CLI, BugTraceAI-API, and optional agents. Interrupted installs now state that remaining components were not installed.
 
 **v2.9.3**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary.
 

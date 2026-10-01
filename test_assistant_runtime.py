@@ -200,6 +200,38 @@ class TestDynamicEndpointWiring(unittest.TestCase):
 
         self.assertIn("host.docker.internal:41234/", rewritten)
 
+    def test_accepts_current_shared_network_proxy_shape(self):
+        nginx = """server {
+    location ^~ /cli-api/ {
+        proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nginx_path = os.path.join(tmp, "nginx.conf")
+            with open(nginx_path, "w", encoding="utf-8") as f:
+                f.write(nginx)
+            self.assertTrue(rewrite_web_cli_proxy(nginx_path, 41234))
+            with open(nginx_path, encoding="utf-8") as f:
+                self.assertIn("proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;", f.read())
+
+    def test_makes_optional_current_proxy_lazy(self):
+        nginx = """server {
+    location ^~ /cli-api/ {
+        proxy_pass http://bugtrace-cli-api:${CLI_API_PORT}/;
+    }
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            nginx_path = os.path.join(tmp, "nginx.conf")
+            with open(nginx_path, "w", encoding="utf-8") as f:
+                f.write(nginx)
+            self.assertTrue(rewrite_web_cli_proxy(nginx_path, None))
+            with open(nginx_path, encoding="utf-8") as f:
+                rewritten = f.read()
+        self.assertIn("set $cli_api_host bugtrace-cli-api;", rewritten)
+        self.assertIn("proxy_pass http://$cli_api_host:${CLI_API_PORT}/;", rewritten)
+
 
 class TestWrapReadlinePrompt(unittest.TestCase):
     def test_ansi_sequences_are_marked_zero_width(self):
