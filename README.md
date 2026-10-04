@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-3.0.3-blue" />
+  <img src="https://img.shields.io/badge/Version-3.0.9-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
@@ -24,7 +24,17 @@ Launcher version source of truth: [VERSION](VERSION)
 
 Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB + API, CLI, or the full platform with a single command.
 
-**v3.0.3**: the AI installer shares the standard Launcher's compatibility patches for WEB, reconFTW and Kali. Repairs preserve database credentials and custom settings; API ports are detected by listener role. Verification requires every selected agent, working proxies and installed Kali tools, not just a running container or an SSE timeout. Compose patches handle root-level boundaries and list/mapping environments safely. Builds have a one-hour timeout, configurable through `BTAI_INSTALLER_BUILD_TIMEOUT` (seconds).
+**v3.0.9**: honors explicit local overrides and saved Docker profiles, reads local logs without Docker, and retains reconfigured CLI profiles and platform inventory. Legacy CLI 3.x is rejected for TUI use.
+
+**v3.0.8**: preserves verified deployment state if global command registration fails and forwards TERM for installed Docker TUI profiles.
+
+**v3.0.7**: adds optional user-global `btai` registration after choosing interface and runtime, including full-platform TUI installs and AI setup. Saved choices survive updates and repairs.
+
+**v3.0.6**: standalone CLI installation now asks TUI / API + MCP / both, then local / Docker. The standard and AI entry points share the CLI installer; update and repair preserve saved choices. WEB deployments require API and may additionally include TUI.
+
+**v3.0.5**: adds `./launcher.sh tui`, honoring the selected CLI checkout and saved runtime and otherwise opening the installed CLI container. Standard and AI installers accept explicit CLI repository/branch overrides.
+
+**v3.0.4**: fixes Compose build timeouts with options, preserves deployment inventory during partial repairs, tears down all selected Compose profiles before uninstalling, and validates service health and updater patches. CLI-only installs include their MCP service and port.
 
 **New in v3.0.0**: the installer validates every selected service before reporting success, installs BugTraceAI-API REST + MCP, keeps CLI MCP ownership in the CLI Compose project, repairs reconFTW Compose YAML safely on ARM and x86, starts CLI before WEB, and supports WEB+API without a local CLI. The AI assistant now configures and verifies BugTraceAI-API too.
 
@@ -32,9 +42,7 @@ Interactive wizard that clones the BugTraceAI repos, builds Docker images, gener
 
 **v2.9.5**: a reinstall now re-enters its newly-created target directory before cloning components, so an installation started from a replaced directory can continue through WEB, CLI, BugTraceAI-API, and optional agents. Interrupted installs now state that remaining components were not installed.
 
-**v2.9.3**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary.
-
-**v2.9.2**: the **AI Setup & Repair Assistant** is interactive again (provider, install/repair, Full/CLI/WEB, optional reconFTW/Kali). Ubuntu sudo uses the same TTY as the cached ticket and re-enters the `docker` group, so it no longer loops on `sudo: a password is required`. The AI chat restores cooked TTY + GNU readline so Backspace and arrows edit the line instead of printing `^H`. Status lines still continue on their own; a real question waits for an answer. The standard guided installer is unchanged.
+**v2.9.4**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary. The **AI Setup & Repair Assistant** preserves the CLI/MCP ports and shared Docker network when it writes or repairs the CLI `.env`, so Launcher-managed deployments remain aligned with the WEB proxy and standalone CLI installations.
 
 **v2.9.0**: DeepSeek V4.1 Flash via OpenRouter with sticky Qwen 3.8 Max (0902) failover; one visible native `sudo` ticket (never stored); host-held API key; dynamic ports; Docker Engine bootstrap on Linux; reconFTW built from local source; Kali in a separate Compose step; `install.log` next to `launcher.sh`.
 
@@ -125,6 +133,7 @@ In **Full** mode the launcher automatically configures CORS and points the WEB f
 
 ```bash
 ./launcher.sh              # Interactive setup wizard
+./launcher.sh tui          # Real terminal workspace; --demo is optional
 ./launcher.sh status       # Service dashboard (container health + endpoints)
 ./launcher.sh start        # Start all services
 ./launcher.sh stop         # Stop all services
@@ -321,7 +330,7 @@ The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the inte
 1. **Bootstraps dependencies**: Git/curl first, then clones or updates the Launcher
 2. **Selects installer mode**: Standard guided wizard or experimental AI Setup & Repair Assistant
 3. **Checks runtime**: Docker runtime + Compose checks, including Docker Desktop or Colima on macOS
-4. **Selects deployment mode**: Full (WEB + CLI), Standalone WEB, or Standalone CLI
+4. **Selects deployment mode**: Full (WEB + API + CLI), WEB + API, or Standalone CLI
 5. **Configures**: Asks for OpenRouter API key, proposes ports, generates `.env` files
 6. **Deploys**: Clones repos, builds Docker images, starts services, runs health checks
 
@@ -357,7 +366,7 @@ cd ~/bugtraceai-launcher
 
 ## License
 
-Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+Apache-2.0 License. See the [LICENSE](LICENSE) file for details.
 
 ## Links
 
@@ -371,3 +380,59 @@ Apache License 2.0. See the [LICENSE](LICENSE) file for details.
   Made with care by Albert C. <a href="https://x.com/yz9yt">@yz9yt</a><br/>
   <a href="https://bugtraceai.com">bugtraceai.com</a>
 </p>
+
+## CLI 4.x terminal workspace
+
+Use `./launcher.sh setup-cli` to choose **TUI**, **API + MCP**, or **both**,
+then **local Python** or **Docker**. Local TUI installations do not require a
+Docker runtime; some scanning tools still use Docker. TUI-only Docker opens an
+interactive scanner without publishing server ports. Full WEB deployments use
+Docker and require the CLI API; their wizard offers API only or API + TUI.
+
+For TUI/both, setup also offers the user-global **btai** command on macOS/Linux.
+Open a new terminal and run `btai` from any folder. Registration uses
+`~/.local/bin` without sudo and preserves unrelated existing commands.
+
+Use `./launcher.sh tui` to open the installed terminal workspace or
+`./launcher.sh api` to start the local API. The TUI runs **Recon → Discovery →
+Strategy → Exploit → Validate → Report** with the tabs **Pipeline, Findings,
+Agents, Timeline, Logs**. Enter the target, Depth and Max URLs at the top;
+configure Provider with F7 and target authentication with Auth/F8. Auth accepts
+a masked Bearer token or the WEB-compatible login YAML, including TOTP/2FA.
+No scan starts until you press Start. F1 opens help.
+
+The default source is the public BugTraceAI-CLI repository. CLI profiles require
+its 4.x installer; older 3.x installations need to be updated first. Existing
+installations update their current checkout and are not silently moved between
+repositories or branches. `BUGTRACEAI_CLI_REPO` and `BUGTRACEAI_CLI_BRANCH`
+select another source on a fresh clone.
+
+### Saved profiles and source overrides
+
+The CLI installer saves `.bugtrace-install.env`; `.launcher-state` stores the
+profile and checkout path. Launcher updates and AI repair reuse this profile.
+Switching interfaces does not automatically uninstall existing packages.
+
+`./launcher.sh tui` honors the saved runtime, including Docker in full-platform
+installations. `BUGTRACEAI_CLI_PATH` explicitly selects a local checkout before
+saved routing. A sibling `BugTraceAI-CLI` checkout is also supported. CLI 3.x
+checkouts cannot open this workspace; compatibility is checked before starting
+TUI services.
+
+Standalone installations read profile changes made by the CLI installer.
+Local `logs cli` / `logs api` reads checkout logs without Docker. `setup-cli`
+keeps an existing standalone checkout and refuses to overwrite a full WEB/API
+inventory; use a separate `BUGTRACEAI_DIR` for a standalone installation.
+
+Standalone setup and global registration require the CLI 4.0.14+ installer.
+
+### Installation by your own AI agent
+
+For a standalone CLI installation, copy the
+[CLI agent installation prompt](https://github.com/BugTraceAI/BugTraceAI-CLI#install-with-your-ai-coding-agent).
+It defaults to local TUI plus the user-global `btai` command and can also select
+API + MCP or both, with local or Docker runtime. This uses your own coding
+agent's terminal access. The optional Launcher AI Setup & Repair Assistant
+above is a separate installer mode.
+
+CLI 4.0.16-beta includes this terminal workspace and authentication settings.

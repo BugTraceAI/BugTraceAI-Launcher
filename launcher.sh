@@ -7,6 +7,7 @@
 #
 # Commands:
 #   (none)        Interactive setup wizard
+#   tui [--demo]  Open the real terminal workspace
 #   status        Show service status
 #   start         Start all services
 #   stop          Stop all services
@@ -20,7 +21,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
-VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.0.3')"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.0.9')"
 # Fail loudly if HOME is unset/empty rather than silently deriving "/bugtraceai"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
@@ -31,7 +32,8 @@ CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
 BTAI_DIR="$INSTALL_DIR/BugTraceAI-API"
 RECON_DIR="$INSTALL_DIR/reconftw-mcp"
 WEB_REPO="https://github.com/BugTraceAI/BugTraceAI-WEB.git"
-CLI_REPO="https://github.com/BugTraceAI/BugTraceAI-CLI.git"
+CLI_REPO="${BUGTRACEAI_CLI_REPO:-https://github.com/BugTraceAI/BugTraceAI-CLI.git}"
+CLI_BRANCH="${BUGTRACEAI_CLI_BRANCH:-}"
 BTAI_REPO="${BUGTRACEAI_API_REPO:-https://github.com/BugTraceAI/BugTraceAI-API.git}"
 RECON_REPO="https://github.com/BugTraceAI/reconftw-mcp.git"
 
@@ -61,6 +63,12 @@ MCP_PORT=""
 API_KEY=""
 API_KEY_ENV_VAR=""
 LLM_PROVIDER="openrouter"
+CLI_INTERFACE="api"
+CLI_RUNTIME="docker"
+CLI_MANAGED=false
+CLI_PROFILE_SAVED=false
+CLI_SETUP_CHECKOUT=""
+CLI_GLOBAL=no
 MENU_SELECTION=0
 
 # MCP Selection state
@@ -690,6 +698,42 @@ patch_recon_dockerfile_venv() {
     mv "$tmp_file" "$dockerfile"
     info "Applied reconftw-mcp Python venv compatibility patch."
 }
+
+# Restore only tracked recon files that exactly equal the output of our own
+# compatibility patch pipeline. Other edits remain untouched and make pull
+# fail safely if Git cannot merge them.
+_restore_recon_patches_for_update() (
+    local original_dir="$RECON_DIR" tmp rel changed=false
+    [[ -d "$original_dir/.git" ]] || return 0
+    tmp="$(mktemp -d)" || return 1
+    for rel in Dockerfile requirements.txt entrypoint.sh; do
+        if git -C "$original_dir" cat-file -e "HEAD:$rel" 2>/dev/null; then
+            mkdir -p "$tmp/$(dirname "$rel")"
+            git -C "$original_dir" show "HEAD:$rel" > "$tmp/$rel" || { rm -rf "$tmp"; return 1; }
+        fi
+    done
+    RECON_DIR="$tmp"
+    patch_recon_dockerfile_venv >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+    RECON_DIR="$original_dir"
+    for rel in Dockerfile requirements.txt entrypoint.sh; do
+        if ! git -C "$original_dir" diff HEAD --quiet -- "$rel"; then
+            if [[ ! -f "$tmp/$rel" || ! -f "$original_dir/$rel" ]] || ! cmp -s "$tmp/$rel" "$original_dir/$rel"; then
+                rm -rf "$tmp"
+                error "Recon $rel has edits beyond the known launcher patch; preserving them and stopping update."
+                return 1
+            fi
+            changed=true
+        fi
+    done
+    if $changed; then
+        for rel in Dockerfile requirements.txt entrypoint.sh; do
+            if ! git -C "$original_dir" diff HEAD --quiet -- "$rel"; then
+                git -C "$original_dir" show "HEAD:$rel" > "$original_dir/$rel" || { rm -rf "$tmp"; return 1; }
+            fi
+        done
+    fi
+    rm -rf "$tmp"
+)
 
 # The WEB compose project builds reconFTW from a sibling directory:
 #   BugTraceAI-WEB/../reconftw-mcp
@@ -1629,6 +1673,59 @@ offer_installer_mode() {
     fi
 }
 
+wizard_cli_preferences() {
+    if [[ "$DEPLOY_MODE" == cli ]]; then
+        select_option "How will you use BugTraceAI CLI?" "Interactive terminal (TUI)" "API server + MCP" "Both TUI and API"
+        case $MENU_SELECTION in 0) CLI_INTERFACE=tui ;; 1) CLI_INTERFACE=api ;; 2) CLI_INTERFACE=both ;; esac
+        select_option "Where should the CLI run?" "Local Python environment" "Docker"
+        case $MENU_SELECTION in 0) CLI_RUNTIME=local ;; 1) CLI_RUNTIME=docker ;; esac
+        CLI_MANAGED=true
+        MCP_CLI_ENABLED=false
+        [[ "$CLI_INTERFACE" == tui ]] || MCP_CLI_ENABLED=true
+    elif $INSTALL_CLI || $MCP_CLI_ENABLED; then
+        select_option "WEB needs the CLI API. Include the terminal workspace too?" "API server + MCP" "Both API and TUI"
+        if [[ $MENU_SELECTION -eq 1 ]]; then CLI_INTERFACE=both; else CLI_INTERFACE=api; fi
+        CLI_RUNTIME=docker
+    fi
+    CLI_GLOBAL=no
+    if [[ "$CLI_INTERFACE" != api ]]; then
+        select_option "Install global btai to open the TUI from any folder?" "Yes (current user, no sudo)" "No"
+        [[ $MENU_SELECTION -ne 0 ]] || CLI_GLOBAL=yes
+    fi
+}
+
+deploy_cli_only() {
+    mkdir -p "$INSTALL_DIR" || return 1
+    local workspace="${BUGTRACEAI_CLI_PATH:-${CLI_SETUP_CHECKOUT:-}}"
+    if [[ -z "$workspace" && -f "$SCRIPT_DIR/../BugTraceAI-CLI/install.sh" ]]; then
+        workspace="$SCRIPT_DIR/../BugTraceAI-CLI"
+    fi
+    if [[ -n "$workspace" ]]; then
+        CLI_DIR="$(cd "$workspace" && pwd)" || return 1
+    else
+        clone_repos || return 1
+    fi
+    if ! grep -q -- '--interface' "$CLI_DIR/install.sh" || ! grep -q -- '--global' "$CLI_DIR/install.sh"; then
+        error "This checkout needs the CLI 4.0.14+ installer. Update the CLI to 4.0.14 or newer, or select another compatible source with BUGTRACEAI_CLI_REPO / BUGTRACEAI_CLI_BRANCH."
+        return 1
+    fi
+    # Finish the engine installation before optional user command registration.
+    (cd "$CLI_DIR" && bash ./install.sh --interface "$CLI_INTERFACE" --runtime "$CLI_RUNTIME" --global no) || return 1
+    INSTALL_CLI=true INSTALL_WEB=false INSTALL_BTAI=false
+    DEPLOY_MODE=cli CLI_MANAGED=true
+    if [[ "$CLI_RUNTIME" == docker && "$CLI_INTERFACE" != tui ]]; then
+        CLI_PORT=$(awk -F= '$1=="CLI_PORT" {print $2}' "$CLI_DIR/.env")
+        MCP_PORT=$(awk -F= '$1=="MCP_PORT" {print $2}' "$CLI_DIR/.env")
+    fi
+    save_state
+    if [[ "$CLI_GLOBAL" == yes ]]; then
+        (cd "$CLI_DIR" && bash ./install.sh --interface "$CLI_INTERFACE" --runtime "$CLI_RUNTIME" --global yes --global-only) || return 1
+    fi
+    success "CLI installed: $CLI_INTERFACE / $CLI_RUNTIME"
+    [[ "$CLI_INTERFACE" == api ]] || info "Terminal: ./launcher.sh tui"
+    [[ "$CLI_INTERFACE" == tui ]] || info "Server: ./launcher.sh api"
+}
+
 wizard_select_components() {
     # Step 1: Select Base Installation Mode
     select_option "What would you like to install?" \
@@ -1653,6 +1750,7 @@ wizard_select_components() {
             ;;
         1) # Solo CLI
             INSTALL_CLI=true
+            MCP_CLI_ENABLED=true
             DEPLOY_MODE="cli"
             ;;
         2) # WEB + API
@@ -1894,7 +1992,6 @@ run_wizard() {
     show_banner
     offer_installer_mode
     cleanup_legacy_version_cache_dir
-    check_docker install
 
     # Detect existing BugTraceAI containers (running OR stopped — both cause name conflicts)
     local existing_btai
@@ -1992,8 +2089,14 @@ run_wizard() {
     fi
 
     check_for_updates
-    check_deps
     wizard_select_components
+    wizard_cli_preferences
+    if [[ "$DEPLOY_MODE" == cli ]]; then
+        deploy_cli_only
+        return $?
+    fi
+    check_docker install
+    check_deps
     wizard_select_provider
     wizard_ask_api_key
     wizard_configure_ports
@@ -2018,7 +2121,12 @@ deploy() {
         exit 1
     fi
 
-    clone_repos
+    clone_repos || return 1
+    if [[ "$CLI_INTERFACE" != api ]]; then _require_tui_cli_version "$CLI_DIR" || return 1; fi
+    if [[ "$CLI_GLOBAL" == yes ]] && ! grep -q -- '--global-only' "$CLI_DIR/install.sh"; then
+        error "The selected CLI checkout does not support global btai. Use CLI 4.0.14+ via BUGTRACEAI_CLI_REPO / BUGTRACEAI_CLI_BRANCH."
+        return 1
+    fi
     if ! generate_env; then
         error "Deployment stopped because configuration generation failed."
         return 1
@@ -2036,6 +2144,9 @@ deploy() {
         return 1
     fi
     save_state
+    if [[ "$CLI_GLOBAL" == yes ]]; then
+        (cd "$CLI_DIR" && bash ./install.sh --interface "$CLI_INTERFACE" --runtime docker --global yes --global-only) || return 1
+    fi
     show_success
 }
 
@@ -2073,7 +2184,9 @@ clone_repos() {
             step "Cloning BugTraceAI-CLI..."
             # Clean partial directory from failed previous attempt
             [[ -d "$CLI_DIR" && ! -d "$CLI_DIR/.git" ]] && rm -rf "$CLI_DIR"
-            if ! git clone --depth 1 "$CLI_REPO" "$CLI_DIR"; then
+            local cli_clone_args=(--depth 1)
+            [[ -n "$CLI_BRANCH" ]] && cli_clone_args+=(--branch "$CLI_BRANCH" --single-branch)
+            if ! git clone "${cli_clone_args[@]}" "$CLI_REPO" "$CLI_DIR"; then
                 error "Failed to clone BugTraceAI-CLI from $CLI_REPO"
                 error "Check your internet connection and try again."
                 exit 1
@@ -2253,6 +2366,7 @@ EOF
           cat > "$CLI_DIR/.env" << EOF
 # BugTraceAI-CLI — Generated by Launcher v${VERSION} ($(iso_date))
 PROVIDER=${LLM_PROVIDER}
+BUGTRACE_INTERFACE=${CLI_INTERFACE}
 CLI_PORT=${CLI_PORT}
 MCP_PORT=${MCP_PORT}
 ${API_KEY_ENV_VAR}=${API_KEY}
@@ -2396,6 +2510,114 @@ patch_web_npm_resilience() {
     info "Applied npm registry retry settings to the WEB Dockerfile."
 }
 
+# Undo only the exact npm retry lines emitted by patch_web_npm_resilience.
+# Any remaining diff is a user/upstream edit, so refuse to pull over it.
+_restore_web_npm_patch_for_update() {
+    local file="$WEB_DIR/backend/Dockerfile"
+    [[ -f "$file" ]] || return 0
+    if grep -q 'npm config set fetch-retries 5' "$file"; then
+        sed_inplace \
+            -e 's|^RUN npm config set fetch-retries 5 && npm config set fetch-retry-mintimeout 20000 && npm config set fetch-retry-maxtimeout 120000 && npm ci --omit=dev --no-audit --no-fund$|RUN npm ci --omit=dev|' \
+            -e 's|^RUN npm config set fetch-retries 5 && npm config set fetch-retry-mintimeout 20000 && npm config set fetch-retry-maxtimeout 120000 && npm ci --no-audit --no-fund$|RUN npm ci|' "$file"
+        if ! (cd "$WEB_DIR" && git diff --quiet -- backend/Dockerfile); then
+            patch_web_npm_resilience >/dev/null 2>&1 || true
+            error "WEB Dockerfile contains edits beyond the known launcher patch; preserving them and stopping update."
+            return 1
+        fi
+    fi
+}
+
+# Restore only the tracked WEB files that exactly match the launcher's own
+# Compose/nginx transformation.  A user edit in either file must stop update
+# rather than being silently discarded or allowed to block git pull.
+_restore_web_compose_patches_for_update() (
+    local original_dir="$WEB_DIR" tmp rel changed=false
+    [[ -d "$original_dir/.git" ]] || return 0
+    tmp="$(mktemp -d)" || return 1
+    for rel in docker-compose.yml nginx.conf; do
+        if git -C "$original_dir" cat-file -e "HEAD:$rel" 2>/dev/null; then
+            git -C "$original_dir" show "HEAD:$rel" > "$tmp/$rel" || {
+                rm -rf "$tmp"
+                return 1
+            }
+        fi
+    done
+
+    local saved_web_dir="$WEB_DIR" saved_cli_dir="$CLI_DIR"
+    local saved_install_web="$INSTALL_WEB"
+    WEB_DIR="$tmp"
+    CLI_DIR="$tmp/no-cli"
+    INSTALL_WEB=true
+    patch_compose >/dev/null 2>&1 || {
+        WEB_DIR="$saved_web_dir"
+        CLI_DIR="$saved_cli_dir"
+        INSTALL_WEB="$saved_install_web"
+        rm -rf "$tmp"
+        return 1
+    }
+    WEB_DIR="$saved_web_dir"
+    CLI_DIR="$saved_cli_dir"
+    INSTALL_WEB="$saved_install_web"
+
+    for rel in docker-compose.yml nginx.conf; do
+        if ! git -C "$original_dir" diff HEAD --quiet -- "$rel"; then
+            if [[ ! -f "$tmp/$rel" || ! -f "$original_dir/$rel" ]] || ! cmp -s "$tmp/$rel" "$original_dir/$rel"; then
+                rm -rf "$tmp"
+                error "WEB $rel has edits beyond the known launcher patch; preserving them and stopping update."
+                return 1
+            fi
+            changed=true
+        fi
+    done
+    if $changed; then
+        for rel in docker-compose.yml nginx.conf; do
+            if ! git -C "$original_dir" diff HEAD --quiet -- "$rel"; then
+                git -C "$original_dir" show "HEAD:$rel" > "$original_dir/$rel" || {
+                    rm -rf "$tmp"
+                    return 1
+                }
+            fi
+        done
+    fi
+    rm -rf "$tmp"
+)
+
+# CLI has a smaller launcher patch surface, but it needs the same protection
+# before pull because its selected host ports are written into Compose.
+_restore_cli_compose_patch_for_update() (
+    local original_dir="$CLI_DIR" tmp
+    [[ -d "$original_dir/.git" && -f "$original_dir/docker-compose.yml" ]] || return 0
+    if git -C "$original_dir" diff HEAD --quiet -- docker-compose.yml; then
+        return 0
+    fi
+    tmp="$(mktemp -d)" || return 1
+    git -C "$original_dir" show HEAD:docker-compose.yml > "$tmp/docker-compose.yml" || {
+        rm -rf "$tmp"
+        return 1
+    }
+    local saved_cli_dir="$CLI_DIR" saved_web_dir="$WEB_DIR"
+    CLI_DIR="$tmp"
+    WEB_DIR="$tmp/no-web"
+    patch_compose >/dev/null 2>&1 || {
+        CLI_DIR="$saved_cli_dir"
+        WEB_DIR="$saved_web_dir"
+        rm -rf "$tmp"
+        return 1
+    }
+    CLI_DIR="$saved_cli_dir"
+    WEB_DIR="$saved_web_dir"
+    if ! cmp -s "$tmp/docker-compose.yml" "$original_dir/docker-compose.yml"; then
+        rm -rf "$tmp"
+        error "CLI docker-compose.yml has edits beyond the known launcher patch; preserving them and stopping update."
+        return 1
+    fi
+    git -C "$original_dir" show HEAD:docker-compose.yml > "$original_dir/docker-compose.yml" || {
+        rm -rf "$tmp"
+        return 1
+    }
+    rm -rf "$tmp"
+)
+
 # Patch docker-compose files to use .env values and enable MCP profiles
 patch_compose() {
     # Migrate installations produced by older launcher versions, which wrote
@@ -2491,7 +2713,11 @@ _web_compose() {
 
 _cli_compose() {
     if [[ -z "$COMPOSE_CMD" ]]; then error "Docker Compose not found. Run: ./launcher.sh"; return 1; fi
-    (cd "$CLI_DIR" && $COMPOSE_CMD "$@")
+    if $CLI_MANAGED && [[ "$CLI_INTERFACE" == tui && "$CLI_RUNTIME" == docker ]]; then
+        (cd "$CLI_DIR" && $COMPOSE_CMD -f docker-compose.tui.yml "$@")
+    else
+        (cd "$CLI_DIR" && $COMPOSE_CMD "$@")
+    fi
 }
 
 _btai_compose() {
@@ -2664,13 +2890,25 @@ wait_for_url() {
     local elapsed=0 interval=3
 
     while [[ $elapsed -lt $timeout ]]; do
-        if [[ "$type" == "sse" ]]; then
+    if [[ "$type" == "sse" ]]; then
             local sse_status
             sse_status=$(curl -sS -N --max-time 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
             # A stream is healthy only when curl received an HTTP 2xx status;
             # an arbitrary timeout from an unreachable endpoint is not enough.
             if [[ "$sse_status" =~ ^2[0-9][0-9]$ ]]; then
                 printf "\r    ${OK} %-30s\n" "$label"
+                return 0
+            fi
+        elif [[ "$type" == "health" || "$type" == "webhealth" ]]; then
+            local health_body health_status health_file
+            health_file="$(mktemp "${TMPDIR:-/tmp}/btai-health.XXXXXX")" || return 1
+            health_body=$(curl -sS --max-time 2 -o "$health_file" -w '%{http_code}' "$url" 2>/dev/null || true)
+            health_status="$(cat "$health_file" 2>/dev/null || true)"
+            rm -f "$health_file"
+            if [[ "$health_body" =~ ^2[0-9][0-9]$ ]] && \
+               { [[ "$type" == "health" && "$health_status" =~ \"status\"[[:space:]]*:[[:space:]]*\"(healthy|ok|ready|up|alive|running|pass)\" ]] || \
+                 [[ "$type" == "webhealth" && "$health_status" =~ \"success\"[[:space:]]*:[[:space:]]*true && "$health_status" =~ \"data\"[[:space:]]*:[[:space:]]*\{ && "$health_status" =~ \"status\"[[:space:]]*:[[:space:]]*\"(healthy|ok|ready|up|alive|running|pass)\" ]]; }; then
+                printf "\\r    ${OK} %-30s\\n" "$label"
                 return 0
             fi
         elif [[ "$type" == "mcp" ]]; then
@@ -2708,15 +2946,44 @@ health_checks() {
 
     local all_ok=true
 
-    # WEB health check
-    if [[ -n "$WEB_PORT" ]]; then
-        wait_for_url "http://localhost:${WEB_PORT}" "WEB (port ${WEB_PORT})" 120 || all_ok=false
-        # API Discovery (Kiterunner) — core WEB service, check via nginx proxy
-        wait_for_url "http://localhost:${WEB_PORT}/kr-api/health" "API Discovery (Kiterunner)" 60 || all_ok=false
+    # A selected component without a host port is a failed deployment, not a
+    # component whose health check can be skipped.
+    if $INSTALL_WEB && [[ -z "$WEB_PORT" ]]; then
+        error "WEB is selected but has no configured host port."
+        all_ok=false
+    fi
+    if $INSTALL_BTAI && { [[ -z "$BTAI_PORT" ]] || [[ -z "$BTAI_MCP_PORT" ]]; }; then
+        error "BugTraceAI-API is selected but one or more host ports are missing."
+        all_ok=false
+    fi
+    if { $INSTALL_CLI || $MCP_CLI_ENABLED; } && [[ -z "$CLI_PORT" ]]; then
+        error "CLI is selected but has no configured host port."
+        all_ok=false
+    fi
+    if $MCP_CLI_ENABLED && [[ -z "$MCP_PORT" ]]; then
+        error "BugTraceAI MCP is selected but has no configured host port."
+        all_ok=false
+    fi
+    if $MCP_RECON_ENABLED && [[ -z "$RECON_PORT" ]]; then
+        error "reconFTW MCP is selected but has no configured host port."
+        all_ok=false
     fi
 
-    if [[ -n "$BTAI_PORT" ]]; then
-        wait_for_url "http://localhost:${BTAI_PORT}/health" "BugTraceAI-API (port ${BTAI_PORT})" 180 || all_ok=false
+    # WEB health check
+    if $INSTALL_WEB && [[ -n "$WEB_PORT" ]]; then
+        wait_for_url "http://localhost:${WEB_PORT}" "WEB (port ${WEB_PORT})" 120 || all_ok=false
+        wait_for_url "http://localhost:${WEB_PORT}/health" "WEB backend health" 120 webhealth || all_ok=false
+        wait_for_url "http://localhost:${WEB_PORT}/kr-api/health" "API Discovery (Kiterunner)" 60 webhealth || all_ok=false
+        if $INSTALL_BTAI; then
+            wait_for_url "http://localhost:${WEB_PORT}/btai-api/health" "WEB to BugTraceAI-API proxy" 120 webhealth || all_ok=false
+        fi
+        if $INSTALL_CLI; then
+            wait_for_url "http://localhost:${WEB_PORT}/cli-api/health" "WEB to CLI proxy" 120 webhealth || all_ok=false
+        fi
+    fi
+
+    if $INSTALL_BTAI && [[ -n "$BTAI_PORT" ]]; then
+        wait_for_url "http://localhost:${BTAI_PORT}/health" "BugTraceAI-API (port ${BTAI_PORT})" 180 health || all_ok=false
     fi
 
     if $INSTALL_BTAI && [[ -n "$BTAI_MCP_PORT" ]]; then
@@ -2725,8 +2992,8 @@ health_checks() {
     fi
 
     # CLI health check
-    if [[ -n "$CLI_PORT" ]]; then
-        wait_for_url "http://localhost:${CLI_PORT}/health" "CLI (port ${CLI_PORT})" 120 || all_ok=false
+    if { $INSTALL_CLI || $MCP_CLI_ENABLED; } && [[ -n "$CLI_PORT" ]]; then
+        wait_for_url "http://localhost:${CLI_PORT}/health" "CLI (port ${CLI_PORT})" 120 health || all_ok=false
     fi
 
     # MCP agents health checks
@@ -2747,9 +3014,16 @@ health_checks() {
 
     if $MCP_KALI_ENABLED; then
         # Kali is a toolbox container, not an HTTP/SSE MCP endpoint.
-        local kali_status
-        kali_status=$(docker ps --format '{{.Status}}' --filter "name=^kali-mcp-server$" 2>/dev/null | head -1)
-        if [[ -n "$kali_status" ]] && echo "$kali_status" | grep -q "Up"; then
+        local kali_status kali_ready=false attempt
+        for attempt in {1..20}; do
+            kali_status=$(docker ps --format '{{.Status}}' --filter "name=^kali-mcp-server$" 2>/dev/null | head -1)
+            if [[ -n "$kali_status" ]] && docker exec kali-mcp-server sh -lc 'command -v nmap >/dev/null && command -v hydra >/dev/null && command -v python3 >/dev/null' >/dev/null 2>&1; then
+                kali_ready=true
+                break
+            fi
+            sleep 3
+        done
+        if $kali_ready; then
             echo -e "    ${OK} Kali toolbox (running)"
         else
             echo -e "    ${FAIL} Kali toolbox (not running)"
@@ -2772,6 +3046,11 @@ save_state() {
 {
   "version": "${VERSION}",
   "mode": "${DEPLOY_MODE}",
+  "cli_interface": "${CLI_INTERFACE}",
+  "cli_runtime": "${CLI_RUNTIME}",
+  "cli_global": "${CLI_GLOBAL}",
+  "cli_managed": ${CLI_MANAGED},
+  "cli_checkout": "${CLI_DIR}",
   "web_port": "${WEB_PORT}",
   "cli_port": "${CLI_PORT}",
   "btai_port": "${BTAI_PORT}",
@@ -2888,6 +3167,7 @@ show_success() {
 
     echo ""
     echo -e "  ${BOLD}Commands:${NC}"
+    echo -e "    ${DIM}./launcher.sh tui${NC}          Terminal workspace (CLI 4.x)"
     echo -e "    ${DIM}./launcher.sh status${NC}       Service dashboard"
     echo -e "    ${DIM}./launcher.sh logs${NC}         View logs"
     echo -e "    ${DIM}./launcher.sh stop${NC}         Stop services"
@@ -2902,6 +3182,19 @@ load_state() {
         error "BugTraceAI not installed. Run: ./launcher.sh"
         exit 1
     fi
+    CLI_GLOBAL=$(awk -F'"' '/"cli_global"/{print $4}' "$STATE_FILE")
+    [[ "$CLI_GLOBAL" == yes ]] || CLI_GLOBAL=no
+    local saved_interface saved_runtime saved_checkout saved_managed
+    saved_interface=$(awk -F'"' '/"cli_interface"/{print $4}' "$STATE_FILE")
+    saved_runtime=$(awk -F'"' '/"cli_runtime"/{print $4}' "$STATE_FILE")
+    saved_checkout=$(awk -F'"' '/"cli_checkout"/{print $4}' "$STATE_FILE")
+    CLI_PROFILE_SAVED=false
+    case "$saved_interface/$saved_runtime" in tui/local|api/local|both/local|tui/docker|api/docker|both/docker) CLI_PROFILE_SAVED=true ;; esac
+    saved_managed=$(awk '/"cli_managed"/ {gsub(/[, ]/, "", $2); print $2}' "$STATE_FILE")
+    case "$saved_interface" in tui|api|both) CLI_INTERFACE="$saved_interface" ;; *) CLI_INTERFACE=api ;; esac
+    case "$saved_runtime" in local|docker) CLI_RUNTIME="$saved_runtime" ;; *) CLI_RUNTIME=docker ;; esac
+    [[ "$saved_managed" == true ]] && CLI_MANAGED=true || CLI_MANAGED=false
+    if $CLI_MANAGED && [[ -n "$saved_checkout" ]]; then CLI_DIR="$saved_checkout"; fi
     DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
     WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
@@ -2942,14 +3235,36 @@ load_state() {
         INSTALL_BTAI=false
     fi
 
+    # The CLI installer can reconfigure a standalone install independently.
+    # Read its validated profile without executing configuration as shell code.
+    if $CLI_MANAGED && [[ -f "$CLI_DIR/.bugtrace-install.env" ]]; then
+        local cli_interface cli_runtime cli_global
+        cli_interface=$(awk -F= '$1=="INTERFACE" {print $2}' "$CLI_DIR/.bugtrace-install.env")
+        cli_runtime=$(awk -F= '$1=="RUNTIME" {print $2}' "$CLI_DIR/.bugtrace-install.env")
+        cli_global=$(awk -F= '$1=="GLOBAL" {print $2}' "$CLI_DIR/.bugtrace-install.env")
+        case "$cli_interface/$cli_runtime" in
+            tui/local|api/local|both/local|tui/docker|api/docker|both/docker)
+                CLI_INTERFACE="$cli_interface" CLI_RUNTIME="$cli_runtime" CLI_PROFILE_SAVED=true
+                [[ "$cli_global" == yes ]] && CLI_GLOBAL=yes || CLI_GLOBAL=no
+                [[ "$CLI_INTERFACE" == tui ]] && MCP_CLI_ENABLED=false || MCP_CLI_ENABLED=true
+                ;;
+            *) error "Invalid saved CLI installation profile at $CLI_DIR/.bugtrace-install.env"; return 1 ;;
+        esac
+    fi
+
     # Older state files have no API fields.  Preserve their behavior until the
     # user runs a new deployment, instead of silently cloning a new service.
     [[ -z "$BTAI_PORT" ]] && BTAI_PORT=""
     [[ -z "$BTAI_MCP_PORT" ]] && BTAI_MCP_PORT=""
+    return 0
 }
 
 cmd_status() {
-    load_state
+    load_state || return 1
+    if $CLI_MANAGED && { [[ "$CLI_RUNTIME" == local ]] || [[ "$CLI_INTERFACE" == tui ]]; }; then
+        info "CLI: $CLI_INTERFACE / $CLI_RUNTIME — use ./launcher.sh tui or ./launcher.sh api as installed."
+        return
+    fi
     echo ""
     echo -e "${BOLD}BugTraceAI Status${NC}  (mode: ${CYAN}$DEPLOY_MODE${NC})"
     echo "──────────────────────────────────────────"
@@ -3029,8 +3344,19 @@ _print_container_status() {
     fi
 }
 
+_managed_container_names() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null |
+        grep -E '^(bugtrace-api|bugtrace_api|bugtrace_mcp|bugtrace-mcp|bugtrace-cli-mcp|bugtraceai-web-(frontend|backend|db)|bugtraceai-api-routes|kali-mcp-server|reconftw-mcp)$' |
+        sort -u || true
+}
+
 cmd_start() {
-    load_state
+    load_state || return 1
+    if $CLI_MANAGED && { [[ "$CLI_RUNTIME" == local ]] || [[ "$CLI_INTERFACE" == tui ]]; }; then
+        info "CLI: $CLI_INTERFACE / $CLI_RUNTIME — use ./launcher.sh tui or ./launcher.sh api as installed."
+        return
+    fi
+    check_docker
     info "Starting services..."
     local ok=true
     local recon_ready=true
@@ -3076,7 +3402,12 @@ cmd_start() {
 }
 
 cmd_stop() {
-    load_state
+    load_state || return 1
+    if $CLI_MANAGED && { [[ "$CLI_RUNTIME" == local ]] || [[ "$CLI_INTERFACE" == tui ]]; }; then
+        info "CLI: $CLI_INTERFACE / $CLI_RUNTIME — use ./launcher.sh tui or ./launcher.sh api as installed."
+        return
+    fi
+    check_docker
     info "Stopping services..."
 
     if $INSTALL_BTAI && [[ -d "$BTAI_DIR" ]]; then
@@ -3104,8 +3435,24 @@ cmd_restart() {
 }
 
 cmd_logs() {
-    load_state
+    load_state || return 1
     local target="${1:-}"
+
+    if $CLI_MANAGED && [[ "$CLI_RUNTIME" == local ]]; then
+        case "$target" in
+            ""|cli|api|mcp) ;;
+            *) error "This local installation has CLI logs only."; return 1 ;;
+        esac
+        local log_file
+        for log_file in "$CLI_DIR/logs/execution.log" "$CLI_DIR/logs/bugtrace.jsonl" "$CLI_DIR/logs/errors.log"; do
+            if [[ -f "$log_file" ]]; then
+                tail -n 100 -f "$log_file"
+                return $?
+            fi
+        done
+        info "No local scanner logs yet. Start a scan with ./launcher.sh tui or ./launcher.sh api."
+        return 0
+    fi
 
     if [[ -z "$target" ]]; then
         if $INSTALL_WEB && $INSTALL_CLI; then
@@ -3164,7 +3511,13 @@ cmd_logs() {
 }
 
 cmd_update() {
-    load_state
+    load_state || return 1
+    if $CLI_MANAGED; then
+        (cd "$CLI_DIR" && git pull --ff-only && bash ./install.sh --reuse) || return 1
+        success "CLI updated; kept $CLI_INTERFACE / $CLI_RUNTIME"
+        return
+    fi
+    check_docker
     info "Updating BugTraceAI..."
     echo ""
     local update_ok=true
@@ -3172,9 +3525,6 @@ cmd_update() {
 
     if $INSTALL_BTAI && [[ -d "$BTAI_DIR/.git" ]]; then
         step "Pulling BugTraceAI-API updates..."
-        # Restore launcher-owned deployment patches before pulling upstream.
-        (cd "$BTAI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
-        [[ -f "$WEB_DIR/nginx.conf" ]] && (cd "$WEB_DIR" && git checkout -- nginx.conf 2>/dev/null || true)
         if ! (cd "$BTAI_DIR" && git pull --quiet); then
             warn "Failed to pull BugTraceAI-API updates"
             update_ok=false
@@ -3199,12 +3549,15 @@ cmd_update() {
             update_ok=false
         elif [[ -d "$RECON_DIR/.git" ]]; then
             step "Pulling Recon updates..."
-            if ! (cd "$RECON_DIR" && git pull --quiet); then
+            if ! _restore_recon_patches_for_update; then
+                update_ok=false
+            elif ! (cd "$RECON_DIR" && git pull --quiet); then
                 warn "Failed to pull Recon updates"
                 update_ok=false
+            else
+                patch_recon_dockerfile_venv
+                echo -e "    ${OK} Recon updated"
             fi
-            patch_recon_dockerfile_venv
-            echo -e "    ${OK} Recon updated"
         fi
     fi
 
@@ -3212,35 +3565,45 @@ cmd_update() {
     # network target during an update.
     if [[ -d "$CLI_DIR/.git" ]] && { $INSTALL_CLI || $MCP_CLI_ENABLED; }; then
         step "Pulling CLI updates..."
-        (cd "$CLI_DIR" && git checkout -- docker-compose.yml 2>/dev/null || true)
-        if ! (cd "$CLI_DIR" && git pull --quiet); then
+        if ! _restore_cli_compose_patch_for_update; then
+            update_ok=false
+        elif ! (cd "$CLI_DIR" && git pull --quiet); then
             warn "Failed to pull CLI updates"
             update_ok=false
-        fi
-        patch_compose
-        step "Rebuilding CLI..."
-        if ! _cli_compose up -d --build; then
-            error "Failed to rebuild CLI service"
-            update_ok=false
         else
-            echo -e "    ${OK} CLI updated"
+            patch_compose
+            step "Rebuilding CLI..."
+            if ! _cli_compose up -d --build; then
+                error "Failed to rebuild CLI service"
+                update_ok=false
+            else
+                echo -e "    ${OK} CLI updated"
+            fi
         fi
     fi
 
     if [[ -d "$WEB_DIR/.git" ]] && [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]]; then
         step "Pulling WEB updates..."
-        # Reset launcher-patched compose before pull, then re-apply patches.
-        (cd "$WEB_DIR" && git checkout -- docker-compose.yml nginx.conf 2>/dev/null || true)
-        if ! (cd "$WEB_DIR" && git pull --quiet); then
+        # Restore launcher patches only when they exactly match known
+        # transformations; user edits remain intact and stop the pull safely.
+        if ! _restore_web_compose_patches_for_update; then
+            update_ok=false
+        elif ! _restore_web_npm_patch_for_update; then
+            update_ok=false
+        elif ! (cd "$WEB_DIR" && git pull --quiet); then
             warn "Failed to pull WEB updates"
             update_ok=false
+        else
+            patch_web_npm_resilience || update_ok=false
         fi
         # Patch .env.docker: ensure VITE_CLI_API_URL uses proxy path (safe: preserves passwords)
         _patch_env_docker
         patch_compose
         step "Rebuilding WEB..."
         resolve_web_mcp_profiles
-        if ! _web_compose up -d --build; then
+        if ! $update_ok; then
+            warn "Skipping WEB rebuild because its update did not complete."
+        elif ! _web_compose up -d --build; then
             error "Failed to rebuild WEB services"
             update_ok=false
         else
@@ -3288,7 +3651,12 @@ _patch_env_docker() {
 }
 
 cmd_uninstall() {
-    load_state
+    load_state || return 1
+    if $CLI_MANAGED && [[ "$CLI_RUNTIME" == local ]]; then
+        info "Local checkout and reports are kept at $CLI_DIR. Remove its virtual environment manually if no longer needed."
+        return
+    fi
+    check_docker
     echo ""
     warn "This will remove all BugTraceAI containers, volumes, and data."
     echo -e "  ${DIM}Install directory: $INSTALL_DIR${NC}"
@@ -3297,28 +3665,41 @@ cmd_uninstall() {
     read -r confirm
     [[ "$(to_lower "$confirm")" != "y" ]] && { info "Cancelled."; exit 0; }
 
-    _teardown_all
+    _teardown_all || { error "Uninstall stopped before deleting installation files."; return 1; }
 
     success "BugTraceAI uninstalled."
 }
 
 # Tear down all services and remove install directory
 _teardown_all() {
-    if [[ -d "$BTAI_DIR" ]]; then
+    local failed=false remaining
+    _assert_safe_install_dir "$INSTALL_DIR" require_marker || return 1
+    if [[ -d "$BTAI_DIR" && -f "$BTAI_DIR/docker-compose.yml" ]]; then
         step "Stopping BugTraceAI-API..."
-        (cd "$BTAI_DIR" && $COMPOSE_CMD down -v 2>/dev/null) || true
+        (cd "$BTAI_DIR" && $COMPOSE_CMD down -v --remove-orphans) || failed=true
     fi
-    if [[ -d "$CLI_DIR" ]]; then
+    if [[ -d "$CLI_DIR" && -f "$CLI_DIR/docker-compose.yml" ]]; then
         step "Stopping CLI..."
-        (cd "$CLI_DIR" && $COMPOSE_CMD down -v 2>/dev/null) || true
+        (cd "$CLI_DIR" && $COMPOSE_CMD down -v --remove-orphans) || failed=true
     fi
-    if [[ -d "$WEB_DIR" ]]; then
+    if [[ -d "$WEB_DIR" && -f "$WEB_DIR/docker-compose.yml" ]]; then
         step "Stopping WEB..."
-        (cd "$WEB_DIR" && $COMPOSE_CMD --env-file .env.docker down -v 2>/dev/null) || true
+        # Enable both optional profiles so their services are included in down.
+        (cd "$WEB_DIR" && $COMPOSE_CMD --env-file .env.docker --profile recon --profile kali down -v --remove-orphans) || failed=true
+    fi
+    remaining="$(_managed_container_names)"
+    if [[ -n "$remaining" ]]; then
+        error "Managed BugTraceAI containers remain after teardown; installation files were kept: $remaining"
+        failed=true
+    fi
+    if $failed; then
+        error "One or more Compose stacks could not be stopped; installation files were kept."
+        return 1
     fi
     step "Removing $INSTALL_DIR..."
     _assert_safe_install_dir "$INSTALL_DIR" require_marker
     rm -rf "$INSTALL_DIR"
+    return $?
 }
 
 # ── Docker Check ─────────────────────────────────────────────────────────────
@@ -3381,6 +3762,109 @@ check_docker() {
     detect_compose_cmd
 }
 
+# An explicit local path overrides saved routing; otherwise honor the installation profile.
+_require_tui_cli_version() {
+    local checkout="$1"
+    if [[ -f "$checkout/VERSION" ]]; then
+        local cli_version
+        cli_version=$(tr -d '[:space:]' < "$checkout/VERSION")
+        if [[ "$cli_version" =~ ^([0-9]+)\. ]] && (( ${BASH_REMATCH[1]} < 4 )); then
+            error "Legacy CLI $cli_version cannot open this workspace. Use a CLI 4.x checkout."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+_run_local_tui() {
+    local workspace="$1"
+    shift
+    if [[ ! -x "$workspace/bugtraceai-cli" ]]; then
+        error "CLI workspace not found or not executable: $workspace/bugtraceai-cli"
+        return 1
+    fi
+    _require_tui_cli_version "$workspace" || return 1
+    "$workspace/bugtraceai-cli" tui "$@"
+}
+
+cmd_tui() {
+    local workspace="${BUGTRACEAI_CLI_PATH:-}"
+    if [[ -n "$workspace" ]]; then
+        _run_local_tui "$workspace" "$@"
+        return $?
+    fi
+    if [[ -f "$STATE_FILE" ]]; then load_state || return 1; fi
+    if { $CLI_MANAGED || $CLI_PROFILE_SAVED; } && [[ "$CLI_INTERFACE" == api ]]; then
+        error "This installation selected API only. Run the installer to add TUI."
+        return 1
+    fi
+    if { $CLI_MANAGED || $CLI_PROFILE_SAVED; } && [[ "$CLI_RUNTIME" == docker ]]; then
+        _require_tui_cli_version "$CLI_DIR" || return 1
+        check_docker
+        if [[ "$CLI_INTERFACE" == tui ]]; then
+            _cli_compose run --rm -e "TERM=${TERM:-xterm-256color}" scanner tui "$@"
+        else
+            _cli_compose exec -e "TERM=${TERM:-xterm-256color}" api python3 -m bugtrace tui "$@"
+        fi
+        return $?
+    fi
+    if $CLI_MANAGED && [[ "$CLI_RUNTIME" == local ]]; then
+        workspace="$CLI_DIR"
+    elif [[ -f "$SCRIPT_DIR/../BugTraceAI-CLI/bugtraceai-cli" ]]; then
+        workspace="$SCRIPT_DIR/../BugTraceAI-CLI"
+    fi
+    if [[ -n "$workspace" ]]; then
+        _run_local_tui "$workspace" "$@"
+        return $?
+    fi
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        error "The terminal workspace needs an interactive terminal. Run ./launcher.sh tui in your terminal."
+        return 1
+    fi
+    load_state || return 1
+    if [[ ! -f "$CLI_DIR/docker-compose.yml" ]]; then
+        error "CLI is not installed. Install a CLI 4.x checkout or set BUGTRACEAI_CLI_PATH."
+        return 1
+    fi
+    check_docker
+    _cli_compose exec -e "TERM=${TERM:-xterm-256color}" api python3 -m bugtrace tui "$@"
+}
+
+cmd_api() {
+    load_state || return 1
+    if [[ "$CLI_INTERFACE" == tui ]]; then error "This installation selected TUI only."; return 1; fi
+    if $CLI_MANAGED && [[ "$CLI_RUNTIME" == local ]]; then
+        "$CLI_DIR/bugtraceai-cli" serve "$@"
+    else
+        check_docker
+        _cli_compose up -d api mcp
+    fi
+}
+
+cmd_cli_setup() {
+    if [[ $# -gt 1 || ( $# -eq 1 && "$1" != --reuse ) ]]; then
+        error "Usage: ./launcher.sh setup-cli [--reuse]"
+        return 1
+    fi
+    CLI_SETUP_CHECKOUT=""
+    if [[ -f "$STATE_FILE" ]]; then
+        load_state || return 1
+        if $INSTALL_WEB || $INSTALL_BTAI; then
+            error "This installation includes WEB/API. Use a separate BUGTRACEAI_DIR for standalone CLI setup; the existing platform state was kept."
+            return 1
+        fi
+        if $CLI_MANAGED; then CLI_SETUP_CHECKOUT="$CLI_DIR"; fi
+    fi
+    if [[ "${1:-}" == --reuse ]]; then
+        load_state || return 1
+        (cd "$CLI_DIR" && bash ./install.sh --reuse)
+        return $?
+    fi
+    DEPLOY_MODE=cli INSTALL_CLI=true INSTALL_WEB=false INSTALL_BTAI=false
+    wizard_cli_preferences
+    deploy_cli_only
+}
+
 # ── Help ─────────────────────────────────────────────────────────────────────
 
 show_help() {
@@ -3391,6 +3875,9 @@ show_help() {
     echo ""
     echo "Commands:"
     echo "  (no args)       Interactive setup wizard"
+    echo "  api             Start the installed CLI API"
+    echo "  setup-cli       Choose interface and runtime for a standalone CLI"
+    echo "  tui [--demo]    Open the terminal workspace (real scans by default)"
     echo "  status          Show service status"
     echo "  start           Start all services"
     echo "  stop            Stop all services"
@@ -3399,6 +3886,8 @@ show_help() {
     echo "  update          Pull latest & rebuild"
     echo "  uninstall       Remove everything"
     echo ""
+    echo "Local checkout override: BUGTRACEAI_CLI_PATH=/path/to/CLI ./launcher.sh tui"
+    echo "Install source overrides: BUGTRACEAI_CLI_REPO / BUGTRACEAI_CLI_BRANCH"
     echo "Docs: https://docs.bugtraceai.com"
 
     check_for_updates
@@ -3412,13 +3901,16 @@ main() {
     _log_event INFO "command: ${1:-wizard}"
     case "${1:-}" in
         "")         run_wizard ;;
+        tui)        shift; cmd_tui "$@" ;;
+        api)        shift; cmd_api "$@" ;;
+        setup-cli)  shift; cmd_cli_setup "$@" ;;
         status)     cmd_status ;;
-        start)      check_docker; cmd_start ;;
-        stop)       check_docker; cmd_stop ;;
-        restart)    check_docker; cmd_restart ;;
+        start)      cmd_start ;;
+        stop)       cmd_stop ;;
+        restart)    cmd_restart ;;
         logs)       cmd_logs "${2:-}" ;;
-        update)     check_docker; cmd_update ;;
-        uninstall)  check_docker; cmd_uninstall ;;
+        update)     cmd_update ;;
+        uninstall)  cmd_uninstall ;;
         help|--help|-h) show_help ;;
         *)
             error "Unknown command: $1"

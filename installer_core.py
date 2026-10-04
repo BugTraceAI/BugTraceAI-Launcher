@@ -134,9 +134,7 @@ def make_palette(caps: TerminalCaps) -> Palette:
 
 # ── Command classification (pure) ─────────────────────────────────────────────
 _LONG_CMD_MARKERS: Tuple[str, ...] = (
-    "docker compose up", "docker compose build",
-    "docker-compose up", "docker-compose build",
-    "docker build", "docker pull", "docker compose pull",
+    "docker build", "docker pull",
     "apt-get install", "apt install", "npm install", "npm ci",
     "get.docker.com",
 )
@@ -177,7 +175,15 @@ def _has_flag(tokens, letter: str) -> bool:
 def is_long_running(cmd: str) -> bool:
     """True for commands that legitimately take minutes (builds, image pulls,
     package installs) and therefore deserve the long timeout."""
-    return any(marker in cmd for marker in _LONG_CMD_MARKERS)
+    if any(marker in cmd for marker in _LONG_CMD_MARKERS):
+        return True
+    # Compose permits global options (and environment assignments) before the
+    # operation. Match only lifecycle/build operations, never ps/logs/config.
+    return bool(re.search(
+        r"\bdocker\s+(?:compose\s+(?:(?:--[\w-]+(?:=\S+)?|-\w)(?:\s+\S+)?\s+)*)"
+        r"(?:up|build|pull)\b|\bdocker-compose\s+"
+        r"(?:(?:--[\w-]+(?:=\S+)?|-\w)(?:\s+\S+)?\s+)*(?:up|build|pull)\b",
+        cmd, re.IGNORECASE))
 
 
 def select_timeout(cmd: str, default_timeout: int, long_timeout: int) -> int:
@@ -989,6 +995,8 @@ class PromptSpec:
     mcp_recon: bool = False
     mcp_kali: bool = False
     btai_repo: str = ""
+    cli_branch: str = ""
+    cli_interface: str = "api"
 
 
 def build_system_prompt(spec: PromptSpec) -> str:
@@ -1011,8 +1019,10 @@ def build_system_prompt(spec: PromptSpec) -> str:
     if needs_cli:
         cli_playbook = f"""
 STEP 1: INSTALL CLI
+Selected CLI interface: {spec.cli_interface}; runtime: Docker. Preserve this selection during repair.
+Use configure_cli to set BUGTRACE_INTERFACE; do not replace that value.
 1. mkdir -p {install_dir} && cd {install_dir}
-2. git clone --depth 1 {spec.cli_repo} BugTraceAI-CLI
+2. git clone --depth 1 {("--branch " + shlex.quote(spec.cli_branch) + " --single-branch ") if spec.cli_branch else ""}{shlex.quote(spec.cli_repo)} BugTraceAI-CLI
 3. cd BugTraceAI-CLI
 4. Call configure_cli. It writes the provider configuration and API secret
    locally with mode 600. Never create or print the secret yourself.
