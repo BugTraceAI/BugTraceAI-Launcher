@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BugTraceAI — AI Setup & Repair Assistant v3.0.3
+BugTraceAI — AI Setup & Repair Assistant v3.0.9
 Defaults to OpenRouter (DeepSeek V4.1 Flash -> Qwen 3.8 Max (0902)). Anthropic direct
 (Claude Haiku 4.5 / Messages API) remains an explicit environment override.
 
@@ -205,15 +205,16 @@ CMD_TIMEOUT_DOCKER_BUILD = _positive_env_int("BTAI_INSTALLER_BUILD_TIMEOUT", 360
 API_MAX_ATTEMPTS = 4
 INSTALL_DIR = os.path.abspath(os.path.expanduser(
     os.environ.get("BUGTRACEAI_DIR", "~/bugtraceai")))
-CLI_REPO = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
+CLI_REPO = os.environ.get("BUGTRACEAI_CLI_REPO", "https://github.com/BugTraceAI/BugTraceAI-CLI.git")
+CLI_BRANCH = os.environ.get("BUGTRACEAI_CLI_BRANCH", "")
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 BTAI_REPO = os.environ.get("BUGTRACEAI_API_REPO", "https://github.com/BugTraceAI/BugTraceAI-API.git")
 _VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
 try:
     with open(_VERSION_FILE, encoding="utf-8") as _version_handle:
-        VERSION = _version_handle.read().strip() or "3.0.3"
+        VERSION = _version_handle.read().strip() or "3.0.9"
 except OSError:
-    VERSION = "3.0.3"
+    VERSION = "3.0.9"
 BTAI_SHARED_NETWORK = "bugtraceai-platform"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks
@@ -514,9 +515,9 @@ def _choose_mode(action):
     idx = _ask_menu(
         title,
         (
-            "Full platform        (WEB + CLI — recommended)",
-            "CLI only             (scanner API, no web interface)",
-            "WEB only             (web interface — needs the CLI API elsewhere)",
+            "Full platform        (WEB + API + CLI — recommended)",
+            "CLI only             (TUI / API / both)",
+            "WEB + API only       (web interface and BugTraceAI API)",
         ),
         default=0,
     )
@@ -648,6 +649,8 @@ class DeploymentContext:
     mcp_recon_enabled: bool = False
     mcp_kali_enabled: bool = False
     has_state: bool = False
+    cli_interface: str = "api"
+    cli_global: str = "no"
 
 
 def _as_port(value):
@@ -819,6 +822,8 @@ def _resolve_deployment_context():
         mcp_recon_enabled=_bool_state(state.get("mcp_recon_enabled")),
         mcp_kali_enabled=_bool_state(state.get("mcp_kali_enabled")),
         has_state=bool(state),
+        cli_global="yes" if state.get("cli_global") == "yes" else "no",
+        cli_interface=state.get("cli_interface", "api") if state.get("cli_interface", "api") in ("api", "both") else "api",
     )
     return _refresh_deployment_context(context, allocate_web=not context.has_state)
 
@@ -888,6 +893,15 @@ def _configure_cli():
     if not os.path.isdir(cli_dir):
         return False, "CLI directory is missing. Clone BugTraceAI-CLI first."
 
+    if deployment_context.cli_interface == "both":
+        try:
+            with open(os.path.join(cli_dir, "VERSION"), encoding="utf-8") as handle:
+                major = handle.read().strip().split(".", 1)[0]
+            if major.isdigit() and int(major) < 4:
+                return False, "The TUI requires CLI 4.x. Select the refactor via BUGTRACEAI_CLI_REPO / BUGTRACEAI_CLI_BRANCH."
+        except OSError:
+            pass
+
     env_path = os.path.join(cli_dir, ".env")
     existing_env = _read_env_values(env_path)
     cli_env_values = {}
@@ -946,6 +960,7 @@ def _configure_cli():
     try:
         _update_private_env(env_path, {
             "PROVIDER": PROVIDER, key_env: api_key,
+            "BUGTRACE_INTERFACE": deployment_context.cli_interface,
             "BUGTRACE_CORS_ORIGINS": existing_env.get("BUGTRACE_CORS_ORIGINS", "*"),
             **cli_env_values,
         })
@@ -1147,6 +1162,10 @@ def _save_ai_state(context):
         "recon_port": str(context.ports.recon or ""),
         "kali_port": str(context.ports.kali or ""),
         "provider": context.provider,
+        "cli_interface": context.cli_interface,
+        "cli_runtime": "docker",
+        "cli_global": context.cli_global,
+        "cli_managed": False,
         "primary_model": MODEL_CHAIN[0] if MODEL_CHAIN else "",
         "fallback_model": MODEL_CHAIN[1] if len(MODEL_CHAIN) > 1 else "",
         "install_web": context.mode in ("full", "web"),
@@ -1158,6 +1177,25 @@ def _save_ai_state(context):
         "install_dir": context.install_dir,
         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    # A repair menu selection is a verification/configuration scope, not a
+    # declaration that unselected deployed components were removed.
+    if globals().get("setup_action") == "repair":
+        try:
+            with open(state_path, encoding="utf-8") as handle:
+                previous = json.load(handle)
+            if isinstance(previous, dict):
+                for key, value in previous.items():
+                    if key not in data and key not in ("version", "deployed_at"):
+                        data[key] = value
+                for key in ("mode", "web_port", "cli_port", "btai_port",
+                            "btai_mcp_port", "mcp_port", "recon_port", "kali_port",
+                            "provider", "install_web", "install_cli", "install_btai",
+                            "mcp_cli_enabled", "mcp_recon_enabled", "mcp_kali_enabled",
+                            "install_dir", "cli_interface", "cli_runtime", "cli_managed", "cli_checkout", "cli_global"):
+                    if key in previous:
+                        data[key] = previous[key]
+        except (OSError, ValueError):
+            pass
     _write_private_file(state_path, json.dumps(data, indent=2) + "\n")
 
 
@@ -1272,6 +1310,18 @@ def _boot():
     print()
     hr()
 
+    # Resolve standalone CLI scope before sudo, Docker or an assistant API key.
+    _existing_target = _has_existing_target()
+    setup_action = _choose_action(_existing_target)
+    install_mode = _choose_mode(setup_action)
+    saved_state = _read_launcher_state(INSTALL_DIR)
+    if install_mode == "cli" and (setup_action != "repair" or saved_state.get("cli_managed")):
+        command = ["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh"), "setup-cli"]
+        if setup_action == "repair":
+            command.append("--reuse")
+        result = subprocess.run(command, check=False)
+        sys.exit(result.returncode)
+
     # Privilege is intentionally acquired through the native terminal prompt.  We
     # retain no password: sudo owns a temporary ticket, refreshed only while this
     # process lives and explicitly invalidated on exit.
@@ -1346,9 +1396,16 @@ def _boot():
     ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
     hr()
 
-    _existing_target = _has_existing_target()
-    setup_action = _choose_action(_existing_target)
-    install_mode = _choose_mode(setup_action)
+    cli_interface = saved_state.get("cli_interface", "api")
+    if setup_action != "repair" and install_mode == "full":
+        cli_interface = ("api", "both")[_ask_menu(
+            "WEB needs the CLI API. Include the TUI too?",
+            ("API server + MCP", "Both API and TUI"), default=0)]
+    cli_global = "yes" if saved_state.get("cli_global") == "yes" else "no"
+    if setup_action != "repair" and cli_interface == "both":
+        cli_global = ("yes", "no")[_ask_menu(
+            "Install global btai to open the TUI from any folder?",
+            ("Yes (current user, no sudo)", "No"), default=0)]
     mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
     ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
     if mcp_recon_enabled or mcp_kali_enabled:
@@ -1369,6 +1426,8 @@ def _boot():
         deployment_context,
         mode=install_mode,
         provider=PROVIDER,
+        cli_interface=cli_interface,
+        cli_global=cli_global,
         mcp_cli_enabled=mcp_cli_enabled,
         mcp_recon_enabled=mcp_recon_enabled,
         mcp_kali_enabled=mcp_kali_enabled,
@@ -1382,7 +1441,7 @@ def _boot():
     # ── Build prompt & messages ──────────────────────────────────────────────────
     SYSTEM = core.build_system_prompt(PromptSpec(
         mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
-        api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS,
+        api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS, cli_branch=CLI_BRANCH, cli_interface=deployment_context.cli_interface,
         btai_repo=BTAI_REPO,
         provider=PROVIDER, ports=deployment_context.ports,
         mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
@@ -1786,6 +1845,14 @@ def _finish_tool(tc, args):
         return ToolOutcome(_tool_result(
             tc.id, tc.name,
             f"VERIFICATION PASSED but state could not be saved: {exc}. Fix that and call finish again."))
+    if deployment_context.cli_global == "yes":
+        command = ["bash", os.path.join(deployment_context.install_dir, "BugTraceAI-CLI", "install.sh"),
+                   "--interface", deployment_context.cli_interface, "--runtime", "docker",
+                   "--global", "yes", "--global-only"]
+        result = subprocess.run(command, check=False)
+        if result.returncode:
+            return ToolOutcome(_tool_result(tc.id, tc.name,
+                "Services verified but btai registration failed. Fix it and call finish again."))
     _log_event("OK", "verification passed")
     if summary.strip():
         bubble_ai(summary)

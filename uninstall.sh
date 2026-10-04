@@ -59,6 +59,7 @@ LAUNCHER_DIR="${BUGTRACEAI_LAUNCHER_DIR:-$TARGET_HOME/bugtraceai-launcher}"
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
 CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
+API_DIR="$INSTALL_DIR/BugTraceAI-API"
 
 # Refuse to rm -rf an empty / root / unexpected path. Marker mode prevents a
 # custom path that merely contains "bugtraceai" from being removed by mistake.
@@ -93,6 +94,12 @@ _assert_safe_dir() {
 # destroy resources and then abort mid-way on a bad path (partial uninstall).
 _assert_safe_dir "$INSTALL_DIR" require_marker
 _assert_safe_dir "$LAUNCHER_DIR" require_marker
+
+managed_container_names() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null |
+        grep -E '^(bugtrace-api|bugtrace_api|bugtrace_mcp|bugtrace-mcp|bugtrace-cli-mcp|bugtraceai-web-(frontend|backend|db)|bugtraceai-api-routes|kali-mcp-server|reconftw-mcp)$' |
+        sort -u || true
+}
 
 # Detect docker compose command
 if docker compose version &>/dev/null; then
@@ -142,7 +149,7 @@ else
 fi
 
 # Check Docker containers
-containers=$({ docker ps -a --filter "name=bugtraceai" --format "{{.Names}}"; docker ps -a --filter "name=bugtrace_" --format "{{.Names}}"; } | sort -u 2>/dev/null || true)
+containers="$(managed_container_names)"
 if [[ -n "$containers" ]]; then
     count=$(echo "$containers" | wc -l)
     step "Docker containers: ${BOLD}${count}${NC} found"
@@ -214,50 +221,34 @@ echo ""
 # ── Step 1: Stop Docker Compose stacks ─────────────────────────────────────
 
 if [[ -n "$COMPOSE_CMD" ]]; then
+    teardown_failed=false
+    if [[ -d "$API_DIR" && -f "$API_DIR/docker-compose.yml" ]]; then
+        step "Stopping BugTraceAI-API stack..."
+        (cd "$API_DIR" && $COMPOSE_CMD down -v --remove-orphans) || teardown_failed=true
+    fi
+    if [[ -d "$CLI_DIR" && -f "$CLI_DIR/docker-compose.yml" ]]; then
+        step "Stopping CLI stack..."
+        (cd "$CLI_DIR" && $COMPOSE_CMD down -v --remove-orphans) || teardown_failed=true
+    fi
     if [[ -d "$WEB_DIR" ]] && [[ -f "$WEB_DIR/docker-compose.yml" ]]; then
         step "Stopping WEB stack..."
-        (cd "$WEB_DIR" && $COMPOSE_CMD --env-file .env.docker down -v 2>/dev/null) || true
+        (cd "$WEB_DIR" && $COMPOSE_CMD --env-file .env.docker --profile recon --profile kali down -v --remove-orphans) || teardown_failed=true
     fi
-
-    if [[ -d "$CLI_DIR" ]] && [[ -f "$CLI_DIR/docker-compose.yml" ]]; then
-        step "Stopping CLI stack..."
-        (cd "$CLI_DIR" && $COMPOSE_CMD down -v 2>/dev/null) || true
+    if [[ "$teardown_failed" == true ]]; then
+        error "A Compose stack could not be stopped. No installation files or Docker resources were removed."
+        exit 1
     fi
+    remaining="$(managed_container_names)"
+    if [[ -n "$remaining" ]]; then
+        error "Managed BugTraceAI containers remain after teardown. No installation files or Docker resources were removed: $remaining"
+        exit 1
+    fi
+elif [[ -n "$containers" || -f "$API_DIR/docker-compose.yml" || -f "$CLI_DIR/docker-compose.yml" || -f "$WEB_DIR/docker-compose.yml" ]]; then
+    error "Compose is unavailable or managed containers remain; refusing to remove installation files while services may still be running."
+    exit 1
 fi
 
-# ── Step 2: Remove remaining containers ────────────────────────────────────
-
-containers=$({ docker ps -a --filter "name=bugtraceai" --format "{{.ID}}"; docker ps -a --filter "name=bugtrace_" --format "{{.ID}}"; } | sort -u 2>/dev/null || true)
-if [[ -n "$containers" ]]; then
-    step "Removing leftover containers..."
-    echo "$containers" | xargs -r docker rm -f 2>/dev/null || true
-fi
-
-# ── Step 3: Remove volumes ─────────────────────────────────────────────────
-
-volumes=$(docker volume ls --filter "name=bugtraceai" --format "{{.Name}}" 2>/dev/null || true)
-if [[ -n "$volumes" ]]; then
-    step "Removing Docker volumes..."
-    echo "$volumes" | xargs -r docker volume rm -f 2>/dev/null || true
-fi
-
-# ── Step 4: Remove networks ───────────────────────────────────────────────
-
-networks=$(docker network ls --filter "name=bugtraceai" --format "{{.Name}}" 2>/dev/null || true)
-if [[ -n "$networks" ]]; then
-    step "Removing Docker networks..."
-    echo "$networks" | xargs -r docker network rm 2>/dev/null || true
-fi
-
-# ── Step 5: Remove Docker images ──────────────────────────────────────────
-
-images=$(docker images --filter "reference=*bugtraceai*" --format "{{.ID}}" 2>/dev/null || true)
-if [[ -n "$images" ]]; then
-    step "Removing Docker images..."
-    echo "$images" | xargs -r docker image rm -f 2>/dev/null || true
-fi
-
-# ── Step 6: Remove install directory ──────────────────────────────────────
+# ── Step 2: Remove install directory ──────────────────────────────────────
 
 if [[ -d "$INSTALL_DIR" ]]; then
     step "Removing $INSTALL_DIR..."
@@ -265,7 +256,7 @@ if [[ -d "$INSTALL_DIR" ]]; then
     rm -rf "$INSTALL_DIR"
 fi
 
-# ── Step 7: Remove launcher directory ─────────────────────────────────────
+# ── Step 3: Remove launcher directory ─────────────────────────────────────
 
 if [[ -d "$LAUNCHER_DIR" ]]; then
     step "Removing $LAUNCHER_DIR..."
@@ -276,7 +267,7 @@ fi
 # ── Done ──────────────────────────────────────────────────────────────────
 
 echo ""
-success "BugTraceAI has been completely removed from this system."
+success "BugTraceAI Compose stacks, project volumes, and launcher files have been removed. Docker images were retained."
 echo ""
 echo -e "${DIM}Docker Engine and Docker Compose were NOT removed.${NC}"
 echo ""
