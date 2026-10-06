@@ -465,29 +465,27 @@ access to your local terminal. The Launcher stays interactive so you can
 choose the products, provider and installation method yourself.
 
 ```text
-Install BugTraceAI using the official universal Launcher.
+Help me install BugTraceAI using the official universal Launcher.
 
-Read the Launcher README first. Use the public installer:
+First read:
+https://github.com/BugTraceAI/BugTraceAI-Launcher#readme
+
+Follow those instructions using the official installer:
 https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh
-If the Launcher is already installed, preserve its files and configuration;
-do not replace an existing checkout or switch its repository or branch
-silently.
 
-Run the installer in my local terminal and leave its TUI interactive. I will
-enter and verify the provider API key locally, choose Wizard or AI, select
-WEB, CLI, API and any optional CLI TUI/toolboxes, choose the runtime and
-review the final selection. Never ask me to paste credentials into chat,
-print existing secrets, or start a scan.
+Ask which independent modules I want: BugTraceAI-WEB, BugTraceAI-CLI,
+BugTraceAI-API, or a combination. Install only the modules I choose. Let me
+choose Wizard or the built-in AI installer when my selection is supported;
+use Wizard for other combinations.
 
-Keep system password prompts in my terminal. Do not change runtime settings,
-delete data or overwrite existing configuration without asking me first.
-Resolve setup errors only when the cause and safe fix are clear; otherwise
-report the exact blocker and let me decide.
+Preserve any existing installation, configuration and data. Run the
+Launcher in my local interactive terminal. I will enter and verify the
+provider API key there, choose ports and review the plan before installation.
+Keep credentials out of chat and logs. Do not start a scan.
 
-After installation, verify the selected modules and their health endpoints,
-check btai and PATH if I enabled the global command, and report any check
-that could not be completed. Finish with the install location and the exact
-commands to open the installed products.
+Verify the selected services on their configured ports. If I enable the
+global btai command, check it from a fresh shell. Report the installation
+location, launch commands, checks completed and any checks still pending.
 ```
 
 ## AI-Assisted Installer
