@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-3.3.20-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.26-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
@@ -20,118 +20,17 @@
 
 Launcher version source of truth: [VERSION](VERSION)
 
-**v3.3.20**: give local API/MCP update checks up to 120 seconds for cold startup,
-and distinguish process exit from readiness timeout. The previous approximately
-30-second window could stop an API while its first embedding model was loading.
+The Launcher installs BugTraceAI-WEB, BugTraceAI-CLI and BugTraceAI-API as
+independent products or in any combination. Enter and verify a provider key,
+choose the standard Wizard or the built-in AI installer, select modules and
+ports, and review the plan before installing. Component `install.sh` entry
+points open this same TUI. Direct component installation remains available for
+scripts and coding agents.
 
-**v3.3.19**: make Docker status checks use cached sudo access when the current
-Linux login cannot access the Docker socket, and report permission errors
-instead of claiming running containers are missing.
-
-**v3.3.18**: show the terminal-workspace command after installation only when
-the selected profile installed a CLI interface that includes the TUI.
-
-**v3.3.17**: preserve the selected products, interface, runtime, global command
-and optional toolboxes when Linux restarts the wizard to apply Docker group
-membership. The installer resumes setup without repeating its selection menus.
-
-**v3.3.16**: coordinate the candidate manifest with CLI 4.0.31-beta, WEB
-2.0.32-beta and API 1.4.11-beta. These refs are backed up in the private
-component repositories; the public release remains unavailable until the
-curated component tags are published.
-
-**v3.3.15**: make combined WEB + API installs share the API-owned Docker network,
-and keep standalone WEB installs on their own network.
-
----
-
-One installation entry point for the BugTraceAI platform. Choose what you want
-to use; the launcher downloads the required repositories, selects interface
-dependencies, connects backends, configures ports and verifies the installation.
-Bare `install.sh` entry points in the ecosystem, CLI, WEB and API repositories
-open this same visual menu, suggesting the relevant profile without deploying
-it automatically. Direct component installation remains available through
-explicit standalone paths and documented options for developers and agents.
-
-**v3.3.12**: show runtime update failures as actionable messages without a
-Python traceback. Also pin the API engine to amd64 for its packaged tools, while CLI and
-WEB retain their native platform. Also report every unavailable component tag together before setup or
-updates, so users can see why a coordinated release is not ready.
-
-**v3.3.9**: respect the installer's choice to keep existing Docker containers;
-deployments now report a name conflict instead of silently deleting them.
-
-**v3.3.8**: keep version and health-response checks compatible with the Bash
-3.2 parser shipped by macOS.
-
-**v3.3.7**: install logs fall back to the user's state directory when the
-Launcher checkout is read-only, without printing a shell error or blocking the
-TUI. **v3.3.6**: component entry points verify the published Launcher's version
-and stop before running an incompatible older installer. **v3.3.5**: piped
-launches only reconnect to `/dev/tty` when stderr is attached to a terminal, and
-only clear the screen for terminal output. This avoids misleading `/dev/tty`
-errors and screen-control sequences over non-interactive SSH. **v3.3.4**:
-conflict checks run after profile/runtime selection, only cover
-selected Docker services, and preserve data volumes when removing containers.
-
-**v3.3.3**: update previews confirm that every selected release tag exists on
-the configured remotes before presenting a candidate as available. A missing
-or unreachable component tag stops the preview without touching the installation.
-
-**v3.3.2**: provider keys are optional during installation; generated API/CLI
-configuration contains no empty key assignment, and the summary explains how
-to configure credentials later. Press Enter at the provider-key prompt to
-continue; add the key locally before starting AI-powered scans. WEB + CLI now
-share the proxy network reliably, and health checks match the CLI and
-Kiterunner response formats, including the valid no-key CLI state.
-
-**v3.3.1**: detects missing Python `venv` support by creating a pip-ready test
-environment, so clean Ubuntu installs enable the visual Launcher instead of
-silently falling back to the legacy text wizard. Incomplete cached TUI
-environments are preserved and rebuilt safely.
-
-**v3.3.0**: fresh installs use one tagged release combination. The TUI previews
-updates, and the updater prepares all source/dependencies/images before switching.
-Local configuration and data volumes remain in place; failed activation has a
-recovery journal and previous source/runtime backups.
-
-**v3.2.2**: the universal Launcher is the only guided installer. Component
-entries delegate here; explicit runtime backends support direct agents and
-older automation without additional selection menus. API service management
-remains separate and preserves local configuration.
-
-**v3.2.0**: interactive purple/coral Textual TUI for selecting products,
-runtime and optional toolboxes; one profile catalog drives the TUI, standard
-installer and AI installer. The TUI dependency is pinned and isolated in the
-user cache. Updating an existing Launcher preserves local changes.
-
-**v3.1.0**: universal profiles shared by the standard and AI installers,
-automatic WEB backend selection, an independent API-target server, readable
-setup summaries, a preview command and repair of the saved selection.
-
-**v3.0.9**: honors explicit local overrides and saved Docker profiles, reads local logs without Docker, and retains reconfigured CLI profiles and platform inventory. Legacy CLI 3.x is rejected for TUI use.
-
-**v3.0.8**: preserves verified deployment state if global command registration fails and forwards TERM for installed Docker TUI profiles.
-
-**v3.0.7**: adds optional user-global `btai` registration after choosing interface and runtime, including full-platform TUI installs and AI setup. Saved choices survive updates and repairs.
-
-**v3.0.6**: standalone CLI installation now asks TUI / API + MCP / both, then local / Docker. The standard and AI entry points share the CLI installer; update and repair preserve saved choices. WEB deployments require API and may additionally include TUI.
-
-**v3.0.5**: adds `./launcher.sh tui`, preferring the active refactor checkout in a development workspace and otherwise opening the installed CLI container. Standard and AI installers accept explicit CLI repository/branch overrides.
-
-**v3.0.4**: fixes Compose build timeouts with options, preserves deployment inventory during partial repairs, tears down all selected Compose profiles before uninstalling, and validates service health and updater patches. CLI-only installs include their MCP service and port.
-
-**New in v3.0.0**: the installer validates every selected service before reporting success, installs BugTraceAI-API REST + MCP, keeps CLI MCP ownership in the CLI Compose project, repairs reconFTW Compose YAML safely on ARM and x86, starts CLI before WEB, and supports WEB+API without a local CLI. The AI assistant now configures and verifies BugTraceAI-API too.
-
-**v2.9.7**: the CLI startup no longer removes the standalone `bugtrace-api` container in Full/WEB deployments, and API REST/MCP ports cannot be selected twice. BugTraceAI-API's REST and MCP endpoints are shown separately during setup, after deployment, and in `status`; its Streamable HTTP MCP endpoint is also added to `mcp-config.json` as `bugtraceai-api`.
-
-**v2.9.5**: a reinstall now re-enters its newly-created target directory before cloning components, so an installation started from a replaced directory can continue through WEB, CLI, BugTraceAI-API, and optional agents. Interrupted installs now state that remaining components were not installed.
-
-**v2.9.4**: the standard installer labels the automatically included BugTraceAI-API in the Full and WEB deployment choices and in the selected-components summary. The **AI Setup & Repair Assistant** preserves the CLI/MCP ports and shared Docker network when it writes or repairs the CLI `.env`, so Launcher-managed deployments remain aligned with the WEB proxy and standalone CLI installations.
-
-**v2.9.0**: DeepSeek V4.1 Flash via OpenRouter with sticky Qwen 3.8 Max (0902) failover; one visible native `sudo` ticket (never stored); host-held API key; dynamic ports; Docker Engine bootstrap on Linux; reconFTW built from local source; Kali in a separate Compose step; `install.log` next to `launcher.sh`.
-
-> This repository is part of the [BugTraceAI](https://github.com/BugTraceAI/BugTraceAI) monorepo (as a git submodule) and also works as a standalone repo.
+[Install](#quick-start) · [Choose a profile](#universal-installation-profiles) ·
+[Manage services](#commands) · [Updates](#compatible-updates) ·
+[Install with your own agent](#installation-by-your-own-ai-agent) ·
+[Releases](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases)
 
 ## Quick Start
 
@@ -149,36 +48,63 @@ cd ~/bugtraceai-launcher
 ./launcher.sh
 ```
 
-The Launcher opens an interactive terminal UI. Choose a profile to see exactly
-which products and services it installs, then select the runtime and optional
-WEB toolboxes. `terminal`, `server`, and `terminal-server` support local Python
-or Docker; `web`, `full`, and `api` require Docker. The selected profile is
-passed to the installer once, so it does not ask you to choose the same
-interfaces again. The remaining setup prompts configure provider credentials,
-ports and deployment confirmation. The optional AI Setup & Repair Assistant is
-available from the TUI; it is not an extra question before the installer opens.
+The first screen asks you to choose a provider, enter its required API key and
+select **Verify and continue**. A failed check stays on this screen with a retry
+message. Changing the provider or key requires a new check. OpenRouter and
+Anthropic checks verify access without generating text; Z.ai uses a short test
+request, so provider usage may apply. A successful access check does not
+guarantee sufficient balance or model access for a complete scan.
+
+Next choose **Install with Wizard** or **Install with AI**. Both remain inside
+the TUI and use the same product checkbox form. WEB, CLI and the API-target
+engine are independent; only checked modules are installed. WEB-only can
+connect to external engines later. Enable the optional CLI TUI separately.
+Docker is the default; Advanced offers local Python for CLI-only selections.
+The provider key stays masked and is passed to installation in a private
+configuration file. Configure only the ports used by selected modules.
+reconFTW and Kali require WEB and CLI to both be selected.
+
+Review the selected products and confirm installation with your chosen method.
+Both stay inside the TUI: output and conversation appear in an embedded session,
+with a reply field for questions and native hidden credential/password prompts.
+Stop ends the child session; Back returns after it ends. The built-in AI
+installer uses provider model tokens and supports API-only or the full
+platform selection: WEB, CLI, API and the CLI TUI, with OpenRouter or
+Anthropic. Use the Wizard for every other combination and for Z.ai.
+Installation always requires the verified provider key; only AI-assisted
+setup makes model calls for its conversation. Update and AI repair are
+separate actions for existing installations.
 
 The TUI uses Python 3.10+ and installs pinned Textual into an isolated
 per-user cache. If the TUI runtime cannot start, the compatible text wizard
 remains available with `BUGTRACEAI_CLASSIC=1 ./launcher.sh`.
 
-Component entry points suggest `terminal` (CLI), `web` (WEB), `api`
-(API-target engine) or `full` (ecosystem). All profiles remain available in the
-menu. `BUGTRACEAI_LAUNCHER_INITIAL_PROFILE` changes only this initial highlight;
-it does not approve or start installation. The compatibility bootstrap has one
+Component entry points suggest their own starting selection: `terminal` for
+CLI, `web` for WEB, `api` for the API-target engine and `full` for all
+modules. In the TUI these are starting checkboxes, not separate installation
+questions. You can change the modules before review.
+`BUGTRACEAI_LAUNCHER_INITIAL_PROFILE` changes only the initial selection; it
+does not approve or start installation. The compatibility bootstrap has one
 source in [component-bootstrap.sh](component-bootstrap.sh).
 
 ## Requirements
 
 | Requirement            | Details                                                                                                   |
 | ---------------------- | --------------------------------------------------------------------------------------------------------- |
-| **OS**                 | Linux (x86_64) or macOS (Intel / Apple Silicon)                                                           |
+| **OS** | Linux amd64; Launcher startup checked on a clean Lubuntu VM. macOS and ARM remain unvalidated |
 | **Runtime** | Python 3.10+ for the Launcher TUI and local terminal/CLI-server installs; Docker + Compose for container profiles |
 | **Git**                | Any recent version                                                                                        |
 | **curl**               | For the one-liner installer                                                                               |
 | **RAM**                | 4 GB minimum (8 GB recommended)                                                                           |
 | **Disk**               | 10 GB free space                                                                                          |
-| **LLM provider key** | Configure through TUI/F7 or during platform setup                                   |
+| **Provider API key** | Required on the first setup screen and verified before installation; enter it locally |
+
+### Release validation
+
+The v3.3.26 automated Launcher suite passed with 399 tests and 25 subtests.
+A clean Lubuntu VM confirmed the TUI starts and rejects an invalid provider
+key. A complete module installation and a live scan were not performed in this
+release check.
 
 ### Auto-Installation (Linux)
 
@@ -215,17 +141,20 @@ xcode-select --install
 | Profile | What you get | Runtime |
 | --- | --- | --- |
 | `terminal` | CLI scanning engine with the visual terminal TUI | Local Python or Docker |
-| `web` | WEB dashboard/database plus CLI web-scanning API/MCP and BugTraceAI-API target engine | Docker |
+| `web` script preset | WEB dashboard/database plus CLI web-scanning API/MCP and BugTraceAI-API target engine | Docker |
 | `full` | WEB and both scanning engines, plus the CLI terminal TUI | Docker |
 | `server` | CLI web-scanning engine, exposed through API + MCP | Local Python or Docker |
 | `terminal-server` | CLI TUI + web-scanning API/MCP, without the WEB app | Local Python or Docker |
 | `api` | BugTraceAI-API engine for API-target testing, with REST + MCP | Docker |
 
 The **CLI web-scanning API/MCP** serves the CLI scanning engine.
-**BugTraceAI-API** is the separate engine for API-target scans. A WEB selection includes both so the
-browser workspace can use both scan types. Optional reconFTW/Kali tools are
-offered only for WEB profiles. BugStore is a separate practice target, not a
-required platform dependency.
+**BugTraceAI-API** is the separate engine for API-target scans. WEB can connect
+to either or both when they are selected. The interactive TUI's `web`
+suggestion checks WEB only; `full` checks WEB, CLI, API and the CLI TUI.
+The command-line `web` script preset remains a bundled selection of WEB plus
+both scanning engines for compatibility. Prefer the TUI to select independent
+modules. Optional reconFTW/Kali tools require WEB and CLI. BugStore is a
+separate practice target, not a required platform dependency.
 
 Preview a selection without downloads, installation or starting services:
 
@@ -258,6 +187,19 @@ provider/database credentials. If saved configuration is missing, repair stops
 and reports it instead of inventing defaults. Old WEB-only/CLI profiles remain
 supported for update, repair and service management.
 
+### Independent checkbox selections
+
+| Checked modules | Installed products | Runtime |
+| --- | --- | --- |
+| WEB only | Dashboard and database; connect external engines later | Docker |
+| CLI only | Web-scanning engine, REST/MCP and optional terminal TUI | Docker or local Python |
+| API only | API-target scanner, REST/MCP | Docker |
+| Any combination including WEB or API | Exactly the checked modules | Docker |
+
+You can edit the TUI's starting selection before review. The checkbox form
+also supports combinations such as `web-only`, `web-cli`, `web-api` and
+`engines`.
+
 ## Compatible updates
 
 The Launcher uses one tagged combination of CLI, WEB and API-target versions.
@@ -289,7 +231,10 @@ See [Compatible updates](#compatible-updates) for update and recovery guidance.
 ./launcher.sh help         # Show usage
 ```
 
-> No `sudo` required. On Linux, your user needs Docker permissions (`sudo usermod -aG docker $USER`). On macOS, the launcher can bootstrap either Docker Desktop or Colima.
+Run the Launcher as your normal user. Linux setup may request `sudo` locally
+to install system dependencies or prepare Docker access. The first TUI screen
+requires a provider API key and verifies access before offering installation
+methods. Enter keys in the local terminal, never in a chat prompt.
 
 ## Architecture
 
@@ -351,7 +296,7 @@ The launcher installs the platform to:
 │   └── .env.docker               ← generated config (ports, DB password, CLI URL)
 ├── BugTraceAI-CLI/               ← cloned repo (if CLI selected)
 │   └── .env                      ← generated config (API key, CORS origins)
-├── BugTraceAI-API/               ← cloned repo (if WEB selected)
+├── BugTraceAI-API/               ← cloned repo (if API or WEB selected)
 │   └── .env                      ← generated provider configuration
 └── .launcher-state               ← JSON with deployment mode, ports, version
 ```
@@ -378,7 +323,7 @@ BUGTRACEAI_DIR=/srv/bugtraceai ./launcher.sh
 
 | Variable                | Description                                                                     |
 | ----------------------- | ------------------------------------------------------------------------------- |
-| `OPENROUTER_API_KEY`    | Your OpenRouter API key                                                         |
+| Provider-specific key | The verified OpenRouter, Anthropic or Z.ai key selected in the Launcher |
 | `BUGTRACE_CORS_ORIGINS` | Allowed origins (`*` in Standalone CLI, `http://localhost:<port>` in Full mode) |
 
 After editing configs, restart for changes to take effect:
@@ -387,14 +332,6 @@ After editing configs, restart for changes to take effect:
 nano ~/bugtraceai/BugTraceAI-CLI/.env
 ./launcher.sh restart
 ```
-
-## Updating
-
-```bash
-./launcher.sh update
-```
-
-Pulls the latest code from both repos and rebuilds Docker images. The CLI's `docker-compose.yml` is re-patched automatically after pulling.
 
 ## Uninstalling
 
@@ -419,7 +356,10 @@ docker ps -a | grep bugtraceai     # Raw container status
 
 **Port conflicts:** The wizard auto-detects occupied ports. You can type a custom port number (1024-65535) when prompted, or press `n` to cycle to the next available one.
 
-**API key issues:** Verify your key at [openrouter.ai/keys](https://openrouter.ai/keys). It should start with `sk-or-`. The wizard warns you if it doesn't match this pattern but lets you continue anyway.
+**Provider key issues:** Check that the selected provider matches the key.
+The first screen requires a valid key and offers a retry after a failed check.
+OpenRouter and Anthropic checks do not generate text; Z.ai makes a short test
+request that may incur provider usage.
 
 **Permission issues (Linux):** Your user needs Docker permissions. Run `sudo usermod -aG docker $USER` and re-login.
 
@@ -467,75 +407,17 @@ docker logs --tail 200 kali-mcp-server
 
 **Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (compatible release + verification).
 
-## How the Install Script Works
-
-The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the interactive wizard, which:
-
-1. **Bootstraps dependencies**: Git/curl first, then clones or updates the Launcher
-2. **Opens the universal TUI**: select Terminal, WEB, both workspaces or a scanning server and review included products
-3. **Selects runtime and optional tools**: local Python or Docker where supported; recon/Kali are explicit WEB add-ons
-4. **Prepares the runtime**: Local Python or Docker as supported by the profile
-5. **Configures**: Provider, ports and optional global command for the chosen interfaces
-6. **Deploys**: Clones repos, builds Docker images, starts services, runs health checks
-
-## AI-Assisted Installer
-
-BugTraceAI Launcher includes an optional **AI Setup & Repair Assistant** (`ai_installer.py`) powered by **DeepSeek V4.1 Flash**, with an automatic sticky fallback to **Qwen 3.8 Max (0902)** (both via OpenRouter). A fresh target defaults to a Full install; an existing or partial target defaults to repair/diagnosis first. The assistant only asks when a real decision is needed, such as confirming a destructive reinstall. The API key is entered hidden only if no private local CLI configuration exists, destructive commands require confirmation, and the assistant can autonomously:
-
-- Analyze your system configuration and error logs
-- Diagnose Docker, network, port, or dependency issues
-- Propose and apply fixes interactively
-- Guide you through complex deployment scenarios (VM hosts, non-standard environments)
-
-The AI mode starts only after you select it in the TUI. It then opens the operating system's normal `sudo` prompt once, keeping only sudo's temporary ticket for the running launcher; the password is never stored in Python, a shell variable, or the model context. If no locally saved key is available, it asks for and validates your OpenRouter API key before starting the agent. The key is never inserted into the system prompt: dedicated host tools write it directly to the private CLI configuration.
-
-For AI-managed fresh installs, host ports are allocated dynamically and then verified from Docker's published mappings. The WEB proxy is wired to the resolved CLI endpoint by the host tool, not by asking the model to guess a port. Every successful command/tool result immediately triggers the next model turn; after verification passes, the same loop remains available for support and repairs.
-
-### How to invoke
-
-The TUI exposes AI setup and repair alongside the standard universal installer:
-
-```bash
-cd ~/bugtraceai-launcher
-./launcher.sh
-```
-
-### Requirements
-
-- **Python 3.8+** (usually already present)
-- Your **OpenRouter API key** (the same one used for BugTraceAI)
-- Internet access to reach the OpenRouter API
-
-> The AI installer uses DeepSeek V4.1 Flash (falling back to Qwen 3.8 Max (0902)) through OpenRouter. You can override either model with `BTAI_INSTALLER_MODEL` and `BTAI_INSTALLER_FALLBACK_MODEL`; use `BTAI_INSTALLER_ACTION`, `BTAI_INSTALLER_MODE`, or `BTAI_INSTALLER_PROVIDER` only when you need to override the safe detected defaults. It is experimental and can run commands after you opt in, so review the terminal output and use the standard wizard if you prefer fully manual control.
-
-## License
-
-The BugTraceAI-owned portions of this distribution are licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [LICENSE-HISTORY.md](LICENSE-HISTORY.md).
-
-## Links
-
-- **Website**: [bugtraceai.com](https://bugtraceai.com)
-- **GitHub**: [github.com/BugTraceAI](https://github.com/BugTraceAI)
-- **Issues**: [GitHub Issues](https://github.com/BugTraceAI/BugTraceAI-Launcher/issues)
-
----
-
-<p align="center">
-  Made with care by Albert C. <a href="https://x.com/yz9yt">@yz9yt</a><br/>
-  <a href="https://bugtraceai.com">bugtraceai.com</a>
-</p>
-
 ## CLI 4.x terminal workspace
 
-Use `./launcher.sh` and choose the **CLI terminal TUI**, **WEB dashboard +
-engines**, **WEB + CLI TUI**, **CLI web-scan API/MCP**, **CLI TUI + web-scan API**, or
-**API-target server** profile. The universal menu already selects the
-interfaces and includes the required engines.
+Use `./launcher.sh` to enter the provider key, choose Wizard or AI, and select
+the CLI terminal TUI, WEB dashboard, CLI web-scanning API/MCP and API-target
+engine independently. The `full` preset checks all products and the terminal
+TUI; you can change its checkboxes before review.
 `setup-cli` remains available for existing standalone installation scripts.
 Local TUI installations do not require a
 Docker runtime; some scanning tools still use Docker. TUI-only Docker opens an
-interactive scanner without publishing server ports. Full WEB deployments use
-Docker and require the CLI API; their wizard offers API only or API + TUI.
+interactive scanner without publishing server ports. Any selection containing
+WEB or the API-target engine uses Docker.
 
 For TUI/both, setup also offers the user-global **btai** command on macOS/Linux.
 Open a new terminal and run `btai` from any folder. Registration uses
@@ -578,48 +460,67 @@ Standalone setup and global registration require the CLI 4.0.14+ installer.
 
 ### Installation by your own AI agent
 
-Copy this prompt into your coding agent with terminal access. It uses the
-universal Launcher and defaults to a local terminal workspace plus `btai`.
-Change the first line to request a different profile. The current coordinated
-release requires Launcher 3.3.16+; component entry points require 3.3.14+.
+Copy this prompt into Codex, Claude Code, Cursor or another coding agent with
+access to your local terminal. The Launcher stays interactive so you can
+choose the products, provider and installation method yourself.
 
 ```text
-Install BugTraceAI through the universal Launcher: terminal profile,
-local Python, with the user-global btai command. Perform the installation.
+Install BugTraceAI using the official universal Launcher.
 
-Read the Launcher README and help at
-https://github.com/BugTraceAI/BugTraceAI-Launcher.git. The current coordinated
-release requires Launcher 3.3.16 or newer; component entry points require
-3.3.14 or newer. Clone into a suitable user-owned directory.
-If an installation exists, preserve its configuration, credentials and
-uncommitted changes. Use ./launcher.sh update or ./launcher.sh repair with
-its saved selection unless I request a profile change. Do not replace an
-existing checkout or switch its repository or branch silently.
+Read the Launcher README first. Use the public installer:
+https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh
+If the Launcher is already installed, preserve its files and configuration;
+do not replace an existing checkout or switch its repository or branch
+silently.
 
-For a fresh local TUI installation, review and then install:
-./launcher.sh plan --profile terminal --runtime local --global yes
-./launcher.sh install --profile terminal --runtime local --global yes
+Run the installer in my local terminal and leave its TUI interactive. I will
+enter and verify the provider API key locally, choose Wizard or AI, select
+WEB, CLI, API and any optional CLI TUI/toolboxes, choose the runtime and
+review the final selection. Never ask me to paste credentials into chat,
+print existing secrets, or start a scan.
 
-If I request WEB, use --profile web; WEB + TUI uses --profile full.
-A headless web-scanning engine uses --profile server. TUI + CLI API/MCP
-without WEB uses --profile terminal-server. API-target testing uses
---profile api. Local Python is supported for terminal, server and
-terminal-server; WEB/full/api profiles use Docker. Install only the
-requested components and let the launcher connect their dependencies.
+Keep system password prompts in my terminal. Do not change runtime settings,
+delete data or overwrite existing configuration without asking me first.
+Resolve setup errors only when the cause and safe fix are clear; otherwise
+report the exact blocker and let me decide.
 
-Handle the required prompts and resolve setup errors using the repository
-instructions. Keep system privilege/password prompts in my local terminal.
-Do not change the runtime without asking. I will configure the LLM key
-later through Provider/F7 for a terminal-only install. Never ask me to paste
-credentials into chat or print existing secrets. Auth/F8 configures target
-login separately. Platform setup can request its provider key locally.
-
-Verify the version, saved profile and installed components. For TUI, verify
-startup and quit in an interactive terminal when available; otherwise state
-that visual verification is pending. Check btai registration and PATH in a
-fresh shell. For servers, check health and MCP on the actual configured
-ports. Do not start a scan as part of installation.
-
-Finish with the installation directory, selected profile, checks performed
-and exact commands to open the installed interfaces.
+After installation, verify the selected modules and their health endpoints,
+check btai and PATH if I enabled the global command, and report any check
+that could not be completed. Finish with the install location and the exact
+commands to open the installed products.
 ```
+
+## AI-Assisted Installer
+
+The built-in **Install with AI** choice is an installation assistant inside the
+Launcher TUI. It is separate from the coding-agent prompt above and from
+**Repair / diagnose** for an existing installation.
+
+Enter and verify the required provider key first, then choose Install with AI
+and check the modules you want. The assistant uses OpenRouter or Anthropic
+model calls, which can incur usage charges. It currently supports an
+API-only install or the full platform selection: WEB, CLI, API and the CLI TUI.
+Use **Install with Wizard** for WEB-only, CLI-only, other combinations and
+Z.ai. The Wizard
+supports all available module combinations.
+
+AI-assisted installation runs inside the TUI, uses the reviewed selection and
+does not start a scan. The provider key is entered locally and stays masked;
+the assistant does not ask you to put the secret into the conversation.
+
+## License
+
+The BugTraceAI-owned portions of this distribution are licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [LICENSE-HISTORY.md](LICENSE-HISTORY.md).
+
+## Links
+
+- **Website**: [bugtraceai.com](https://bugtraceai.com)
+- **GitHub**: [github.com/BugTraceAI](https://github.com/BugTraceAI)
+- **Issues**: [GitHub Issues](https://github.com/BugTraceAI/BugTraceAI-Launcher/issues)
+
+---
+
+<p align="center">
+  Made with care by Albert C. <a href="https://x.com/yz9yt">@yz9yt</a><br/>
+  <a href="https://bugtraceai.com">bugtraceai.com</a>
+</p>

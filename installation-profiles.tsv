@@ -4,3 +4,9 @@ full|WEB + CLI TUI|WEB dashboard, both scanning engines, and the CLI terminal TU
 server|CLI web-scan API/MCP|Headless BugTraceAI-CLI web-scanning server for integrations and agents; no terminal UI.|cli|api|false|true|false
 terminal-server|CLI TUI + web-scan API|BugTraceAI-CLI terminal TUI and headless web-scanning API/MCP, without WEB.|cli|both|false|true|false
 api|API-target server|Standalone BugTraceAI-API engine for API security scans, exposed over REST + MCP.|api|api|false|false|true
+web-only|WEB standalone|Independent WEB dashboard and database. Connect scanning engines separately when needed.|full|api|true|false|false
+web-cli|WEB + CLI|WEB and the web-scanning CLI engine, without the API-target engine.|full|api|true|true|false
+web-cli-tui|WEB + CLI terminal|WEB and CLI REST/MCP plus the terminal workspace, without the API-target engine.|full|both|true|true|false
+web-api|WEB + API|WEB and the API-target engine, without the CLI web-scanning engine.|full|api|true|false|true
+engines|CLI + API|Independent web-scanning and API-target servers, without WEB.|full|api|false|true|true
+engines-tui|CLI terminal + API|CLI terminal and REST/MCP plus the independent API-target engine, without WEB.|full|both|false|true|true

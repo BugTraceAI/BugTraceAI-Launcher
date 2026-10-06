@@ -75,6 +75,7 @@ THINKING = "The AI is thinking" if _UTF8_ENABLED else "The AI is thinking"
 # explicitly on every exit/interrupt path, or a long `docker compose up --build`
 # would be orphaned and keep running after the installer quits.
 _bash = None
+_verification_completed = False
 _privilege_session: Optional[PrivilegeSession] = None
 
 
@@ -423,12 +424,13 @@ def _ensure_readline():
         _readline_ready = False
 
 
-def _read_line(prompt=""):
+def _read_line(prompt="", eof_cancel=False):
     _restore_cooked_tty()
     _ensure_readline()
     try:
         return input(wrap_readline_prompt(prompt) if prompt else "")
     except EOFError:
+        if eof_cancel: raise SystemExit(1)
         return ""
 
 
@@ -453,13 +455,13 @@ def _ask_menu(title, options, default=0):
         marker = f"  {DIM}(default){RESET}" if i - 1 == default else ""
         print(f"  {CYAN}{i}){RESET} {option}{marker}")
     print()
-    raw = _read_line(f"{YELLOW}  Option [1-{len(options)}]: {RESET}").strip()
-    if not raw:
-        return default
-    if raw.isdigit() and 1 <= int(raw) <= len(options):
-        return int(raw) - 1
-    info(f"Invalid option; using default ({default + 1}).")
-    return default
+    while True:
+        raw = _read_line(f"{YELLOW}  Option [1-{len(options)}]: {RESET}", eof_cancel=True).strip()
+        if not raw:
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        info(f"Invalid option. Enter a number from 1 to {len(options)}.")
 
 
 def _env_choice(name, allowed):
@@ -472,7 +474,7 @@ def _has_existing_target():
         return True
     return any(
         os.path.isdir(os.path.join(INSTALL_DIR, name))
-        for name in ("BugTraceAI-CLI", "BugTraceAI-WEB")
+        for name in ("BugTraceAI-CLI", "BugTraceAI-WEB", "BugTraceAI-API")
     )
 
 
@@ -509,27 +511,39 @@ def _choose_action(existing):
 
 
 def _choose_mode(action):
-    env = _env_choice("BTAI_INSTALLER_MODE", ("full", "cli", "web", "api"))
-    if env:
-        return env
     if action != 'repair':
         catalog = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'installation-profiles.tsv')
         with open(catalog, encoding='utf-8') as handle:
             profiles = core.parse_install_profiles(handle.read())
         requested = os.environ.get('BUGTRACEAI_PROFILE', '')
-        if requested:
-            profile = next((item for item in profiles if item.key == requested), None)
-            if profile is None:
-                raise ValueError('Unknown installation profile: ' + requested)
-        else:
-            idx = _ask_menu('What do you want to use? Required components are included.',
-                            tuple(f'{item.label} - {item.description}' for item in profiles), default=2)
-            profile = profiles[idx]
-            os.environ['BUGTRACEAI_PROFILE'] = profile.key
+        if not requested:
+            env = _env_choice("BTAI_INSTALLER_MODE", ("full", "cli", "web", "api"))
+            if env:
+                return env
+            group = _ask_menu("Step 1: How do you want to use BugTraceAI?",
+                              ("Terminal", "WEB browser", "Both browser and terminal", "Server / integrations"), default=0)
+            if group == 0:
+                expose = _ask_menu("Expose the terminal engine through REST / MCP too?",
+                                   ("No, terminal only", "Yes, terminal and server"), default=0)
+                requested = 'terminal-server' if expose else 'terminal'
+            elif group == 3:
+                engine = _ask_menu("Which targets will the server scan?",
+                                   ("Web applications (BugTraceAI-CLI)", "APIs (BugTraceAI-API)"), default=0)
+                requested = 'api' if engine else 'server'
+            else:
+                requested = 'web-only' if group == 1 else 'web-cli-tui'
+        profile = next((item for item in profiles if item.key == requested), None)
+        if profile is None:
+            raise ValueError('Unknown installation profile: ' + requested)
+        os.environ['BUGTRACEAI_PROFILE'] = profile.key
+        info("Selected installation: " + profile.label)
         return profile.mode
     saved = _read_launcher_state(INSTALL_DIR)
-    if saved.get('mode') == 'api':
+    if not saved and os.path.isdir(os.path.join(INSTALL_DIR, 'BugTraceAI-API')) and not any(
+            os.path.isdir(os.path.join(INSTALL_DIR, name)) for name in ('BugTraceAI-CLI','BugTraceAI-WEB')):
         return 'api'
+    if saved.get('mode') in ('api', 'cli', 'web', 'full'):
+        return saved['mode']
     title = ("Which part do you want to review?"
              if action == "repair" else "What do you want to install?")
     idx = _ask_menu(
@@ -565,7 +579,7 @@ def _choose_mcp(mode):
             "Add reconFTW MCP (OSINT & subdomains by @six2dez)",
             "NONE (only BugTraceAI core components)",
         ),
-        default=0,
+        default=3,
     )
     recon = idx in (0, 2)
     kali = idx in (0, 1)
@@ -835,6 +849,12 @@ def _resolve_deployment_context():
         btai=_as_port(state.get("btai_port")) or _as_port(btai_env.get("API_PORT")),
         btai_mcp=_as_port(state.get("btai_mcp_port")) or _as_port(btai_env.get("MCP_PORT")),
     )
+    if os.environ.get('BTAI_SETUP_CONFIG') and os.environ.get('BTAI_INSTALLER_ACTION') == 'install':
+        from setup_form import load_config
+        from dataclasses import replace
+        configured=load_config(os.environ['BTAI_SETUP_CONFIG'])['ports']
+        names={'WEB_PORT':'web','CLI_PORT':'cli','MCP_PORT':'mcp','BTAI_PORT':'btai','BTAI_MCP_PORT':'btai_mcp'}
+        ports=replace(ports,**{names[k]:v for k,v in configured.items()})
     context = DeploymentContext(
         install_dir=INSTALL_DIR,
         mode=mode,
@@ -1340,26 +1360,86 @@ def _boot():
 
     # Resolve standalone CLI scope before sudo, Docker or an assistant API key.
     _existing_target = _has_existing_target()
+    form_config = None
+    if os.environ.get('BTAI_SETUP_CONFIG'):
+        from setup_form import load_config
+        form_config = load_config(os.environ['BTAI_SETUP_CONFIG'])
+        if not os.environ.get('BUGTRACEAI_PROFILE'):
+            os.environ['BUGTRACEAI_PROFILE'] = form_config['profile']
+        for key, field in [('BTAI_INSTALLER_RUNTIME','runtime'),('BTAI_INSTALLER_GLOBAL','global')]:
+            os.environ[key] = form_config[field]
+        os.environ['BTAI_INSTALLER_MCP_RECON']=str(form_config['recon']).lower()
+        os.environ['BTAI_INSTALLER_MCP_KALI']=str(form_config['kali']).lower()
+        if form_config['provider'] in ('openrouter','anthropic'):
+            os.environ['BTAI_INSTALLER_PROVIDER']=form_config['provider']
     setup_action = _choose_action(_existing_target)
     install_mode = _choose_mode(setup_action)
     saved_state = _read_launcher_state(INSTALL_DIR)
+    profile_key = os.environ.get('BUGTRACEAI_PROFILE','') if setup_action != 'repair' else saved_state.get('install_profile','')
+    if profile_key and profile_key not in ('terminal','terminal-server','server','web','full','api'):
+        # The model playbook still describes bundled topologies. Never let it
+        # install unselected modules for an independent combination.
+        command=['bash',os.path.join(os.path.dirname(os.path.abspath(__file__)),'launcher.sh')]
+        if setup_action == 'repair': command.append('repair')
+        else:
+            command += ['install','--profile',profile_key,'--runtime','docker','--global',
+                        _env_choice('BTAI_INSTALLER_GLOBAL',('yes','no')) or 'no']
+        info('Using standard setup/repair for this independent combination; no assistant credits required.')
+        sys.exit(subprocess.run(command,check=False).returncode)
     if install_mode == "cli" and (setup_action != "repair" or saved_state.get("cli_managed")):
         command = ["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh"), "setup-cli"]
         if setup_action == "repair":
             command.append("--reuse")
+        if setup_action != "repair":
+            runtime = _env_choice("BTAI_INSTALLER_RUNTIME", ("local", "docker"))
+            if runtime:
+                command = ["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)), "launcher.sh"),
+                           "install", "--profile", os.environ.get("BUGTRACEAI_PROFILE", "terminal"),
+                           "--runtime", runtime, "--global",
+                           _env_choice("BTAI_INSTALLER_GLOBAL", ("yes", "no")) or "no"]
+            info("Terminal/server profile: using the standard installer; no assistant key or AI credits required.")
         result = subprocess.run(command, check=False)
         sys.exit(result.returncode)
+
+    cli_interface = saved_state.get("cli_interface", "api")
+    selected_profile = os.environ.get('BUGTRACEAI_PROFILE', '')
+    if setup_action != 'repair' and selected_profile in ('web', 'full'):
+        cli_interface = 'both' if selected_profile == 'full' else 'api'
+    elif setup_action != "repair" and install_mode == "full":
+        cli_interface = ("api", "both")[_ask_menu(
+            "WEB needs the CLI API. Include the TUI too?",
+            ("API server + MCP", "Both API and TUI"), default=0)]
+    cli_global = "yes" if saved_state.get("cli_global") == "yes" else "no"
+    requested_global = _env_choice("BTAI_INSTALLER_GLOBAL", ("yes", "no"))
+    if setup_action != "repair" and requested_global:
+        cli_global = requested_global if cli_interface == "both" else "no"
+    elif setup_action != "repair" and cli_interface == "both":
+        cli_global = ("yes", "no")[_ask_menu(
+            "Install global btai to open the TUI from any folder?",
+            ("Yes (current user, no sudo)", "No"), default=0)]
+    if setup_action == "repair" and saved_state:
+        mcp_cli_enabled = saved_state.get("mcp_cli_enabled", install_mode in ("full", "cli"))
+        mcp_recon_enabled = saved_state.get("mcp_recon_enabled", False)
+        mcp_kali_enabled = saved_state.get("mcp_kali_enabled", False)
+    else:
+        mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
+    ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
+    if mcp_recon_enabled or mcp_kali_enabled:
+        extras = []
+        if mcp_recon_enabled:
+            extras.append("reconFTW")
+        if mcp_kali_enabled:
+            extras.append("Kali")
+        ok("Extras: " + " + ".join(extras))
+    elif install_mode != "cli":
+        ok("Extras: none")
+
+    info("Install directory: " + INSTALL_DIR)
+    info("Runtime: Docker" + "  ·  Global btai: " + cli_global)
 
     # Privilege is intentionally acquired through the native terminal prompt.  We
     # retain no password: sudo owns a temporary ticket, refreshed only while this
     # process lives and explicitly invalidated on exit.
-    _privilege_session = PrivilegeSession()
-    info("Authenticate once with sudo if required; its native prompt will appear below.")
-    if not _privilege_session.authenticate():
-        err("Sudo access is required to continue.")
-        sys.exit(1)
-    ok("Temporary sudo session is active for this launcher only.")
-
     _REEXECED_DOCKER_GROUP = os.environ.get("BTAI_DOCKER_GROUP_REEXEC") == "1"
 
     # Disclaimer (skip on the sg docker re-exec — already confirmed).
@@ -1375,6 +1455,13 @@ def _boot():
             sys.exit(0)
     else:
         ok("Docker group is active in this session.")
+
+    _privilege_session = PrivilegeSession()
+    info("Authenticate once with sudo if required; its native prompt will appear below.")
+    if not _privilege_session.authenticate():
+        err("Sudo access is required to continue.")
+        sys.exit(1)
+    ok("Temporary sudo session is active for this launcher only.")
 
     if sys.platform != "darwin" and not _docker_info_ok():
         info("Docker Engine is not ready; installing or starting it...")
@@ -1397,7 +1484,8 @@ def _boot():
     _chain_label = " -> ".join(core.model_display_name(model) for model in MODEL_CHAIN)
     ok(f"Provider: {_provider_name}  {DOT}  Models: {_chain_label}")
 
-    api_key = _load_saved_api_key(INSTALL_DIR, PROVIDER)
+    api_key = (form_config.get('api_key','') if form_config and form_config['provider'] == PROVIDER else '')
+    api_key = api_key or _load_saved_api_key(INSTALL_DIR, PROVIDER)
     if api_key:
         ok(f"Using the locally saved API key: {core.mask_secret(api_key, mask_width=8)}")
     else:
@@ -1423,31 +1511,6 @@ def _boot():
         sys.exit(1)
     ok(f"API key validated: {core.mask_secret(api_key, mask_width=8)}")
     hr()
-
-    cli_interface = saved_state.get("cli_interface", "api")
-    selected_profile = os.environ.get('BUGTRACEAI_PROFILE', '')
-    if setup_action != 'repair' and selected_profile in ('web', 'full'):
-        cli_interface = 'both' if selected_profile == 'full' else 'api'
-    elif setup_action != "repair" and install_mode == "full":
-        cli_interface = ("api", "both")[_ask_menu(
-            "WEB needs the CLI API. Include the TUI too?",
-            ("API server + MCP", "Both API and TUI"), default=0)]
-    cli_global = "yes" if saved_state.get("cli_global") == "yes" else "no"
-    if setup_action != "repair" and cli_interface == "both":
-        cli_global = ("yes", "no")[_ask_menu(
-            "Install global btai to open the TUI from any folder?",
-            ("Yes (current user, no sudo)", "No"), default=0)]
-    mcp_cli_enabled, mcp_recon_enabled, mcp_kali_enabled = _choose_mcp(install_mode)
-    ok(f"Mode: {setup_action}  {DOT}  scope: {install_mode}")
-    if mcp_recon_enabled or mcp_kali_enabled:
-        extras = []
-        if mcp_recon_enabled:
-            extras.append("reconFTW")
-        if mcp_kali_enabled:
-            extras.append("Kali")
-        ok("Extras: " + " + ".join(extras))
-    elif install_mode != "cli":
-        ok("Extras: none")
 
     os.environ["BTAI_INSTALLER_MODE"] = install_mode
     os.environ["BTAI_INSTALLER_PROVIDER"] = PROVIDER
@@ -1872,7 +1935,7 @@ def _protocol_error(tc, description):
 
 
 def _finish_tool(tc, args):
-    global deployment_context
+    global deployment_context, _verification_completed
     summary = args.get("summary", "")
     if not isinstance(summary, str):
         return _protocol_error(tc, "'summary' must be a string.")
@@ -1912,6 +1975,7 @@ def _finish_tool(tc, args):
         if result.returncode:
             return ToolOutcome(_tool_result(tc.id, tc.name,
                 "Services verified but btai registration failed. Fix it and call finish again."))
+    _verification_completed = True
     _log_event("OK", "verification passed")
     if summary.strip():
         bubble_ai(summary)
@@ -2009,7 +2073,8 @@ def _report_turn_limit(limit):
 
 
 def main():
-    global _bash
+    global _bash, _verification_completed
+    _verification_completed = False
     atexit.register(_terminate_bash)
     atexit.register(_cleanup_terminal)
     atexit.register(_close_privilege_session)
@@ -2043,7 +2108,7 @@ def main():
         if answer.lower() in _EXIT_ANSWERS:
             print(f"\n{CYAN}  Done. See you later.{RESET}\n")
             _close_persistent_shell()
-            sys.exit(0)
+            return 0 if _verification_completed else 130
         if answer:
             bubble_user(answer)
             messages.append({"role": "user", "content": answer})
@@ -2073,7 +2138,10 @@ def main():
                 _report_turn_limit(SUPPORT_TURNS)
 
     _close_persistent_shell()
+    if _verification_completed:
+        return 0
+    return 1 if outcome == LoopOutcome.ERROR else 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
