@@ -130,7 +130,7 @@ ensure_homebrew() {
 ensure_basic_tools() {
     local missing=()
     local cmd
-    for cmd in git curl; do
+    for cmd in git curl python3; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -183,15 +183,64 @@ ensure_basic_tools() {
     return 1
 }
 
+python_venv_usable() {
+    local python_bin="${1:-python3}" probe_dir status=1
+    command -v "$python_bin" >/dev/null 2>&1 || return 1
+    probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/bugtraceai-venv-check.XXXXXX")" || return 1
+    if "$python_bin" -m venv "$probe_dir/env" >/dev/null 2>&1 && \
+       "$probe_dir/env/bin/python" -m pip --version >/dev/null 2>&1; then
+        status=0
+    fi
+    rm -rf -- "$probe_dir"
+    return "$status"
+}
+
+ensure_python_venv() {
+    if python_venv_usable python3; then
+        return 0
+    fi
+    warn "Python cannot create a pip-ready virtual environment; installing the OS package needed for the Launcher TUI."
+    if command -v apt-get >/dev/null 2>&1; then
+        run_privileged apt-get update -qq
+        run_privileged apt-get install -y python3-venv
+    elif command -v dnf >/dev/null 2>&1; then
+        run_privileged dnf install -y python3
+    elif command -v yum >/dev/null 2>&1; then
+        run_privileged yum install -y python3
+    elif command -v pacman >/dev/null 2>&1; then
+        run_privileged pacman -Syu --noconfirm python
+    elif command -v zypper >/dev/null 2>&1; then
+        run_privileged zypper install -y python3 python3-venv
+    elif $IS_MACOS; then
+        local brew_bin
+        brew_bin="$(ensure_homebrew)" || return 1
+        run_as_target "$brew_bin" install python
+    else
+        error "Install Python 3.10+ with venv support before using the visual Launcher."
+        return 1
+    fi
+    python_venv_usable python3 || {
+        error "Python still cannot create a pip-ready virtual environment. Install python3-venv and retry."
+        return 1
+    }
+}
+
 install_or_update_launcher() {
     if [[ -d "$LAUNCHER_DIR/.git" ]]; then
         info "Launcher already exists at $LAUNCHER_DIR, updating..."
+        local dirty
+        dirty="$(run_as_target git -C "$LAUNCHER_DIR" status --porcelain --untracked-files=all 2>/dev/null || true)"
+        if [[ -n "$dirty" ]]; then
+            warn "Launcher checkout has local changes; keeping them and skipping the automatic update."
+            warn "Commit or move those changes before updating this checkout."
+            return 0
+        fi
         if run_as_target git -C "$LAUNCHER_DIR" fetch --depth 1 origin main --quiet && \
-           run_as_target git -C "$LAUNCHER_DIR" reset --hard FETCH_HEAD --quiet; then
+           run_as_target git -C "$LAUNCHER_DIR" merge --ff-only FETCH_HEAD --quiet; then
             return 0
         fi
 
-        warn "Could not refresh launcher repo automatically; using existing checkout."
+        warn "Could not fast-forward the Launcher safely; using the existing checkout."
         return 0
     fi
 
@@ -208,33 +257,11 @@ fix_permissions_if_needed() {
 
 launch_wizard() {
     chmod +x "$LAUNCHER_DIR/launcher.sh"
-
-    local use_ai="N"
-
-    if command -v python3 >/dev/null 2>&1 && [[ -f "$LAUNCHER_DIR/ai_installer.py" ]]; then
-        chmod +x "$LAUNCHER_DIR/ai_installer.py"
-
-        echo ""
-        echo -e "${YELLOW}${BOLD}Try the AI Setup & Repair Assistant (Experimental — installs & troubleshoots)? [y/N]${NC}"
-        if [[ -t 0 ]]; then
-            read -rp ">> " use_ai
-        elif [[ -c /dev/tty ]]; then
-            read -rp ">> " use_ai </dev/tty
-        else
-            warn "No interactive TTY available; using standard installer."
-            use_ai="N"
-        fi
-    else
-        info "Python3 or AI installer not found; using standard installer..."
-    fi
-
-    if [[ "${use_ai:-}" =~ ^[Yy]$ ]]; then
-        info "Starting AI Setup & Repair Assistant (DeepSeek V4.1 Flash · Qwen 3.8 Max fallback)..."
-        exec_as_target python3 "$LAUNCHER_DIR/ai_installer.py"
-    else
-        info "Starting BugTraceAI standard setup wizard..."
-        exec_as_target env BUGTRACEAI_SKIP_AI_PROMPT=1 "$LAUNCHER_DIR/launcher.sh"
-    fi
+    chmod +x "$LAUNCHER_DIR/ai_installer.py"
+    info "Starting the BugTraceAI visual setup. The AI repair assistant is available from its menu."
+    exec_as_target env BUGTRACEAI_SKIP_AI_PROMPT=1 \
+        BUGTRACEAI_LAUNCHER_INITIAL_PROFILE="${BUGTRACEAI_LAUNCHER_INITIAL_PROFILE:-}" \
+        "$LAUNCHER_DIR/launcher.sh"
 }
 
 echo ""
@@ -242,12 +269,14 @@ echo -e "${CYAN}${BOLD}BugTraceAI Bootstrap Installer${NC}"
 echo ""
 
 ensure_basic_tools
+ensure_python_venv || warn "Python venv support is unavailable; the Launcher will try its compatible text wizard."
 install_or_update_launcher
 fix_permissions_if_needed
 
 echo ""
 success "Launcher is ready at: $LAUNCHER_DIR"
-echo -e "  ${DIM}The launcher will handle Docker/Colima runtime setup and dependency checks.${NC}"
+echo -e "  ${DIM}Choose Terminal, WEB, both, or a server in the universal wizard.${NC}"
+echo -e "  ${DIM}The launcher installs the dependencies required by your selection.${NC}"
 echo ""
 
 launch_wizard

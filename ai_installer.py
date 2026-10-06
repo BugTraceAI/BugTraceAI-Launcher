@@ -35,6 +35,7 @@ import shutil
 import socket
 from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import installer_core as core
@@ -209,12 +210,13 @@ CLI_REPO = os.environ.get("BUGTRACEAI_CLI_REPO", "https://github.com/BugTraceAI/
 CLI_BRANCH = os.environ.get("BUGTRACEAI_CLI_BRANCH", "")
 WEB_REPO = "https://github.com/BugTraceAI/BugTraceAI-WEB.git"
 BTAI_REPO = os.environ.get("BUGTRACEAI_API_REPO", "https://github.com/BugTraceAI/BugTraceAI-API.git")
+RELEASE_MANIFEST = None
 _VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
 try:
     with open(_VERSION_FILE, encoding="utf-8") as _version_handle:
-        VERSION = _version_handle.read().strip() or "3.0.9"
+        VERSION = _version_handle.read().strip() or "3.1.0"
 except OSError:
-    VERSION = "3.0.9"
+    VERSION = "3.1.0"
 BTAI_SHARED_NETWORK = "bugtraceai-platform"
 
 # LLM provider + model chain are chosen AFTER the boot banner (the user picks
@@ -507,9 +509,27 @@ def _choose_action(existing):
 
 
 def _choose_mode(action):
-    env = _env_choice("BTAI_INSTALLER_MODE", ("full", "cli", "web"))
+    env = _env_choice("BTAI_INSTALLER_MODE", ("full", "cli", "web", "api"))
     if env:
         return env
+    if action != 'repair':
+        catalog = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'installation-profiles.tsv')
+        with open(catalog, encoding='utf-8') as handle:
+            profiles = core.parse_install_profiles(handle.read())
+        requested = os.environ.get('BUGTRACEAI_PROFILE', '')
+        if requested:
+            profile = next((item for item in profiles if item.key == requested), None)
+            if profile is None:
+                raise ValueError('Unknown installation profile: ' + requested)
+        else:
+            idx = _ask_menu('What do you want to use? Required components are included.',
+                            tuple(f'{item.label} - {item.description}' for item in profiles), default=2)
+            profile = profiles[idx]
+            os.environ['BUGTRACEAI_PROFILE'] = profile.key
+        return profile.mode
+    saved = _read_launcher_state(INSTALL_DIR)
+    if saved.get('mode') == 'api':
+        return 'api'
     title = ("Which part do you want to review?"
              if action == "repair" else "What do you want to install?")
     idx = _ask_menu(
@@ -528,6 +548,8 @@ def _choose_mcp(mode):
     """Match the wizard extras: Full pack / Kali / recon / none. CLI-only skips this."""
     if mode == "cli":
         return True, False, False
+    if mode == 'api':
+        return False, False, False
     env_recon = os.environ.get("BTAI_INSTALLER_MCP_RECON", "").strip().lower()
     env_kali = os.environ.get("BTAI_INSTALLER_MCP_KALI", "").strip().lower()
     if env_recon in ("0", "1", "true", "false", "yes", "no") or env_kali in (
@@ -790,8 +812,8 @@ def _resolve_deployment_context():
     state = _read_launcher_state(INSTALL_DIR)
     requested_mode = os.environ.get("BTAI_INSTALLER_MODE", "").strip().lower()
     state_mode = str(state.get("mode", "")).strip().lower()
-    mode = requested_mode if requested_mode in ("full", "cli", "web") else state_mode
-    if mode not in ("full", "cli", "web"):
+    mode = requested_mode if requested_mode in ("full", "cli", "web", "api") else state_mode
+    if mode not in ("full", "cli", "web", "api"):
         mode = "full"
 
     requested_provider = os.environ.get("BTAI_INSTALLER_PROVIDER", "").strip().lower()
@@ -837,6 +859,9 @@ def _refresh_deployment_context(context, allocate_web=False):
     btai_ports = _api_published_ports()
     btai_mcp = btai_ports.get("btai_mcp") or context.ports.btai_mcp
     btai = btai_ports.get("btai") or context.ports.btai
+    if context.mode == 'api':
+        # Other installations on the host are not part of this API-only profile.
+        web = cli = mcp = recon = None
     if allocate_web and context.mode in ("full", "web") and web is None:
         web = _allocate_host_port()
     return replace(context, ports=core.DeploymentPorts(
@@ -1154,6 +1179,7 @@ def _save_ai_state(context):
     data = {
         "version": VERSION,
         "mode": context.mode,
+        "install_profile": os.environ.get('BUGTRACEAI_PROFILE', ''),
         "web_port": str(context.ports.web or ""),
         "cli_port": str(context.ports.cli or ""),
         "btai_port": str(context.ports.btai or ""),
@@ -1170,7 +1196,7 @@ def _save_ai_state(context):
         "fallback_model": MODEL_CHAIN[1] if len(MODEL_CHAIN) > 1 else "",
         "install_web": context.mode in ("full", "web"),
         "install_cli": context.mode in ("full", "cli"),
-        "install_btai": context.mode in ("full", "web"),
+        "install_btai": context.mode in ("full", "web", "api"),
         "mcp_cli_enabled": context.mcp_cli_enabled,
         "mcp_recon_enabled": context.mcp_recon_enabled,
         "mcp_kali_enabled": context.mcp_kali_enabled,
@@ -1191,7 +1217,7 @@ def _save_ai_state(context):
                             "btai_mcp_port", "mcp_port", "recon_port", "kali_port",
                             "provider", "install_web", "install_cli", "install_btai",
                             "mcp_cli_enabled", "mcp_recon_enabled", "mcp_kali_enabled",
-                            "install_dir", "cli_interface", "cli_runtime", "cli_managed", "cli_checkout", "cli_global"):
+                            "install_dir", "install_profile", "cli_interface", "cli_runtime", "cli_managed", "cli_checkout", "cli_global"):
                     if key in previous:
                         data[key] = previous[key]
         except (OSError, ValueError):
@@ -1222,6 +1248,7 @@ def run_verification(run_fn, context):
         required_ports.append(("reconFTW MCP host port", context.ports.recon))
     if context.mode in ("full", "web"):
         required_ports.append(("WEB host port", context.ports.web))
+    if context.mode in ("full", "web", "api"):
         required_ports.append(("BugTraceAI-API REST host port", context.ports.btai))
         required_ports.append(("BugTraceAI-API MCP host port", context.ports.btai_mcp))
     for label, port in required_ports:
@@ -1268,7 +1295,7 @@ def print_success_next_steps(context, action):
         print(f"  {CYAN}- WEB:{RESET} {core.endpoint_url(context.ports.web)}")
     if (context.mode in ("full", "cli") or context.mcp_cli_enabled) and context.ports.cli is not None:
         print(f"  {CYAN}- CLI health:{RESET} {core.endpoint_url(context.ports.cli, '/health')}")
-    if context.mode in ("full", "web"):
+    if context.mode in ("full", "web", "api"):
         if context.ports.btai is not None:
             print(f"  {CYAN}- BugTraceAI-API REST:{RESET} {core.endpoint_url(context.ports.btai, '/health')}")
         if context.ports.btai_mcp is not None:
@@ -1284,6 +1311,7 @@ def print_success_next_steps(context, action):
 def _boot():
     global _privilege_session, PROVIDER, MODEL_CHAIN, api_key, setup_action
     global install_mode, deployment_context, SYSTEM, messages
+    global RELEASE_MANIFEST
     # ── Boot ──────────────────────────────────────────────────────────────────────
     reconnect_tty_or_exit()
     _init_install_log()
@@ -1397,7 +1425,10 @@ def _boot():
     hr()
 
     cli_interface = saved_state.get("cli_interface", "api")
-    if setup_action != "repair" and install_mode == "full":
+    selected_profile = os.environ.get('BUGTRACEAI_PROFILE', '')
+    if setup_action != 'repair' and selected_profile in ('web', 'full'):
+        cli_interface = 'both' if selected_profile == 'full' else 'api'
+    elif setup_action != "repair" and install_mode == "full":
         cli_interface = ("api", "both")[_ask_menu(
             "WEB needs the CLI API. Include the TUI too?",
             ("API server + MCP", "Both API and TUI"), default=0)]
@@ -1439,10 +1470,25 @@ def _boot():
     print()
 
     # ── Build prompt & messages ──────────────────────────────────────────────────
+    release_cli_branch, release_web_branch, release_api_branch = CLI_BRANCH, "", ""
+    release_cli_repo, release_web_repo, release_api_repo = CLI_REPO, WEB_REPO, BTAI_REPO
+    if setup_action == "install" and not CLI_BRANCH and CLI_REPO == "https://github.com/BugTraceAI/BugTraceAI-CLI.git" and BTAI_REPO == "https://github.com/BugTraceAI/BugTraceAI-API.git":
+        from release_manager import Manifest, DEFAULT_MANIFEST, run as release_run
+        RELEASE_MANIFEST = Manifest.load(Path(os.environ.get("BUGTRACEAI_RELEASE_MANIFEST", DEFAULT_MANIFEST)))
+        keys = (["cli"] if install_mode in ("full", "cli") or mcp_cli_enabled else [])
+        keys += (["api"] if install_mode in ("full", "web", "api") else [])
+        keys += (["web"] if install_mode in ("full", "web") else [])
+        for key in keys:
+            item = RELEASE_MANIFEST.components[key]
+            release_run(["git", "ls-remote", "--exit-code", item.repository, item.ref])
+        release_cli_branch, release_web_branch, release_api_branch = (RELEASE_MANIFEST.components[key].ref.removeprefix("refs/tags/") for key in ("cli", "web", "api"))
+        release_cli_repo, release_web_repo, release_api_repo = (RELEASE_MANIFEST.components[key].repository for key in ("cli", "web", "api"))
     SYSTEM = core.build_system_prompt(PromptSpec(
         mode=install_mode, action=setup_action, install_dir=INSTALL_DIR,
-        api_key=api_key, cli_repo=CLI_REPO, web_repo=WEB_REPO, max_turns=MAX_TURNS, cli_branch=CLI_BRANCH, cli_interface=deployment_context.cli_interface,
-        btai_repo=BTAI_REPO,
+        api_key=api_key, cli_repo=release_cli_repo, web_repo=release_web_repo, max_turns=MAX_TURNS, cli_branch=release_cli_branch, cli_interface=deployment_context.cli_interface,
+        web_branch=release_web_branch, api_branch=release_api_branch,
+        release=RELEASE_MANIFEST.release if RELEASE_MANIFEST else "",
+        btai_repo=release_api_repo,
         provider=PROVIDER, ports=deployment_context.ports,
         mcp_cli=mcp_cli_enabled, mcp_recon=mcp_recon_enabled, mcp_kali=mcp_kali_enabled))
 
@@ -1832,6 +1878,16 @@ def _finish_tool(tc, args):
         return _protocol_error(tc, "'summary' must be a string.")
 
     deployment_context = _refresh_deployment_context(deployment_context)
+    if RELEASE_MANIFEST is not None:
+        from release_manager import verify_installed_release, ReleaseError
+        keys = (["cli"] if deployment_context.mode in ("full", "cli") or deployment_context.mcp_cli_enabled else [])
+        keys += (["api"] if deployment_context.mode in ("full", "web", "api") else [])
+        keys += (["web"] if deployment_context.mode in ("full", "web") else [])
+        try:
+            paths = {key: Path(INSTALL_DIR) / ("BugTraceAI-" + key.upper()) for key in keys}
+            verify_installed_release(RELEASE_MANIFEST, paths, keys)
+        except (ReleaseError, OSError) as exc:
+            return ToolOutcome(_tool_result(tc.id, tc.name, f"RELEASE VERIFICATION FAILED: {exc}"))
     all_ok, report = run_verification(_verification_command, deployment_context)
     if not all_ok:
         _log_event("ERROR", "verification failed")
@@ -1841,7 +1897,10 @@ def _finish_tool(tc, args):
 
     try:
         _save_ai_state(deployment_context)
-    except OSError as exc:
+        if RELEASE_MANIFEST is not None:
+            from release_manager import record_installed_release
+            record_installed_release(RELEASE_MANIFEST, Path(INSTALL_DIR))
+    except (OSError, RuntimeError) as exc:
         return ToolOutcome(_tool_result(
             tc.id, tc.name,
             f"VERIFICATION PASSED but state could not be saved: {exc}. Fix that and call finish again."))
@@ -1956,7 +2015,11 @@ def main():
     atexit.register(_close_privilege_session)
     signal.signal(signal.SIGINT, lambda *_: _on_signal_exit(130))
     signal.signal(signal.SIGTERM, lambda *_: _on_signal_exit(143))
-    _boot()
+    try:
+        _boot()
+    except (OSError, ValueError, RuntimeError) as exc:
+        err(f"Setup could not start: {exc}")
+        raise SystemExit(1)
     _bash = _spawn_bash()
 
     # Installer pass: status lines continue; a real question waits for an answer.
