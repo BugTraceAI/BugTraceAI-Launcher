@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "release": "2026.10.5-beta.13",
+  "release": "2026.10.6-beta.1",
   "channel": "beta",
-  "launcher_version": "3.3.16",
+  "launcher_version": "3.3.26",
   "components": {
     "cli": {
       "repository": "https://github.com/BugTraceAI/BugTraceAI-CLI.git",

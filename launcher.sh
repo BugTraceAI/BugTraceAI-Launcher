@@ -1925,6 +1925,9 @@ deploy_cli_only() {
         error "This checkout needs the CLI 4.0.14+ installer. Select the private refactor with BUGTRACEAI_CLI_REPO / BUGTRACEAI_CLI_BRANCH."
         return 1
     fi
+    if [[ -n "${BTAI_SETUP_CONFIG:-}" ]]; then
+        python3 -c 'import sys; sys.path.insert(0, sys.argv[3]); from setup_form import apply_cli_config; apply_cli_config(sys.argv[1], sys.argv[2])' "$BTAI_SETUP_CONFIG" "$CLI_DIR" "$SCRIPT_DIR" || return 1
+    fi
     # Finish the engine installation before optional user command registration.
     run_cli_installer --interface "$CLI_INTERFACE" --runtime "$CLI_RUNTIME" --global no || return 1
     INSTALL_CLI=true INSTALL_WEB=false INSTALL_BTAI=false
@@ -1983,19 +1986,33 @@ wizard_select_components() {
     MCP_KALI_ENABLED=false
 
     if [[ -z "$INSTALL_PROFILE" ]]; then
-        local key label description mode interface web cli api
-        local keys=() options=()
-        if [[ -n "${BUGTRACEAI_LAUNCHER_INITIAL_PROFILE:-}" ]]; then
-            info "Suggested profile: $BUGTRACEAI_LAUNCHER_INITIAL_PROFILE. Review the choices below."
-        fi
-        while IFS='|' read -r key label description mode interface web cli api; do
-            keys+=("$key")
-            options+=("$label\n     $description")
-        done < "$SCRIPT_DIR/installation-profiles.tsv"
-        options+=("Cancel")
-        select_option "What do you want to use? The launcher installs all required components." "${options[@]}"
-        [[ $MENU_SELECTION -lt ${#keys[@]} ]] || return 2
-        INSTALL_PROFILE="${keys[$MENU_SELECTION]}"
+        select_option "Step 1: How do you want to use BugTraceAI?" \
+            "Terminal — scan from your terminal" \
+            "WEB — scan from your browser" \
+            "Both — browser and terminal" \
+            "Server — REST / MCP integrations" \
+            "Cancel"
+        case $MENU_SELECTION in
+            0)
+                select_option "Expose the terminal engine through REST / MCP too?" \
+                    "No — terminal only" "Yes — terminal and server" "Cancel"
+                case $MENU_SELECTION in
+                    0) INSTALL_PROFILE=terminal ;;
+                    1) INSTALL_PROFILE=terminal-server ;;
+                    *) return 2 ;;
+                esac ;;
+            1) INSTALL_PROFILE=web-only ;;
+            2) INSTALL_PROFILE=web-cli-tui ;;
+            3)
+                select_option "Which targets will the server scan?" \
+                    "Web applications — BugTraceAI-CLI" "APIs — BugTraceAI-API" "Cancel"
+                case $MENU_SELECTION in
+                    0) INSTALL_PROFILE=server ;;
+                    1) INSTALL_PROFILE=api ;;
+                    *) return 2 ;;
+                esac ;;
+            *) return 2 ;;
+        esac
     fi
     apply_install_profile "$INSTALL_PROFILE" || return 1
 
@@ -2042,6 +2059,7 @@ wizard_select_components() {
 }
 
 wizard_select_provider() {
+    [[ -z "${BTAI_SETUP_CONFIG:-}" ]] || return 0
     select_option "Which LLM provider would you like to use?" \
         "OpenRouter — Multi-model access (Recommended)" \
         "Z.ai — GLM models (Chinese provider)" \
@@ -2059,6 +2077,7 @@ wizard_select_provider() {
 }
 
 wizard_ask_api_key() {
+    [[ -z "${BTAI_SETUP_CONFIG:-}" ]] || return 0
     local key_label key_url key_prefix key_env_var key_min_len
 
     if [[ "$LLM_PROVIDER" == "zai" ]]; then
@@ -2142,6 +2161,7 @@ wizard_ask_api_key() {
 
 
 wizard_configure_ports() {
+    [[ -z "${BTAI_SETUP_CONFIG:-}" ]] || return 0
     echo -e "${BOLD}Port Configuration${NC}"
 
     if $INSTALL_WEB; then
@@ -2286,7 +2306,23 @@ prompt_docker_conflicts() {
     echo ""
 }
 
+load_tui_configuration() {
+    [[ -n "${BTAI_SETUP_CONFIG:-}" ]] || return 0
+    local values key value
+    values=$(mktemp) || return 1
+    if ! python3 "$SCRIPT_DIR/setup_form.py" "$BTAI_SETUP_CONFIG" > "$values"; then
+        rm -f "$values"
+        error "Invalid TUI configuration; installation stopped."
+        return 1
+    fi
+    while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+        printf -v "$key" '%s' "$value"
+    done < "$values"
+    rm -f "$values"
+}
+
 run_wizard() {
+    load_tui_configuration || return 1
     local resume_after_docker_reexec=false
 
     # Restore stdin if piped (e.g. curl | bash)
@@ -2573,7 +2609,7 @@ FRONTEND_PORT=${WEB_PORT}
 VITE_CLI_API_URL=${cli_url}
 CLI_API_PORT=${cli_api_port}
 VITE_BTAI_API_URL=/btai-api
-BTAI_API_PORT=${BTAI_PORT}
+BTAI_API_PORT=${BTAI_PORT:-8005}
 BTAI_SHARED_NETWORK=${BTAI_SHARED_NETWORK}
 EOF
             )
