@@ -5,24 +5,109 @@
 <h1 align="center">BugTraceAI Launcher</h1>
 
 <p align="center">
-  One-command deployment for the BugTraceAI security platform via Docker.
+  Universal installer for BugTraceAI: terminal, WEB and scanning servers.
 </p>
 
 <p align="center">
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-3.0.9-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.20-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
-  <img src="https://img.shields.io/badge/Docker-Required-2496ED?logo=docker&logoColor=white" />
+  <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
 </p>
 
 Launcher version source of truth: [VERSION](VERSION)
 
+**v3.3.20**: give local API/MCP update checks up to 120 seconds for cold startup,
+and distinguish process exit from readiness timeout. The previous approximately
+30-second window could stop an API while its first embedding model was loading.
+
+**v3.3.19**: make Docker status checks use cached sudo access when the current
+Linux login cannot access the Docker socket, and report permission errors
+instead of claiming running containers are missing.
+
+**v3.3.18**: show the terminal-workspace command after installation only when
+the selected profile installed a CLI interface that includes the TUI.
+
+**v3.3.17**: preserve the selected products, interface, runtime, global command
+and optional toolboxes when Linux restarts the wizard to apply Docker group
+membership. The installer resumes setup without repeating its selection menus.
+
+**v3.3.16**: coordinate the candidate manifest with CLI 4.0.31-beta, WEB
+2.0.32-beta and API 1.4.11-beta. These refs are backed up in the private
+component repositories; the public release remains unavailable until the
+curated component tags are published.
+
+**v3.3.15**: make combined WEB + API installs share the API-owned Docker network,
+and keep standalone WEB installs on their own network.
+
 ---
 
-Interactive wizard that clones the BugTraceAI repos, builds Docker images, generates configs, sets up databases, and orchestrates all services. Deploy WEB + API, CLI, or the full platform with a single command.
+One installation entry point for the BugTraceAI platform. Choose what you want
+to use; the launcher downloads the required repositories, selects interface
+dependencies, connects backends, configures ports and verifies the installation.
+Bare `install.sh` entry points in the ecosystem, CLI, WEB and API repositories
+open this same visual menu, suggesting the relevant profile without deploying
+it automatically. Direct component installation remains available through
+explicit standalone paths and documented options for developers and agents.
+
+**v3.3.12**: show runtime update failures as actionable messages without a
+Python traceback. Also pin the API engine to amd64 for its packaged tools, while CLI and
+WEB retain their native platform. Also report every unavailable component tag together before setup or
+updates, so users can see why a coordinated release is not ready.
+
+**v3.3.9**: respect the installer's choice to keep existing Docker containers;
+deployments now report a name conflict instead of silently deleting them.
+
+**v3.3.8**: keep version and health-response checks compatible with the Bash
+3.2 parser shipped by macOS.
+
+**v3.3.7**: install logs fall back to the user's state directory when the
+Launcher checkout is read-only, without printing a shell error or blocking the
+TUI. **v3.3.6**: component entry points verify the published Launcher's version
+and stop before running an incompatible older installer. **v3.3.5**: piped
+launches only reconnect to `/dev/tty` when stderr is attached to a terminal, and
+only clear the screen for terminal output. This avoids misleading `/dev/tty`
+errors and screen-control sequences over non-interactive SSH. **v3.3.4**:
+conflict checks run after profile/runtime selection, only cover
+selected Docker services, and preserve data volumes when removing containers.
+
+**v3.3.3**: update previews confirm that every selected release tag exists on
+the configured remotes before presenting a candidate as available. A missing
+or unreachable component tag stops the preview without touching the installation.
+
+**v3.3.2**: provider keys are optional during installation; generated API/CLI
+configuration contains no empty key assignment, and the summary explains how
+to configure credentials later. Press Enter at the provider-key prompt to
+continue; add the key locally before starting AI-powered scans. WEB + CLI now
+share the proxy network reliably, and health checks match the CLI and
+Kiterunner response formats, including the valid no-key CLI state.
+
+**v3.3.1**: detects missing Python `venv` support by creating a pip-ready test
+environment, so clean Ubuntu installs enable the visual Launcher instead of
+silently falling back to the legacy text wizard. Incomplete cached TUI
+environments are preserved and rebuilt safely.
+
+**v3.3.0**: fresh installs use one tagged release combination. The TUI previews
+updates, and the updater prepares all source/dependencies/images before switching.
+Local configuration and data volumes remain in place; failed activation has a
+recovery journal and previous source/runtime backups.
+
+**v3.2.2**: the universal Launcher is the only guided installer. Component
+entries delegate here; explicit runtime backends support direct agents and
+older automation without additional selection menus. API service management
+remains separate and preserves local configuration.
+
+**v3.2.0**: interactive purple/coral Textual TUI for selecting products,
+runtime and optional toolboxes; one profile catalog drives the TUI, standard
+installer and AI installer. The TUI dependency is pinned and isolated in the
+user cache. Updating an existing Launcher preserves local changes.
+
+**v3.1.0**: universal profiles shared by the standard and AI installers,
+automatic WEB backend selection, an independent API-target server, readable
+setup summaries, a preview command and repair of the saved selection.
 
 **v3.0.9**: honors explicit local overrides and saved Docker profiles, reads local logs without Docker, and retains reconfigured CLI profiles and platform inventory. Legacy CLI 3.x is rejected for TUI use.
 
@@ -32,7 +117,7 @@ Interactive wizard that clones the BugTraceAI repos, builds Docker images, gener
 
 **v3.0.6**: standalone CLI installation now asks TUI / API + MCP / both, then local / Docker. The standard and AI entry points share the CLI installer; update and repair preserve saved choices. WEB deployments require API and may additionally include TUI.
 
-**v3.0.5**: adds `./launcher.sh tui`, honoring the selected CLI checkout and saved runtime and otherwise opening the installed CLI container. Standard and AI installers accept explicit CLI repository/branch overrides.
+**v3.0.5**: adds `./launcher.sh tui`, preferring the active refactor checkout in a development workspace and otherwise opening the installed CLI container. Standard and AI installers accept explicit CLI repository/branch overrides.
 
 **v3.0.4**: fixes Compose build timeouts with options, preserves deployment inventory during partial repairs, tears down all selected Compose profiles before uninstalling, and validates service health and updater patches. CLI-only installs include their MCP service and port.
 
@@ -64,35 +149,43 @@ cd ~/bugtraceai-launcher
 ./launcher.sh
 ```
 
-The wizard will guide you step by step: choose installer mode, choose deployment mode, enter your OpenRouter API key, configure ports, and confirm. The launcher handles the rest.
+The Launcher opens an interactive terminal UI. Choose a profile to see exactly
+which products and services it installs, then select the runtime and optional
+WEB toolboxes. `terminal`, `server`, and `terminal-server` support local Python
+or Docker; `web`, `full`, and `api` require Docker. The selected profile is
+passed to the installer once, so it does not ask you to choose the same
+interfaces again. The remaining setup prompts configure provider credentials,
+ports and deployment confirmation. The optional AI Setup & Repair Assistant is
+available from the TUI; it is not an extra question before the installer opens.
 
-During one-liner setup, if Python 3 and `ai_installer.py` are available, you will also be asked whether you want to try the experimental AI Setup & Repair Assistant:
+The TUI uses Python 3.10+ and installs pinned Textual into an isolated
+per-user cache. If the TUI runtime cannot start, the compatible text wizard
+remains available with `BUGTRACEAI_CLASSIC=1 ./launcher.sh`.
 
-```text
-Try the AI Setup & Repair Assistant (Experimental — installs & troubleshoots)? [y/N]
-```
-
-Choose `N` for the standard wizard, or `Y` to let the AI installer guide and troubleshoot the deployment.
-
-If you start from a local clone with `./launcher.sh`, the first menu also lets you choose between the standard guided installer and the experimental AI Setup & Repair Assistant.
+Component entry points suggest `terminal` (CLI), `web` (WEB), `api`
+(API-target engine) or `full` (ecosystem). All profiles remain available in the
+menu. `BUGTRACEAI_LAUNCHER_INITIAL_PROFILE` changes only this initial highlight;
+it does not approve or start installation. The compatibility bootstrap has one
+source in [component-bootstrap.sh](component-bootstrap.sh).
 
 ## Requirements
 
 | Requirement            | Details                                                                                                   |
 | ---------------------- | --------------------------------------------------------------------------------------------------------- |
 | **OS**                 | Linux (x86_64) or macOS (Intel / Apple Silicon)                                                           |
-| **Container Runtime** | Docker Engine 24.0+ + Compose (Linux), or on macOS: **Docker Desktop** OR **Colima** |
+| **Runtime** | Python 3.10+ for the Launcher TUI and local terminal/CLI-server installs; Docker + Compose for container profiles |
 | **Git**                | Any recent version                                                                                        |
 | **curl**               | For the one-liner installer                                                                               |
 | **RAM**                | 4 GB minimum (8 GB recommended)                                                                           |
 | **Disk**               | 10 GB free space                                                                                          |
-| **OpenRouter API Key** | [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`)                                   |
+| **LLM provider key** | Configure through TUI/F7 or during platform setup                                   |
 
 ### Auto-Installation (Linux)
 
 **The installer will automatically detect and offer to install missing dependencies** across major Linux distros:
 
-- ✅ **Git & curl** → Installed via your package manager (`apt-get`, `dnf`, `yum`, `pacman`, or `zypper`) if missing
+- ✅ **Git, curl & Python** → Installed via your package manager (`apt-get`, `dnf`, `yum`, `pacman`, or `zypper`) if missing
+- ✅ **Launcher TUI runtime** → Pinned Textual installed into an isolated user cache, not into the system Python
 - ✅ **Docker Engine** → Installed automatically via Docker's official installer (`get.docker.com`), with a distro-package fallback, then the daemon is started and your user is added to the `docker` group
 - ✅ **Docker Compose** → Installed automatically as plugin (`docker-compose-plugin`) or standalone binary if missing
 
@@ -117,28 +210,79 @@ For best automation, install Xcode CLT first if missing:
 xcode-select --install
 ```
 
-## Deployment Modes
+## Universal installation profiles
 
-The wizard presents three deployment options:
+| Profile | What you get | Runtime |
+| --- | --- | --- |
+| `terminal` | CLI scanning engine with the visual terminal TUI | Local Python or Docker |
+| `web` | WEB dashboard/database plus CLI web-scanning API/MCP and BugTraceAI-API target engine | Docker |
+| `full` | WEB and both scanning engines, plus the CLI terminal TUI | Docker |
+| `server` | CLI web-scanning engine, exposed through API + MCP | Local Python or Docker |
+| `terminal-server` | CLI TUI + web-scanning API/MCP, without the WEB app | Local Python or Docker |
+| `api` | BugTraceAI-API engine for API-target testing, with REST + MCP | Docker |
 
-| Mode                          | What gets deployed               | Use case                              |
-| ----------------------------- | -------------------------------- | ------------------------------------- |
-| **Full Platform** (WEB + API + CLI) | All stacks, auto-connected  | Complete security workflow with UI    |
-| **Standalone WEB**            | WEB dashboard + BugTraceAI-API   | API testing and report management     |
-| **Standalone CLI**            | Headless autonomous scanner only | CI/CD pipelines, automation, API-only |
+The **CLI web-scanning API/MCP** serves the CLI scanning engine.
+**BugTraceAI-API** is the separate engine for API-target scans. A WEB selection includes both so the
+browser workspace can use both scan types. Optional reconFTW/Kali tools are
+offered only for WEB profiles. BugStore is a separate practice target, not a
+required platform dependency.
 
-In **Full** mode the launcher automatically configures CORS and points the WEB frontend to the CLI API — no manual wiring needed.
+Preview a selection without downloads, installation or starting services:
+
+```bash
+./launcher.sh plan --profile full
+./launcher.sh plan --profile terminal --runtime local --global yes
+```
+
+Install using the same universal flow with choices supplied as flags:
+
+```bash
+./launcher.sh install --profile terminal --runtime local --global yes
+./launcher.sh install --profile web
+./launcher.sh install --profile full --global yes
+./launcher.sh install --profile server --runtime docker --global no
+./launcher.sh install --profile api
+```
+
+Provider, ports, optional tools and any system password prompts remain
+interactive. These flags do not imply an unattended installation. Global
+`btai` is available for profiles with a TUI. With Docker the workspace still
+appears in your terminal; its process runs in the container. New terminal
+sessions pick up the registered command; the installer also shows how to use
+it in the current session and offers to open the workspace immediately.
+
+Selections are saved in `.launcher-state`; the CLI also retains its own
+installation profile. `update` applies the tagged compatible release to the saved selection after preparation and validation.
+`repair` rebuilds/verifies that selection without pulling updates or replacing
+provider/database credentials. If saved configuration is missing, repair stops
+and reports it instead of inventing defaults. Old WEB-only/CLI profiles remain
+supported for update, repair and service management.
+
+## Compatible updates
+
+The Launcher uses one tagged combination of CLI, WEB and API-target versions.
+It checks that every selected release tag is available before presenting an
+update as ready. Choose **Update installation** in the TUI to review the saved
+installation, or run `./launcher.sh update --plan`. Builds finish before the
+switch, configuration and data are retained, and service checks must pass before
+success is reported. Interrupted activation can be recovered with
+`./launcher.sh update --recover`.
+See [Compatible updates](#compatible-updates) for update and recovery guidance.
 
 ## Commands
 
 ```bash
-./launcher.sh              # Interactive setup wizard
+./launcher.sh              # Universal installation wizard
+./launcher.sh plan --profile full  # Preview; no installation
 ./launcher.sh tui          # Real terminal workspace; --demo is optional
 ./launcher.sh status       # Service dashboard (container health + endpoints)
 ./launcher.sh start        # Start all services
 ./launcher.sh stop         # Stop all services
 ./launcher.sh restart      # Restart all services
-./launcher.sh update       # Git pull + Docker rebuild
+./launcher.sh update --plan # Review installed and target versions (read-only)
+./launcher.sh update       # Prepare, activate and verify compatible releases
+./launcher.sh update --recover # Restore an interrupted update
+./launcher.sh repair       # Keep saved selection/config; rebuild and verify
 ./launcher.sh uninstall    # Stop containers, remove volumes & install dir
 ./launcher.sh logs web     # Tail WEB stack logs
 ./launcher.sh logs cli     # Tail CLI stack logs
@@ -292,7 +436,7 @@ colima start --runtime docker
 
 The launcher starts optional Compose profiles explicitly after the base WEB and CLI services are up. This keeps a full selection from attempting reconFTW or Kali during the initial WEB build.
 
-If Docker reports that `../reconftw-mcp` cannot be found, run `./launcher.sh update`. The launcher restores a completely missing sibling source checkout before building the recon profile. It intentionally refuses to overwrite an existing incomplete `reconftw-mcp` folder, so move that folder aside or restore its `Dockerfile` first if prompted.
+If Docker reports that `../reconftw-mcp` cannot be found, run `./launcher.sh repair`. The launcher restores a completely missing sibling source checkout before building the recon profile. It intentionally refuses to overwrite an existing incomplete `reconftw-mcp` folder, so move that folder aside or restore its `Dockerfile` first if prompted.
 
 **reconFTW MCP (Apple Silicon):**
 - Forces `linux/amd64` for `six2dez/reconftw:main` on ARM hosts.
@@ -321,17 +465,17 @@ docker logs --tail 200 reconftw-mcp
 docker logs --tail 200 kali-mcp-server
 ```
 
-**Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (pull + rebuild).
+**Existing installation detected:** If `~/bugtraceai/` already exists, the wizard offers to reinstall (wipe + fresh setup) or update (compatible release + verification).
 
 ## How the Install Script Works
 
 The one-liner clones this repo to `~/bugtraceai-launcher/` and launches the interactive wizard, which:
 
 1. **Bootstraps dependencies**: Git/curl first, then clones or updates the Launcher
-2. **Selects installer mode**: Standard guided wizard or experimental AI Setup & Repair Assistant
-3. **Checks runtime**: Docker runtime + Compose checks, including Docker Desktop or Colima on macOS
-4. **Selects deployment mode**: Full (WEB + API + CLI), WEB + API, or Standalone CLI
-5. **Configures**: Asks for OpenRouter API key, proposes ports, generates `.env` files
+2. **Opens the universal TUI**: select Terminal, WEB, both workspaces or a scanning server and review included products
+3. **Selects runtime and optional tools**: local Python or Docker where supported; recon/Kali are explicit WEB add-ons
+4. **Prepares the runtime**: Local Python or Docker as supported by the profile
+5. **Configures**: Provider, ports and optional global command for the chosen interfaces
 6. **Deploys**: Clones repos, builds Docker images, starts services, runs health checks
 
 ## AI-Assisted Installer
@@ -343,13 +487,13 @@ BugTraceAI Launcher includes an optional **AI Setup & Repair Assistant** (`ai_in
 - Propose and apply fixes interactively
 - Guide you through complex deployment scenarios (VM hosts, non-standard environments)
 
-The AI mode starts only after explicit confirmation with a classic `[y/N]` prompt. It then opens the operating system's normal `sudo` prompt once, keeping only sudo's temporary ticket for the running launcher; the password is never stored in Python, a shell variable, or the model context. If no locally saved key is available, it asks for and validates your OpenRouter API key before starting the agent. The key is never inserted into the system prompt: dedicated host tools write it directly to the private CLI configuration.
+The AI mode starts only after you select it in the TUI. It then opens the operating system's normal `sudo` prompt once, keeping only sudo's temporary ticket for the running launcher; the password is never stored in Python, a shell variable, or the model context. If no locally saved key is available, it asks for and validates your OpenRouter API key before starting the agent. The key is never inserted into the system prompt: dedicated host tools write it directly to the private CLI configuration.
 
 For AI-managed fresh installs, host ports are allocated dynamically and then verified from Docker's published mappings. The WEB proxy is wired to the resolved CLI endpoint by the host tool, not by asking the model to guess a port. Every successful command/tool result immediately triggers the next model turn; after verification passes, the same loop remains available for support and repairs.
 
 ### How to invoke
 
-The one-liner can offer AI mode before the standard wizard starts, and `./launcher.sh` exposes it in the first menu:
+The TUI exposes AI setup and repair alongside the standard universal installer:
 
 ```bash
 cd ~/bugtraceai-launcher
@@ -366,7 +510,7 @@ cd ~/bugtraceai-launcher
 
 ## License
 
-Apache-2.0 License. See the [LICENSE](LICENSE) file for details.
+The BugTraceAI-owned portions of this distribution are licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [LICENSE-HISTORY.md](LICENSE-HISTORY.md).
 
 ## Links
 
@@ -383,8 +527,12 @@ Apache-2.0 License. See the [LICENSE](LICENSE) file for details.
 
 ## CLI 4.x terminal workspace
 
-Use `./launcher.sh setup-cli` to choose **TUI**, **API + MCP**, or **both**,
-then **local Python** or **Docker**. Local TUI installations do not require a
+Use `./launcher.sh` and choose the **CLI terminal TUI**, **WEB dashboard +
+engines**, **WEB + CLI TUI**, **CLI web-scan API/MCP**, **CLI TUI + web-scan API**, or
+**API-target server** profile. The universal menu already selects the
+interfaces and includes the required engines.
+`setup-cli` remains available for existing standalone installation scripts.
+Local TUI installations do not require a
 Docker runtime; some scanning tools still use Docker. TUI-only Docker opens an
 interactive scanner without publishing server ports. Full WEB deployments use
 Docker and require the CLI API; their wizard offers API only or API + TUI.
@@ -415,8 +563,10 @@ Switching interfaces does not automatically uninstall existing packages.
 
 `./launcher.sh tui` honors the saved runtime, including Docker in full-platform
 installations. `BUGTRACEAI_CLI_PATH` explicitly selects a local checkout before
-saved routing. A sibling `BugTraceAI-CLI` checkout is also supported. CLI 3.x
-checkouts cannot open this workspace; compatibility is checked before starting
+saved routing. In the development workspace, the sibling
+`BugTraceAI-CLI-refactor` checkout is preferred; standalone public installations
+also support a sibling `BugTraceAI-CLI` checkout. CLI 3.x checkouts cannot open
+this workspace; compatibility is checked before starting
 TUI services.
 
 Standalone installations read profile changes made by the CLI installer.
@@ -428,11 +578,48 @@ Standalone setup and global registration require the CLI 4.0.14+ installer.
 
 ### Installation by your own AI agent
 
-For a standalone CLI installation, copy the
-[CLI agent installation prompt](https://github.com/BugTraceAI/BugTraceAI-CLI#install-with-your-ai-coding-agent).
-It defaults to local TUI plus the user-global `btai` command and can also select
-API + MCP or both, with local or Docker runtime. This uses your own coding
-agent's terminal access. The optional Launcher AI Setup & Repair Assistant
-above is a separate installer mode.
+Copy this prompt into your coding agent with terminal access. It uses the
+universal Launcher and defaults to a local terminal workspace plus `btai`.
+Change the first line to request a different profile. The current coordinated
+release requires Launcher 3.3.16+; component entry points require 3.3.14+.
 
-CLI 4.0.16-beta includes this terminal workspace and authentication settings.
+```text
+Install BugTraceAI through the universal Launcher: terminal profile,
+local Python, with the user-global btai command. Perform the installation.
+
+Read the Launcher README and help at
+https://github.com/BugTraceAI/BugTraceAI-Launcher.git. The current coordinated
+release requires Launcher 3.3.16 or newer; component entry points require
+3.3.14 or newer. Clone into a suitable user-owned directory.
+If an installation exists, preserve its configuration, credentials and
+uncommitted changes. Use ./launcher.sh update or ./launcher.sh repair with
+its saved selection unless I request a profile change. Do not replace an
+existing checkout or switch its repository or branch silently.
+
+For a fresh local TUI installation, review and then install:
+./launcher.sh plan --profile terminal --runtime local --global yes
+./launcher.sh install --profile terminal --runtime local --global yes
+
+If I request WEB, use --profile web; WEB + TUI uses --profile full.
+A headless web-scanning engine uses --profile server. TUI + CLI API/MCP
+without WEB uses --profile terminal-server. API-target testing uses
+--profile api. Local Python is supported for terminal, server and
+terminal-server; WEB/full/api profiles use Docker. Install only the
+requested components and let the launcher connect their dependencies.
+
+Handle the required prompts and resolve setup errors using the repository
+instructions. Keep system privilege/password prompts in my local terminal.
+Do not change the runtime without asking. I will configure the LLM key
+later through Provider/F7 for a terminal-only install. Never ask me to paste
+credentials into chat or print existing secrets. Auth/F8 configures target
+login separately. Platform setup can request its provider key locally.
+
+Verify the version, saved profile and installed components. For TUI, verify
+startup and quit in an interactive terminal when available; otherwise state
+that visual verification is pending. Check btai registration and PATH in a
+fresh shell. For servers, check health and MCP on the actual configured
+ports. Do not start a scan as part of installation.
+
+Finish with the installation directory, selected profile, checks performed
+and exact commands to open the installed interfaces.
+```

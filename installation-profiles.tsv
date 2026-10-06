@@ -1,0 +1,6 @@
+terminal|CLI terminal TUI|BugTraceAI-CLI terminal scanner with the visual TUI. Configure and monitor web scans.|cli|tui|false|true|false
+web|WEB dashboard + engines|BugTraceAI-WEB plus the CLI web-scanning API/MCP and API-target scanning engine.|full|api|true|true|true
+full|WEB + CLI TUI|WEB dashboard, both scanning engines, and the CLI terminal TUI.|full|both|true|true|true
+server|CLI web-scan API/MCP|Headless BugTraceAI-CLI web-scanning server for integrations and agents; no terminal UI.|cli|api|false|true|false
+terminal-server|CLI TUI + web-scan API|BugTraceAI-CLI terminal TUI and headless web-scanning API/MCP, without WEB.|cli|both|false|true|false
+api|API-target server|Standalone BugTraceAI-API engine for API security scans, exposed over REST + MCP.|api|api|false|false|true

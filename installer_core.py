@@ -33,6 +33,36 @@ from typing import Any, Optional, Tuple
 
 
 HEALTHY_TOKENS = ("healthy", "ok", "ready", "up", "alive", "running", "pass")
+
+
+@dataclass(frozen=True)
+class InstallProfile:
+    key: str
+    label: str
+    description: str
+    mode: str
+    cli_interface: str
+    install_web: bool
+    install_cli: bool
+    install_api: bool
+
+
+def parse_install_profiles(text: str) -> Tuple[InstallProfile, ...]:
+    """Parse the shared launcher catalog without performing file I/O."""
+    profiles = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split('|')
+        if len(fields) != 8:
+            raise ValueError('Invalid installation profile catalog')
+        key, label, description, mode, interface, web, cli, api = fields
+        if (mode not in ('cli', 'full', 'api') or interface not in ('tui', 'api', 'both')
+                or any(value not in ('true', 'false') for value in (web, cli, api))):
+            raise ValueError('Invalid installation profile values')
+        profiles.append(InstallProfile(key, label, description, mode, interface,
+                                       web == 'true', cli == 'true', api == 'true'))
+    return tuple(profiles)
 _SECRET_ASSIGNMENT = re.compile(
     r"(?im)^(?P<name>[A-Z0-9_]*(?:API_KEY|TOKEN|PASSWORD|SECRET)[A-Z0-9_]*)=(?P<value>[^\r\n]*)$")
 
@@ -934,6 +964,7 @@ def verification_checks(mode: str, install_dir: str,
                                 ("API Discovery (Kiterunner)", "/kr-api/health")):
                 checks.append(Check(label, f"curl -sf --max-time 5 {web_url}{path} 2>/dev/null", "health"))
 
+    if mode in ("full", "web", "api"):
         checks += [
             container_check("BugTraceAI-API container (bugtrace-api)", "bugtrace-api"),
             Check("BugTraceAI-API configuration (.env)",
@@ -980,7 +1011,7 @@ def verification_checks(mode: str, install_dir: str,
 # ── System prompt (pure) ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class PromptSpec:
-    mode: str          # full | cli | web
+    mode: str          # full | cli | web (legacy) | api
     action: str        # install | repair
     install_dir: str
     # Retained for API compatibility at the boundary. It is never included in
@@ -997,6 +1028,9 @@ class PromptSpec:
     btai_repo: str = ""
     cli_branch: str = ""
     cli_interface: str = "api"
+    web_branch: str = ""
+    api_branch: str = ""
+    release: str = ""
 
 
 def build_system_prompt(spec: PromptSpec) -> str:
@@ -1045,13 +1079,13 @@ CLI checks:
   - File {install_dir}/BugTraceAI-CLI/.env exists
 """.replace("{install_dir}", install_dir)
 
-    if spec.mode in ("full", "web"):
+    if spec.mode in ("full", "web", "api"):
         step_num = "2" if needs_cli else "1"
         btai_repo = spec.btai_repo or "https://github.com/BugTraceAI/BugTraceAI-API.git"
         btai_playbook = f"""
 STEP {step_num}: INSTALL BugTraceAI-API
 1. cd {install_dir}
-2. git clone --depth 1 {btai_repo} BugTraceAI-API
+2. git clone --depth 1 {("--branch " + shlex.quote(spec.api_branch) + " --single-branch ") if spec.api_branch else ""}{shlex.quote(btai_repo)} BugTraceAI-API
 3. cd BugTraceAI-API
 4. Call configure_api. It writes the provider configuration and the selected
    REST/MCP ports locally with mode 600. Never create or print the API key file.
@@ -1075,7 +1109,7 @@ BugTraceAI-API checks:
         web_playbook = f"""
 STEP {step_num}: INSTALL WEB
 1. cd {install_dir}
-2. git clone --depth 1 {spec.web_repo} BugTraceAI-WEB
+2. git clone --depth 1 {("--branch " + shlex.quote(spec.web_branch) + " --single-branch ") if spec.web_branch else ""}{shlex.quote(spec.web_repo)} BugTraceAI-WEB
 3. cd BugTraceAI-WEB
 4. Call configure_web. It preserves existing database settings, chooses ports
    and writes .env.docker with mode 600. It also applies the standard Launcher's
@@ -1120,7 +1154,9 @@ WEB checks:
   - File {install_dir}/BugTraceAI-WEB/.env.docker exists
 """.replace("{install_dir}", install_dir)
 
-    mode_label = {"full": "Full Platform (WEB + CLI)", "cli": "CLI Only", "web": "WEB Only"}[spec.mode]
+    mode_label = {"full": "WEB with scanning backends", "cli": "CLI scanning engine",
+                  "web": "WEB + API-target engine (legacy)",
+                  "api": "API-target scanning server (REST + MCP)"}[spec.mode]
     action_label = ("REPAIR / TROUBLESHOOT EXISTING INSTALLATION"
                     if spec.action == "repair" else "INSTALL NEW DEPLOYMENT")
     if spec.action == "repair":
@@ -1145,6 +1181,9 @@ INSTALL MODE RULES:
 
     bar = "=" * 60
     return f"""You are the BugTraceAI Autonomous Setup & Repair agent.
+Release combination: {spec.release or 'existing/development installation'}.
+For fresh installations, keep the exact tags in the playbook. Never substitute main or latest.
+For repair, preserve installed source versions; use the Launcher's update command for upgrades.
 Use run_command as the installation user and run_privileged_command for
 root-required work. configure_cli, configure_api, configure_web and configure_agents are host-managed setup
 tools that handle secrets and dynamic endpoint wiring. Never type sudo yourself
@@ -1158,7 +1197,7 @@ DEPLOYED CLI PROVIDER: {provider_label}
 SELECTED COMPONENTS:
 - WEB: {"yes" if spec.mode in ("full", "web") else "no"}
 - CLI: {"yes" if needs_cli else "no"}
-- BugTraceAI-API: {"yes" if spec.mode in ("full", "web") else "no"}
+- BugTraceAI-API: {"yes" if spec.mode in ("full", "web", "api") else "no"}
 - BugTraceAI MCP: {"yes" if spec.mcp_cli else "no"}
 - reconFTW MCP: {"yes" if spec.mcp_recon else "no"}
 - Kali toolbox: {"yes" if spec.mcp_kali else "no"}

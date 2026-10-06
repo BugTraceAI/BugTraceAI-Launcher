@@ -1,0 +1,10 @@
+# Keep the Launcher UI runtime reproducible and isolated from system Python.
+textual==8.2.8
+rich==15.0.0
+markdown-it-py==3.0.0
+mdit-py-plugins==0.6.1
+platformdirs==4.5.1
+pygments==2.21.0
+typing-extensions==4.15.0
+linkify-it-py==2.2.0
+mdurl==0.1.2
