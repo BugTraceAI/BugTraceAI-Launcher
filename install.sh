@@ -231,17 +231,28 @@ install_or_update_launcher() {
         local dirty
         dirty="$(run_as_target git -C "$LAUNCHER_DIR" status --porcelain --untracked-files=all 2>/dev/null || true)"
         if [[ -n "$dirty" ]]; then
-            warn "Launcher checkout has local changes; keeping them and skipping the automatic update."
-            warn "Commit or move those changes before updating this checkout."
-            return 0
+            error "Launcher checkout has local changes; automatic update stopped at $LAUNCHER_DIR."
+            error "Commit or move those changes, then rerun the installer. Your checkout was preserved."
+            return 1
         fi
-        if run_as_target git -C "$LAUNCHER_DIR" fetch --depth 1 origin main --quiet && \
+        local fetch_args=(fetch --quiet origin main)
+        if [[ "$(run_as_target git -C "$LAUNCHER_DIR" rev-parse --is-shallow-repository 2>/dev/null)" == true ]]; then
+            fetch_args=(fetch --unshallow --quiet origin main)
+        fi
+        if run_as_target git -C "$LAUNCHER_DIR" "${fetch_args[@]}" && \
            run_as_target git -C "$LAUNCHER_DIR" merge --ff-only FETCH_HEAD --quiet; then
             return 0
         fi
 
-        warn "Could not fast-forward the Launcher safely; using the existing checkout."
-        return 0
+        error "Could not fast-forward the Launcher safely. Installation stopped; the existing checkout was preserved."
+        error "Check the Git connection and branch at $LAUNCHER_DIR, then rerun the installer."
+        return 1
+    fi
+
+    if [[ -e "$LAUNCHER_DIR" ]]; then
+        error "Launcher path already exists but is not a Git checkout: $LAUNCHER_DIR"
+        error "Nothing was changed. Move that directory or set BUGTRACEAI_LAUNCHER_DIR to a new path, then rerun the installer."
+        return 1
     fi
 
     info "Cloning BugTraceAI Launcher into $LAUNCHER_DIR..."

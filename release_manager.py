@@ -28,11 +28,41 @@ from release_errors import ReleaseError
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MANIFEST = ROOT / "release-manifest.json"
 NAMES = {"cli": "BugTraceAI-CLI", "web": "BugTraceAI-WEB", "api": "BugTraceAI-API"}
+_VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 CONFIG_FILES = {
     "cli": (".env", ".bugtrace-install.env", "bugtraceaicli.conf", "bugtrace/data/waf_strategy_learning.json"),
     "web": (".env.docker", "backend/.env"),
     "api": (".env",),
 }
+
+
+def compare_versions(left: str, right: str) -> int:
+    """Compare launcher component versions using SemVer precedence."""
+    def parse(value: str):
+        match = _VERSION_PATTERN.fullmatch(value)
+        if not match:
+            raise ReleaseError(f"Cannot safely compare installed version {value!r}.")
+        major, minor, patch, prerelease = match.groups()
+        return (int(major), int(minor), int(patch)), prerelease.split(".") if prerelease else None
+
+    left_core, left_pre = parse(left)
+    right_core, right_pre = parse(right)
+    if left_core != right_core:
+        return (left_core > right_core) - (left_core < right_core)
+    if left_pre is None or right_pre is None:
+        if left_pre is right_pre:
+            return 0
+        return 1 if left_pre is None else -1
+    for left_item, right_item in zip(left_pre, right_pre):
+        if left_item == right_item:
+            continue
+        left_numeric, right_numeric = left_item.isdigit(), right_item.isdigit()
+        if left_numeric and right_numeric:
+            return (int(left_item) > int(right_item)) - (int(left_item) < int(right_item))
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return (left_item > right_item) - (left_item < right_item)
+    return (len(left_pre) > len(right_pre)) - (len(left_pre) < len(right_pre))
 PATCH_FILES = {
     "cli": {"docker-compose.yml"},
     "web": {"docker-compose.yml", "nginx.conf", "backend/Dockerfile"},
@@ -156,16 +186,23 @@ def ensure_release_tags_available(manifest: Manifest, components: list[str]) -> 
     for key in components:
         target = manifest.components[key]
         try:
-            result = run(["git", "ls-remote", "--exit-code", target.repository, target.ref])
+            patterns = [target.ref]
+            if target.commit:
+                patterns.append(f"{target.ref}^{{}}")
+            result = run(["git", "ls-remote", "--exit-code", target.repository, *patterns])
         except ReleaseError:
             unavailable.append(f"{NAMES[key]} {target.version}")
             continue
-        if not result:
+        refs = {ref: sha for sha, ref in (line.split("\t", 1) for line in result.splitlines() if "\t" in line)}
+        actual = refs.get(f"{target.ref}^{{}}") or refs.get(target.ref)
+        if not actual:
             unavailable.append(f"{NAMES[key]} {target.version}")
+        elif target.commit and actual != target.commit:
+            unavailable.append(f"{NAMES[key]} {target.version} (tag commit differs from manifest)")
     if unavailable:
         missing = "\n".join(f"  - {component}" for component in unavailable)
         raise ReleaseError(
-            f"These pinned release tags are unavailable or unreachable:\n{missing}\n"
+            f"These pinned release tags are unavailable, unreachable, or changed:\n{missing}\n"
             "The release combination is not ready; no product checkout was created."
         )
 
@@ -258,6 +295,7 @@ class SourceTransaction:
         self.job: Path | None = None
 
     def preview(self) -> dict:
+        self._reject_downgrades()
         ensure_release_tags_available(self.manifest, self.selected)
         components = []
         for key in self.selected:
@@ -266,8 +304,30 @@ class SourceTransaction:
             target = self.manifest.components[key]
             components.append({"component": key, "current": current, "target": target.version, "ref": target.ref})
         return {"release": self.manifest.release, "channel": self.manifest.channel,
+                "installed_release": self.state.get("release") or "unrecorded",
+                "launcher_minimum": self.manifest.launcher_version,
+                "launcher_running": self.launcher_version,
                 "install_profile": self.state.get("install_profile") or self.state.get("mode"),
                 "runtime": self.state.get("cli_runtime", "docker"), "components": components}
+
+    def _reject_downgrades(self) -> None:
+        downgrades = []
+        for key in self.selected:
+            version_file = self.paths[key] / "VERSION"
+            current = version_file.read_text().strip() if version_file.is_file() else "unknown"
+            if current == "unknown":
+                continue
+            target = self.manifest.components[key].version
+            if compare_versions(current, target) > 0:
+                downgrades.append(f"{NAMES[key]} {current} -> {target}")
+        if downgrades:
+            details = "\n".join(f"  - {item}" for item in downgrades)
+            raise ReleaseError(
+                f"Installed release: {self.state.get('release') or 'unrecorded'}; selected release: "
+                f"{self.manifest.release}. The selected release would downgrade installed components:\n"
+                f"{details}\nNo files or services were changed. Use a matching or newer release "
+                "manifest when it is available."
+            )
 
     def checkpoint(self, phase: str) -> None:
         self.journal["phase"] = phase
@@ -281,6 +341,7 @@ class SourceTransaction:
     def prepare(self) -> None:
         if (self.install_dir / ".updates" / "active.json").exists():
             raise ReleaseError("An earlier update needs recovery. Run update --recover before another update.")
+        self._reject_downgrades()
         self.runtime.preflight(self.state, self.paths)
         self.job = self.install_dir / ".updates" / (time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8])
         self.job.mkdir(parents=True, mode=0o700)
@@ -447,7 +508,10 @@ class SourceTransaction:
 
 
 def preview_text(value: dict) -> str:
-    lines = [f"Release: {value['release']} ({value['channel']})", f"Installed selection: {value['install_profile']}"]
+    lines = [f"Installed release: {value['installed_release']}",
+             f"Selected release: {value['release']} ({value['channel']})",
+             f"Launcher: {value['launcher_running']} (minimum for selected release: {value['launcher_minimum']})",
+             f"Installed selection: {value['install_profile']}"]
     lines.extend(f"  {NAMES[item['component']]}: {item['current']} -> {item['target']}" for item in value["components"])
     return "\n".join(lines)
 

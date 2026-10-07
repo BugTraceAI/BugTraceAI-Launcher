@@ -530,6 +530,10 @@ ensure_kali_startup_command() {
         print "          echo '\''Required Kali tools are unavailable.'\'' >&2"
         print "          exit 1"
         print "        fi"
+        # Signal only after the complete required package transaction and
+        # optional nuclei attempt have finished. Early binary presence is not
+        # a reliable readiness check while apt is still running.
+        print "        touch /tmp/.bugtraceai-kali-ready"
         print "        echo '\''Kali toolbox ready!'\''"
         print "        exec tail -f /dev/null"
     }
@@ -1697,6 +1701,7 @@ launch_ai_installer() {
 
     chmod +x "$SCRIPT_DIR/ai_installer.py"
     info "Starting AI Setup & Repair Assistant (DeepSeek V4.1 Flash · Qwen 3.8 Max fallback)..."
+    export BTAI_INSTALLER_CONVERSATION=1
     exec python3 "$SCRIPT_DIR/ai_installer.py"
 }
 
@@ -2236,6 +2241,16 @@ wizard_show_summary() {
     echo -e "${BOLD}─────────────────────────────${NC}"
     echo ""
 
+    # The visual Launcher already displayed this exact selection in its
+    # review screen and the user explicitly chose Install. Preserve the
+    # classic wizard's confirmation for direct installs, but do not ask twice.
+    if [[ "${BUGTRACEAI_LAUNCHER_TUI_REVIEWED:-}" == "1" && \
+          "${BUGTRACEAI_LAUNCHER_TUI_CHILD:-}" == "1" && \
+          -n "${BTAI_SETUP_CONFIG:-}" ]]; then
+        info "Configuration already reviewed in the Launcher TUI."
+        return 0
+    fi
+
     echo -en "${YELLOW}Proceed with installation? [Y/n]: ${NC}"
     read -r confirm
     if [[ "$(to_lower "$confirm")" == "n" ]]; then
@@ -2456,6 +2471,9 @@ deploy() {
         error "Deployment stopped because Compose configuration patching failed."
         return 1
     fi
+    # A failed startup must retain the requested inventory for a later repair,
+    # without presenting that inventory as a verified installation.
+    save_state "$INSTALL_DIR/.launcher-pending.json" || return 1
     if ! start_services; then
         error "Deployment stopped because one or more selected services failed to start."
         return 1
@@ -2465,6 +2483,7 @@ deploy() {
         return 1
     fi
     save_state
+    rm -f -- "$INSTALL_DIR/.launcher-pending.json"
     if [[ "$CLI_GLOBAL" == yes ]]; then
         run_cli_installer --interface "$CLI_INTERFACE" --runtime docker --global yes --global-only || return 1
     fi
@@ -3221,13 +3240,13 @@ start_services() {
     if $INSTALL_BTAI; then
         if [[ ! -f "$BTAI_DIR/docker-compose.yml" ]]; then
             error "BugTraceAI-API docker-compose.yml not found — clone may have failed."
-            exit 1
+            return 1
         fi
         echo ""
         step "Building & starting BugTraceAI-API..."
         if ! _build_with_progress "BugTraceAI-API" _btai_compose up -d --build; then
             error "Failed to start BugTraceAI-API."
-            exit 1
+            return 1
         fi
         echo -e "    ${OK} BugTraceAI-API started"
     fi
@@ -3236,14 +3255,14 @@ start_services() {
     # service on the shared Docker network and can fail at startup if DNS is
     # resolved before the CLI container exists.
     if $INSTALL_CLI || $MCP_CLI_ENABLED; then
-        _start_cli_service || exit 1
+        _start_cli_service || return 1
     fi
 
     # Start WEB services
     if $INSTALL_WEB && [[ -n "$WEB_PORT" ]]; then
         if [[ ! -f "$WEB_DIR/docker-compose.yml" ]]; then
             error "WEB docker-compose.yml not found — clone may have failed."
-            exit 1
+            return 1
         fi
         echo ""
         step "Building & starting WEB services..."
@@ -3257,7 +3276,7 @@ start_services() {
             done
             echo -e "    ${DIM}Full log: ${build_log}${NC}"
             echo -e "    ${DIM}Or run: ./launcher.sh logs web${NC}"
-            exit 1
+            return 1
         fi
         echo -e "    ${OK} WEB services started"
     fi
@@ -3450,10 +3469,13 @@ health_checks() {
 
     if $MCP_KALI_ENABLED; then
         # Kali is a toolbox container, not an HTTP/SSE MCP endpoint.
-        local kali_status kali_ready=false attempt
-        for attempt in {1..20}; do
-            kali_status=$(docker ps --format '{{.Status}}' --filter "name=^kali-mcp-server$" 2>/dev/null | head -1)
-            if [[ -n "$kali_status" ]] && docker exec kali-mcp-server sh -lc 'command -v nmap >/dev/null && command -v hydra >/dev/null && command -v python3 >/dev/null' >/dev/null 2>&1; then
+        local kali_status kali_ready=false started=$SECONDS
+        local kali_timeout=${BUGTRACEAI_KALI_READY_TIMEOUT:-900}
+        [[ "$kali_timeout" =~ ^[1-9][0-9]*$ ]] || kali_timeout=900
+        info "Waiting for Kali toolbox tools (first startup installs packages; up to ${kali_timeout}s)..."
+        while (( SECONDS - started < kali_timeout )); do
+            kali_status=$(docker inspect --format '{{.State.Running}}' kali-mcp-server 2>/dev/null)
+            if [[ "$kali_status" == true ]] && docker exec kali-mcp-server sh -lc 'test -f /tmp/.bugtraceai-kali-ready && command -v nmap >/dev/null && command -v hydra >/dev/null && command -v python3 >/dev/null' >/dev/null 2>&1; then
                 kali_ready=true
                 break
             fi
@@ -3462,7 +3484,7 @@ health_checks() {
         if $kali_ready; then
             echo -e "    ${OK} Kali toolbox (running)"
         else
-            echo -e "    ${FAIL} Kali toolbox (not running)"
+            echo -e "    ${FAIL} Kali toolbox (tools not ready within ${kali_timeout}s; inspect docker logs kali-mcp-server)"
             all_ok=false
         fi
     fi
@@ -3478,7 +3500,8 @@ health_checks() {
 }
 
 save_state() {
-    cat > "$STATE_FILE" << EOF
+    local output_state="${1:-$STATE_FILE}"
+    cat > "$output_state" << EOF
 {
   "version": "${VERSION}",
   "mode": "${DEPLOY_MODE}",
@@ -3505,8 +3528,8 @@ save_state() {
   "deployed_at": "$(iso_date)"
 }
 EOF
-    chmod 600 "$STATE_FILE"
-    if $RELEASE_PINNED; then
+    chmod 600 "$output_state"
+    if [[ "$output_state" == "$STATE_FILE" ]] && $RELEASE_PINNED; then
         python3 "$SCRIPT_DIR/release_manager.py" record --install-dir "$INSTALL_DIR" || return 1
     fi
 }
@@ -3620,6 +3643,11 @@ show_success() {
 # ── Service Management Commands ──────────────────────────────────────────────
 
 load_state() {
+    local STATE_FILE="$STATE_FILE"
+    if [[ ! -f "$STATE_FILE" && -f "$INSTALL_DIR/.launcher-pending.json" ]]; then
+        STATE_FILE="$INSTALL_DIR/.launcher-pending.json"
+        warn "Loading the incomplete installation selection; health has not been verified yet."
+    fi
     if [[ ! -f "$STATE_FILE" ]]; then
         error "BugTraceAI not installed. Run: ./launcher.sh"
         exit 1
@@ -4057,10 +4085,29 @@ _teardown_all() {
         error "One or more Compose stacks could not be stopped; installation files were kept."
         return 1
     fi
+    _remove_global_btai_wrapper || {
+        error "Could not remove this installation's global btai command; installation files were kept."
+        return 1
+    }
     step "Removing $INSTALL_DIR..."
     _assert_safe_install_dir "$INSTALL_DIR" require_marker
     rm -rf "$INSTALL_DIR"
     return $?
+}
+
+# Remove only the generated command that points at this install. A different
+# BugTraceAI checkout may own the same per-user command and must be preserved.
+_remove_global_btai_wrapper() {
+    [[ "${CLI_GLOBAL:-no}" == yes ]] || return 0
+
+    local command_path="$HOME/.local/bin/btai" expected_line
+    [[ -f "$command_path" && ! -L "$command_path" ]] || return 0
+    printf -v expected_line 'exec bash %q "$@"' "$CLI_DIR/btai"
+    if grep -Fxq '# BugTraceAI global command' "$command_path" &&
+       grep -Fxq "$expected_line" "$command_path"; then
+        rm -f -- "$command_path" || return 1
+        info "Removed this installation's global btai command."
+    fi
 }
 
 # ── Docker Check ─────────────────────────────────────────────────────────────
@@ -4272,6 +4319,8 @@ cmd_install_plan() {
 }
 
 cmd_repair() {
+    local incomplete=false
+    [[ ! -f "$STATE_FILE" && -f "$INSTALL_DIR/.launcher-pending.json" ]] && incomplete=true
     load_state || return 1
     if $CLI_MANAGED; then
         run_cli_installer --reuse || return 1
@@ -4288,6 +4337,13 @@ cmd_repair() {
         patch_compose || return 1
         start_services || return 1
         health_checks || return 1
+    fi
+    if $incomplete; then
+        if [[ "$CLI_GLOBAL" == yes ]]; then
+            run_cli_installer --interface "$CLI_INTERFACE" --runtime "$CLI_RUNTIME" --global yes --global-only || return 1
+        fi
+        save_state || return 1
+        rm -f -- "$INSTALL_DIR/.launcher-pending.json"
     fi
     success "Repaired the saved installation; component choices and configuration kept."
 }

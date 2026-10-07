@@ -1,6 +1,7 @@
 """Run installer interaction inside a Textual screen, without suspending the TUI."""
 import codecs
 import errno
+import fcntl
 import os
 from pathlib import Path
 import pty
@@ -8,6 +9,7 @@ import re
 import select
 import signal
 import subprocess
+import struct
 import sys
 import termios
 import threading
@@ -50,12 +52,25 @@ class InstallerSession(ModalScreen[int]):
         self.start_session()
         self.query_one('#session-reply',Input).focus()
 
+    def set_terminal_size(self, fd):
+        # openpty defaults to 0x0. Terminal formatters then compute negative
+        # wrapping widths before the assistant can ask its first question.
+        rows=max(10, min(65535, self.host.size.height-8))
+        columns=max(20, min(65535, self.host.size.width-8))
+        fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',rows,columns,0,0))
+
+    def on_resize(self, event):
+        if self.master is not None:
+            try: self.set_terminal_size(self.master)
+            except OSError: pass
+
     @work(thread=True,exclusive=True)
     def start_session(self):
         decoder=codecs.getincrementaldecoder('utf-8')('replace')
         master,slave=pty.openpty()
         self.master=master
         try:
+            self.set_terminal_size(slave)
             # Children see an actual TTY; their native secret prompts remain native.
             self.process=subprocess.Popen([sys.executable,str(ROOT/'pty_child.py'),*self.command],
                 stdin=slave,stdout=slave,stderr=slave,env=self.env,close_fds=True)

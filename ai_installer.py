@@ -77,6 +77,8 @@ THINKING = "The AI is thinking" if _UTF8_ENABLED else "The AI is thinking"
 _bash = None
 _verification_completed = False
 _privilege_session: Optional[PrivilegeSession] = None
+_conversation_session = None
+_conversation_completed = False
 
 
 def _terminate_bash():
@@ -257,7 +259,7 @@ def _build_model_chain(provider):
             else core.DEFAULT_PRIMARY_MODEL,)
 
 try:
-    COLS = min(os.get_terminal_size().columns, 100)
+    COLS = max(20, min(os.get_terminal_size().columns, 100))
 except Exception:
     COLS = 80
 
@@ -853,7 +855,7 @@ def _resolve_deployment_context():
         from setup_form import load_config
         from dataclasses import replace
         configured=load_config(os.environ['BTAI_SETUP_CONFIG'])['ports']
-        names={'WEB_PORT':'web','CLI_PORT':'cli','MCP_PORT':'mcp','BTAI_PORT':'btai','BTAI_MCP_PORT':'btai_mcp'}
+        names={'WEB_PORT':'web','CLI_PORT':'cli','MCP_PORT':'mcp','BTAI_PORT':'btai','BTAI_MCP_PORT':'btai_mcp','RECON_PORT':'recon'}
         ports=replace(ports,**{names[k]:v for k,v in configured.items()})
     context = DeploymentContext(
         install_dir=INSTALL_DIR,
@@ -1335,6 +1337,9 @@ def _boot():
     # ── Boot ──────────────────────────────────────────────────────────────────────
     reconnect_tty_or_exit()
     _init_install_log()
+    if os.environ.get('BTAI_INSTALLER_CONVERSATION') == '1':
+        _boot_conversation()
+        return
     os.system("clear")
     print()
     bw = 56
@@ -1623,6 +1628,51 @@ tools = [
                        "properties": {"summary": {"type": "string", "description": "What was installed and how to access it."}},
                        "required": ["summary"]}}},
 ]
+_legacy_tools = tools
+
+
+def _boot_conversation():
+    """Authenticate the model, then ask the human before any host changes."""
+    global PROVIDER, MODEL_CHAIN, api_key, setup_action, SYSTEM, messages, tools
+    global _conversation_session, RELEASE_MANIFEST
+    from conversational_setup import ConversationSetup, tool_definitions
+
+    credentials = {}
+    if os.environ.get('BTAI_ASSISTANT_CREDENTIALS'):
+        credentials = json.loads(Path(os.environ['BTAI_ASSISTANT_CREDENTIALS']).read_text())
+    PROVIDER = credentials.get('provider') or _choose_provider()
+    if PROVIDER not in ('openrouter', 'anthropic'):
+        raise ValueError('Conversational setup currently supports OpenRouter or Anthropic.')
+    MODEL_CHAIN = _build_model_chain(PROVIDER)
+    api_key = credentials.get('api_key') or _load_saved_api_key(INSTALL_DIR, PROVIDER)
+    if not api_key:
+        api_key = getpass.getpass('Provider API key (local hidden input): ').strip()
+    if not api_key or not validate_key(PROVIDER, api_key):
+        raise ValueError('Provider credentials could not be verified.')
+    RELEASE_MANIFEST = None
+    setup_action = 'repair' if os.environ.get('BTAI_INSTALLER_ACTION') == 'repair' else 'conversation'
+
+    def ask(question):
+        bubble_ai(question)
+        answer = prompt_user()
+        bubble_user(answer)
+        return answer
+
+    _conversation_session = ConversationSetup(
+        Path(__file__).parent, INSTALL_DIR, PROVIDER, api_key,
+        ask=ask, emit=bubble_ai)
+    SYSTEM = _conversation_session.system_prompt()
+    context = 'The user opened the AI assistant. Ask how you can help: installation, diagnosis or repair.'
+    if setup_action == 'repair':
+        context = 'The user wants help diagnosing or repairing an installation. Ask what went wrong, then inspect evidence before changes.'
+    if os.environ.get('BTAI_SETUP_CONFIG'):
+        from setup_form import load_config
+        suggestion = load_config(os.environ['BTAI_SETUP_CONFIG'])
+        suggestion.pop('api_key', None)
+        context += '\nPrevious Wizard selection (context, not permission to install or reinstall):\n' + json.dumps(suggestion)
+    tools = tool_definitions(_legacy_tools)
+    messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': context}]
+    bubble_ai('Hello. I can help you install, diagnose or repair BugTraceAI. We will review changes together in this TUI.')
 
 
 # ── API call (effect) with pure retry policy and typed result ─────────────────
@@ -1825,7 +1875,10 @@ def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
     Python memory or a command string.  The child stays in the installer TTY
     session so Ubuntu tty_tickets still apply.
     """
+    global _privilege_session
     safe_cmd, was_followed = core.harden_command(cmd)
+    if _conversation_session is not None and _privilege_session is None:
+        _privilege_session = PrivilegeSession()
     if _privilege_session is None or not _privilege_session.ensure():
         return 1, _AUTH_REQUIRED
 
@@ -1993,6 +2046,37 @@ def _dispatch_tool(tc):
     _consecutive_tool_protocol_errors = 0
     args = parsed.value
 
+    if _conversation_session is not None:
+        if tc.name == 'finish':
+            global _verification_completed, _conversation_completed
+            summary = args.get('summary', '')
+            if not isinstance(summary, str):
+                return _protocol_error(tc, "'summary' must be a string.")
+            _verification_completed = _conversation_session.verified
+            _conversation_completed = True
+            previous_reply = next((m.get('content') for m in reversed(globals().get('messages', []))
+                                   if m.get('role') == 'assistant'), None)
+            if summary and not previous_reply:
+                bubble_ai(summary)
+            result = 'Installation health verified by the Launcher.' if _verification_completed else 'Diagnosis complete. No installation success is declared.'
+            info(result)
+            return ToolOutcome(_tool_result(tc.id, tc.name, result), finished=True)
+        operations = {
+            'read_skill': lambda: _conversation_session.read_skill(args.get('name')),
+            'inspect_installation': _conversation_session.inspect,
+            'prepare_installation': lambda: _conversation_session.prepare(args),
+            'install_selection': _conversation_session.install,
+            'repair_installation': _conversation_session.repair,
+        }
+        if tc.name in operations:
+            try:
+                result = operations[tc.name]()
+                _verification_completed = _conversation_session.verified
+                content = result if isinstance(result, str) else json.dumps(result)
+            except (OSError, ValueError, RuntimeError) as exc:
+                content = f'ERROR: {exc}. Keep the conversation open; ask the user about the next step.'
+            return ToolOutcome(_tool_result(tc.id, tc.name, core.redact_sensitive_output(content, (api_key,))))
+
     if tc.name == "run_command":
         return ToolOutcome(_run_shell_tool(tc, args, privileged=False))
     if tc.name == "run_privileged_command":
@@ -2073,8 +2157,11 @@ def _report_turn_limit(limit):
 
 
 def main():
-    global _bash, _verification_completed
+    global _bash, _verification_completed, _conversation_session, _conversation_completed, tools
     _verification_completed = False
+    _conversation_session = None
+    _conversation_completed = False
+    tools = _legacy_tools
     atexit.register(_terminate_bash)
     atexit.register(_cleanup_terminal)
     atexit.register(_close_privilege_session)
@@ -2108,7 +2195,7 @@ def main():
         if answer.lower() in _EXIT_ANSWERS:
             print(f"\n{CYAN}  Done. See you later.{RESET}\n")
             _close_persistent_shell()
-            return 0 if _verification_completed else 130
+            return 0 if _verification_completed or _conversation_completed else 130
         if answer:
             bubble_user(answer)
             messages.append({"role": "user", "content": answer})
@@ -2138,7 +2225,7 @@ def main():
                 _report_turn_limit(SUPPORT_TURNS)
 
     _close_persistent_shell()
-    if _verification_completed:
+    if _verification_completed or _conversation_completed:
         return 0
     return 1 if outcome == LoopOutcome.ERROR else 130
 
