@@ -1001,6 +1001,7 @@ def verification_checks(mode: str, install_dir: str,
         checks.append(container_check("Kali toolbox container", "kali-mcp-server"))
         checks.append(Check("Kali toolbox tools",
                             "docker exec kali-mcp-server bash -lc " + shlex.quote(
+                                'test -f /tmp/.bugtraceai-kali-ready || exit 1; '
                                 'for tool in nmap ffuf sqlmap dirb gobuster nikto hydra john hashcat '
                                 'curl wget nc python3 pip3 git vim; do '
                                 'command -v "$tool" >/dev/null || exit 1; done; echo ready'),

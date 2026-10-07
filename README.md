@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-3.3.26-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.31-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
@@ -22,8 +22,9 @@ Launcher version source of truth: [VERSION](VERSION)
 
 The Launcher installs BugTraceAI-WEB, BugTraceAI-CLI and BugTraceAI-API as
 independent products or in any combination. Enter and verify a provider key,
-choose the standard Wizard or the built-in AI installer, select modules and
-ports, and review the plan before installing. Component `install.sh` entry
+choose the standard Wizard or talk to the built-in AI assistant. The Wizard
+uses module checkboxes; the assistant asks what you want to install or repair.
+Both review the plan before installing. Component `install.sh` entry
 points open this same TUI. Direct component installation remains available for
 scripts and coding agents.
 
@@ -55,25 +56,27 @@ Anthropic checks verify access without generating text; Z.ai uses a short test
 request, so provider usage may apply. A successful access check does not
 guarantee sufficient balance or model access for a complete scan.
 
-Next choose **Install with Wizard** or **Install with AI**. Both remain inside
-the TUI and use the same product checkbox form. WEB, CLI and the API-target
-engine are independent; only checked modules are installed. WEB-only can
-connect to external engines later. Enable the optional CLI TUI separately.
-Docker is the default; Advanced offers local Python for CLI-only selections.
-The provider key stays masked and is passed to installation in a private
-configuration file. Configure only the ports used by selected modules.
-reconFTW and Kali require WEB and CLI to both be selected.
+Next choose **Install with Wizard** for module checkboxes or **Talk to AI**
+for a conversation. The assistant asks whether you want to install, diagnose
+or repair, then asks about modules, runtime and ports. Both stay inside the TUI.
+WEB, CLI and the API-target engine are independent. Only the modules you
+select are installed; WEB-only can connect to external engines later.
 
-Review the selected products and confirm installation with your chosen method.
-Both stay inside the TUI: output and conversation appear in an embedded session,
-with a reply field for questions and native hidden credential/password prompts.
-Stop ends the child session; Back returns after it ends. The built-in AI
-installer uses provider model tokens and supports API-only or the full
-platform selection: WEB, CLI, API and the CLI TUI, with OpenRouter or
-Anthropic. Use the Wizard for every other combination and for Z.ai.
-Installation always requires the verified provider key; only AI-assisted
-setup makes model calls for its conversation. Update and AI repair are
-separate actions for existing installations.
+Docker is the default; local Python is available for CLI-only selections.
+The provider key stays masked and is passed locally in a private file.
+Configure only selected service ports. reconFTW and Kali require both WEB and
+CLI, and reconFTW has its own editable MCP port.
+
+The AI reviews the final plan and asks for confirmation before installation.
+An occupied port is discussed with you; it is never silently replaced.
+Installations use the same validated Launcher backend as the Wizard for all
+module combinations. OpenRouter/Anthropic power the conversation; use Wizard
+for Z.ai. Only the AI assistant makes model calls for its conversation.
+
+Output and replies appear in an embedded session, including native hidden
+password prompts. A failed install stays available for diagnosis. The result
+screen also offers **Ask AI**. Stop ends the child session; Back returns after
+it ends. Update and diagnosis remain separate from installing new modules.
 
 The TUI uses Python 3.10+ and installs pinned Textual into an isolated
 per-user cache. If the TUI runtime cannot start, the compatible text wizard
@@ -101,10 +104,10 @@ source in [component-bootstrap.sh](component-bootstrap.sh).
 
 ### Release validation
 
-The v3.3.26 automated Launcher suite passed with 399 tests and 25 subtests.
-A clean Lubuntu VM confirmed the TUI starts and rejects an invalid provider
-key. A complete module installation and a live scan were not performed in this
-release check.
+The automated Launcher suite covers module selection, updates, provider and
+assistant flows, Docker readiness, and bootstrap failure handling. A successful
+local test run does not replace a clean install and service check for the exact
+public release combination.
 
 ### Auto-Installation (Linux)
 
@@ -494,17 +497,24 @@ The built-in **Install with AI** choice is an installation assistant inside the
 Launcher TUI. It is separate from the coding-agent prompt above and from
 **Repair / diagnose** for an existing installation.
 
-Enter and verify the required provider key first, then choose Install with AI
-and check the modules you want. The assistant uses OpenRouter or Anthropic
-model calls, which can incur usage charges. It currently supports an
-API-only install or the full platform selection: WEB, CLI, API and the CLI TUI.
-Use **Install with Wizard** for WEB-only, CLI-only, other combinations and
-Z.ai. The Wizard
-supports all available module combinations.
+Enter and verify the provider key, then choose **Talk to AI**. The assistant
+asks what you want to do before making system changes. It can install any
+independent module combination, diagnose an error or repair an existing
+installation. It asks about conflicting ports and reviews the final selection
+with you before the host runs the standard Launcher.
 
-AI-assisted installation runs inside the TUI, uses the reviewed selection and
-does not start a scan. The provider key is entered locally and stays masked;
-the assistant does not ask you to put the secret into the conversation.
+The system instructions live in [assistant/AGENT.md](assistant/AGENT.md).
+The assistant loads focused guidance for [installation](assistant/skills/install.md),
+[repair](assistant/skills/repair.md) and [ports](assistant/skills/ports.md).
+These are application resources, not instructions for your coding agent.
+Provider keys remain local; the conversation uses OpenRouter or Anthropic
+model calls and can incur usage charges. Use Wizard for Z.ai.
+
+A failed deployment keeps its non-secret selection in `.launcher-pending.json`
+so repair can preserve the requested modules and ports. It is promoted to
+`.launcher-state` only after health verification passes. Kali first startup
+can take several minutes to install tools; its readiness check waits for them.
+No scan starts as part of installation or repair.
 
 ## License
 

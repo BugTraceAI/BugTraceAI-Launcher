@@ -5,7 +5,7 @@ from pathlib import Path
 import socket
 
 PORT_KEYS = {'web': 'WEB_PORT', 'cli': 'CLI_PORT', 'cli_mcp': 'MCP_PORT',
-             'api': 'BTAI_PORT', 'api_mcp': 'BTAI_MCP_PORT'}
+             'api': 'BTAI_PORT', 'api_mcp': 'BTAI_MCP_PORT', 'recon': 'RECON_PORT'}
 
 @dataclass
 class SetupSelection:
@@ -41,7 +41,8 @@ class SetupSelection:
         if self.web: keys.append('web')
         if self.cli: keys.extend(('cli', 'cli_mcp'))
         if self.api: keys.extend(('api', 'api_mcp'))
-        return {k: self.ports.get(k) for k in keys}
+        if self.recon: keys.append('recon')
+        return {k: self.ports.get(k, 8002 if k == 'recon' else None) for k in keys}
 
     def validate(self, check_available=False):
         self.profile
@@ -102,6 +103,10 @@ def load_config(path):
     if profile.install_web: required.add('WEB_PORT')
     if profile.install_cli: required.update(('CLI_PORT','MCP_PORT'))
     if profile.install_api: required.update(('BTAI_PORT','BTAI_MCP_PORT'))
+    if data['recon']:
+        required.add('RECON_PORT')
+        # Accept handoffs produced by older Launchers, which omitted this port.
+        ports.setdefault('RECON_PORT', 8002)
     if set(ports) != required: raise ValueError('Missing or unrelated service ports')
     if data['global']=='yes' and (not profile.install_cli or profile.cli_interface=='api'): raise ValueError('Global btai needs the TUI')
     for port in ports.values():

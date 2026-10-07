@@ -339,8 +339,8 @@ class LauncherTUI(App[int]):
             yield Static("HOW WOULD YOU LIKE TO INSTALL?", classes="panel-title")
             yield Button("Install with Wizard", id="choose-wizard", variant="primary")
             yield Static("Guided setup. Choose modules, ports and runtime, then review the installation.", classes="method-description")
-            yield Button("Install with AI", id="choose-ai")
-            yield Static("AI-assisted setup and troubleshooting in this TUI. Uses provider tokens. Currently supports API-only or the complete WEB + CLI + API platform with OpenRouter/Anthropic.", classes="method-description")
+            yield Button("Talk to AI · install or repair", id="choose-ai")
+            yield Static("Tell the assistant what you want to install or what went wrong. It asks questions, reviews your choices and stays in this TUI. Uses OpenRouter/Anthropic provider tokens.", classes="method-description")
         with VerticalScroll(id="choice-panel"):
             with Vertical(id="modules-form"):
                 with Vertical(classes="module-card",id="web-card"):
@@ -353,6 +353,8 @@ class LauncherTUI(App[int]):
                     yield Static("Toolboxes require CLI selected.")
                     yield Static("WEB port")
                     yield Input(value="6869", placeholder="WEB port", type="integer", id="port-web")
+                    yield Static("reconFTW MCP port", id="recon-port-label")
+                    yield Input(value="8002", placeholder="reconFTW MCP port", type="integer", id="port-recon")
                 with Vertical(classes="module-card",id="cli-card"):
                     yield Static("BugTraceAI-CLI", classes="module-title")
                     yield Static("Independent web-scanning engine · REST / MCP and optional terminal")
@@ -405,6 +407,7 @@ class LauncherTUI(App[int]):
             yield Button("Install selection", id="install-button", variant="primary")
         with Horizontal(id="result-actions"):
             yield Button("Open terminal workspace", id="open-tui-button", variant="primary")
+            yield Button("Ask AI", id="result-ai-button")
             yield Button("Back to profiles", id="back-button")
             yield Button("Quit", id="result-quit-button")
         yield Static("↑↓ profile  ·  Tab settings  ·  Enter focus Install  ·  q quit", id="footer")
@@ -429,7 +432,7 @@ class LauncherTUI(App[int]):
     def form_selection(self) -> SetupSelection:
         def checked(name): return self.query_one(name, Checkbox).value
         ports = {}
-        for key in ("web", "cli", "cli_mcp", "api", "api_mcp"):
+        for key in ("web", "cli", "cli_mcp", "api", "api_mcp", "recon"):
             value = self.query_one("#port-"+key, Input).value
             ports[key] = int(value) if value.isdecimal() else None
         return SetupSelection(
@@ -446,6 +449,8 @@ class LauncherTUI(App[int]):
         effective_api = selection.api
         for name in ("#recon-toggle", "#kali-toggle", "#port-web"):
             self.query_one(name).disabled = not selection.web
+        for name in ("#port-recon", "#recon-port-label"):
+            self.query_one(name).display = selection.recon
         for name in ("#select-tui", "#port-cli", "#port-cli_mcp"):
             self.query_one(name).disabled = not effective_cli
         for name in ("#port-api", "#port-api_mcp"):
@@ -498,6 +503,9 @@ class LauncherTUI(App[int]):
             self.notify("AI installation supports OpenRouter/Anthropic. Use Wizard for Z.ai.", severity="error")
             return
         self.install_method = method
+        if method == "ai":
+            self.run_ai_assistant()
+            return
         self.show_setup_step(0)
 
     def show_setup_step(self, step: int) -> None:
@@ -508,8 +516,6 @@ class LauncherTUI(App[int]):
             try:
                 selection = self.form_selection().validate()
                 self.selected = next(p for p in self.profiles if p.key == selection.profile)
-                if self.install_method == "ai" and selection.profile not in {"web", "full", "api"}:
-                    raise ValueError("AI setup supports API-only or WEB + CLI + API. Go Back to choose Wizard for this selection.")
             except ValueError as error:
                 self.notify(str(error), severity="error", title="Review your selection")
                 return
@@ -572,28 +578,38 @@ class LauncherTUI(App[int]):
             self.notify(str(error),severity="error"); return
         config=self.configuration_file(selection)
         env=os.environ.copy()
-        env.update({"BTAI_SETUP_CONFIG":str(config),"BUGTRACEAI_LAUNCHER_TUI_CHILD":"1", "BUGTRACEAI_LAUNCHER_SKIP_POST_INSTALL":"1", "BUGTRACEAI_MCP_SELECTION_PRESET":"1", "BUGTRACEAI_MCP_RECON":str(selection.recon).lower(),"BUGTRACEAI_MCP_KALI":str(selection.kali).lower()})
+        env.update({"BTAI_SETUP_CONFIG":str(config),"BUGTRACEAI_LAUNCHER_TUI_CHILD":"1", "BUGTRACEAI_LAUNCHER_TUI_REVIEWED":"1", "BUGTRACEAI_LAUNCHER_SKIP_POST_INSTALL":"1", "BUGTRACEAI_MCP_SELECTION_PRESET":"1", "BUGTRACEAI_MCP_RECON":str(selection.recon).lower(),"BUGTRACEAI_MCP_KALI":str(selection.kali).lower()})
         self._run_child(install_command(self.selected,selection.runtime,selection.global_command and selection.tui),env,"install",config=config,secrets=[selection.api_key])
 
     def run_ai_assistant(self, repair: bool = False) -> None:
         env=os.environ.copy(); config=None; secrets=[]
-        for key in ("BUGTRACEAI_PROFILE","BTAI_INSTALLER_MODE","BTAI_INSTALLER_RUNTIME","BTAI_INSTALLER_GLOBAL","BTAI_INSTALLER_MCP_RECON","BTAI_INSTALLER_MCP_KALI","BTAI_SETUP_CONFIG"):
+        for key in ("BUGTRACEAI_PROFILE","BTAI_INSTALLER_MODE","BTAI_INSTALLER_RUNTIME","BTAI_INSTALLER_GLOBAL","BTAI_INSTALLER_MCP_RECON","BTAI_INSTALLER_MCP_KALI","BTAI_SETUP_CONFIG","BTAI_ASSISTANT_CREDENTIALS"):
             env.pop(key,None)
         env['BTAI_INSTALLER_ACTION']='repair' if repair else 'install'
         if not repair:
             if not self.credentials_verified():
                 self.show_setup_step(-2); return
-            try: selection=self.form_selection().validate(check_available=True)
-            except ValueError as error:
-                self.notify(str(error),severity="error"); return
-            if selection.profile not in {"web","full","api"}:
-                self.notify("Use standard installation for this independent combination. AI repair remains available separately.",severity="error"); return
-            if selection.provider == "zai":
-                self.notify("Use standard installation for Z.ai, or choose OpenRouter/Anthropic for AI setup.",severity="error"); return
-            config=self.configuration_file(selection); secrets=[selection.api_key]
-            env['BTAI_SETUP_CONFIG']=str(config)
-            env.update({'BUGTRACEAI_PROFILE':selection.profile,'BTAI_INSTALLER_RUNTIME':selection.runtime,'BTAI_INSTALLER_GLOBAL':'yes' if selection.global_command and selection.tui else 'no','BTAI_INSTALLER_MCP_RECON':str(selection.recon).lower(),'BTAI_INSTALLER_MCP_KALI':str(selection.kali).lower()})
-        self._run_child(['ai'],env,'assistant' if repair else 'install',config=config,secrets=secrets)
+        provider=str(self.query_one('#form-provider',Select).value)
+        if provider == 'zai':
+            self.notify("Choose OpenRouter/Anthropic for AI conversation, or use Wizard for Z.ai.",severity="error"); return
+        key=self.query_one('#form-key',Input).value.strip()
+        # A reviewed Wizard selection is useful repair context. Occupied ports
+        # are discussed by the assistant instead of preventing the chat opening.
+        if self.setup_step == 1 and key:
+            try:
+                config=self.configuration_file(self.form_selection().validate())
+                env['BTAI_SETUP_CONFIG']=str(config)
+            except ValueError:
+                pass
+        if config is None:
+            fd,path=tempfile.mkstemp(prefix='btai-assistant-',suffix='.json')
+            with os.fdopen(fd,'w') as stream:
+                json.dump({'provider':provider,'api_key':key},stream)
+            config=Path(path)
+        env.update({'BTAI_INSTALLER_CONVERSATION':'1','BTAI_ASSISTANT_CREDENTIALS':str(config),
+                    'BUGTRACEAI_LAUNCHER_TUI_CHILD':'1','BUGTRACEAI_DIR':str(self.install_dir)})
+        secrets=[key] if key else []
+        self._run_child(['ai'],env,'assistant',config=config,secrets=secrets)
 
     def review_update(self) -> None:
         from release_manager import Manifest, SourceTransaction, ReleaseError
@@ -622,15 +638,12 @@ class LauncherTUI(App[int]):
                 after=state.stat().st_mtime_ns if state.exists() else None
                 if after is None or after == before: code=130
             self.install_exit_code=code
-            self.query_one('#provider-panel').display=False
-            self.query_one('#method-panel').display=False
-            self.query_one('#choice-panel').display=False
-            self.query_one('#workspace').display=False
-            self.query_one('#setup-actions').display=False
             self.show_result(kind,code)
         self.push_screen(InstallerSession(command,env,secrets=secrets,cleanup=cleanup),completed)
 
     def show_result(self, kind: str, exit_code: int) -> None:
+        for name in ('provider-panel','method-panel','choice-panel','workspace','setup-actions'):
+            self.query_one('#'+name).display=False
         panel = self.query_one("#result-panel", Vertical)
         panel.display = True
         if exit_code == 130:
@@ -642,6 +655,8 @@ class LauncherTUI(App[int]):
             message = "The Launcher finished without an installation error. Review the service URLs shown above the terminal prompt."
             if kind == "update":
                 message = "The selected release versions are active and all required runtime checks passed. Your existing settings and data were retained."
+            elif kind == "assistant":
+                message = "The assistant session ended. Read its report for the diagnosis and any verified installation checks."
             color = "#2ECC71"
         else:
             title = "SETUP NEEDS ATTENTION" if kind == "install" else "ASSISTANT SESSION ENDED WITH AN ERROR"
@@ -657,8 +672,9 @@ class LauncherTUI(App[int]):
         self.query_one("#result-actions", Horizontal).display = True
         self.query_one("#result-quit-button", Button).display = True
         self.query_one("#open-tui-button", Button).display = exit_code == 0 and kind == "install" and has_tui(self.selected)
+        self.query_one("#result-ai-button", Button).display = exit_code not in (0,130) and kind in {"install","update"}
         self.query_one("#back-button", Button).display = kind in {"install", "update", "assistant"}
-        self.query_one("#footer", Static).update("Enter on Install starts setup   ·   Tab edit options   ·   q quit")
+        self.query_one("#footer", Static).update("Review the report   ·   Ask AI for diagnosis   ·   Back to setup   ·   q quit")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         button = event.button.id
@@ -684,6 +700,8 @@ class LauncherTUI(App[int]):
         elif button == "next-button":
             self.show_setup_step(1)
         elif button == "repair-button":
+            self.run_ai_assistant(repair=True)
+        elif button == "result-ai-button":
             self.run_ai_assistant(repair=True)
         elif button == "install-button":
             self.run_install()
