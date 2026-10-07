@@ -12,7 +12,7 @@
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-  <img src="https://img.shields.io/badge/Version-3.3.31-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.32-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
@@ -75,8 +75,10 @@ for Z.ai. Only the AI assistant makes model calls for its conversation.
 
 Output and replies appear in an embedded session, including native hidden
 password prompts. A failed install stays available for diagnosis. The result
-screen also offers **Ask AI**. Stop ends the child session; Back returns after
-it ends. Update and diagnosis remain separate from installing new modules.
+screen also offers **Ask AI**. When an operation succeeds, the session explains
+the result and **Exit** returns to the result screen; after a failure or stop,
+**Back** returns so you can review the output. Update and diagnosis remain
+separate from installing new modules.
 
 The TUI uses Python 3.10+ and installs pinned Textual into an isolated
 per-user cache. If the TUI runtime cannot start, the compatible text wizard

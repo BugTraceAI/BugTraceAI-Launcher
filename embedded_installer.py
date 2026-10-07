@@ -26,14 +26,15 @@ class InstallerSession(ModalScreen[int]):
     InstallerSession { background: #1A0F2E; padding: 1 2; }
     #session-title { height: 2; color: #FF7F50; text-style: bold; }
     #session-log { height: 1fr; background: #211338; border: round #594477; }
-    #reply-label { height: 1; color: #B9A9D3; }
+    #reply-label { height: 2; color: #B9A9D3; }
     #session-reply { height: 3; background: #302047; }
     #session-actions { height: 3; align-horizontal: right; }
     #session-actions Button { margin-left: 1; }
     '''
-    def __init__(self, command, env, secrets=(), cleanup=None):
+    def __init__(self, command, env, secrets=(), cleanup=None, kind=None):
         super().__init__()
         self.command=command; self.env=env; self.secrets=list(filter(None,secrets)); self.cleanup=cleanup
+        self.kind=kind
         self.process=None; self.master=None; self.exit_code=None; self.cancelled=False
         self.stop_requested=threading.Event()
 
@@ -131,8 +132,36 @@ class InstallerSession(ModalScreen[int]):
 
     def finished(self,code):
         self.exit_code=code
-        self.query_one('#session-title',Static).update('Session stopped' if self.cancelled else f'Session ended · exit {code}')
-        self.query_one('#close-session',Button).disabled=False
+        title=self.query_one('#session-title',Static)
+        detail=self.query_one('#reply-label',Static)
+        close_button=self.query_one('#close-session',Button)
+        if self.cancelled:
+            title.update('Session stopped · completion was not confirmed')
+            detail.update('Review the output above, then choose Back to return.')
+            title.styles.color='#FF7F50'
+            close_button.label='Back'
+        elif code == 0:
+            success_titles={
+                'install':'Installation completed successfully',
+                'update':'Update completed successfully',
+                'assistant':'Assistant session completed successfully',
+            }
+            operation=success_titles.get(self.kind,'Session completed successfully')
+            title.update(f'{operation} · exit 0')
+            if self.kind == 'install':
+                detail.update('The installer finished successfully. Review the service URLs above, then choose Exit.')
+            elif self.kind == 'update':
+                detail.update('The update finished successfully. Review the output above, then choose Exit.')
+            else:
+                detail.update('The session finished successfully. Review the output above, then choose Exit.')
+            title.styles.color='#2ECC71'
+            close_button.label='Exit'
+        else:
+            title.update(f'Process ended with an error · exit {code}')
+            detail.update('The operation did not complete successfully. Review the output above before choosing Back.')
+            title.styles.color='#FF7F50'
+            close_button.label='Back'
+        close_button.disabled=False
         self.query_one('#stop-session',Button).disabled=True
         self.query_one('#session-reply',Input).disabled=True
         self.query_one('#send-reply',Button).disabled=True

@@ -639,7 +639,7 @@ class LauncherTUI(App[int]):
                 if after is None or after == before: code=130
             self.install_exit_code=code
             self.show_result(kind,code)
-        self.push_screen(InstallerSession(command,env,secrets=secrets,cleanup=cleanup),completed)
+        self.push_screen(InstallerSession(command,env,secrets=secrets,cleanup=cleanup,kind=kind),completed)
 
     def show_result(self, kind: str, exit_code: int) -> None:
         for name in ('provider-panel','method-panel','choice-panel','workspace','setup-actions'):
