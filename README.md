@@ -5,7 +5,8 @@
 <h1 align="center">BugTraceAI Launcher</h1>
 
 <p align="center">
-  Universal installer for BugTraceAI: terminal, WEB and scanning servers.
+  Guided installation and service management for the BugTraceAI suite.<br/>
+  Choose WEB, the CLI web engine, the API-target engine or a combination.
 </p>
 
 <p align="center">
@@ -19,7 +20,7 @@
 
 Launcher version source of truth: [VERSION](VERSION)
 
-The Launcher installs BugTraceAI-WEB, BugTraceAI-CLI and BugTraceAI-API as
+The Launcher installs [BugTraceAI-WEB](https://github.com/BugTraceAI/BugTraceAI-WEB), [BugTraceAI-CLI](https://github.com/BugTraceAI/BugTraceAI-CLI) and [BugTraceAI-API](https://github.com/BugTraceAI/BugTraceAI-API) as
 independent products or in any combination. Enter and verify a provider key,
 choose the standard Wizard or talk to the built-in AI assistant. The Wizard
 uses module checkboxes; the assistant asks what you want to install or repair.
@@ -30,7 +31,8 @@ scripts and coding agents.
 [Install](#quick-start) · [Choose a profile](#universal-installation-profiles) ·
 [Manage services](#commands) · [Updates](#compatible-updates) ·
 [Install with your own agent](#installation-by-your-own-ai-agent) ·
-[Releases](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases)
+[Releases](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases) ·
+[Explore the suite](https://github.com/BugTraceAI/BugTraceAI)
 
 ## Quick Start
 
@@ -449,9 +451,8 @@ Switching interfaces does not automatically uninstall existing packages.
 
 `./launcher.sh tui` honors the saved runtime, including Docker in full-platform
 installations. `BUGTRACEAI_CLI_PATH` explicitly selects a local checkout before
-saved routing. In the development workspace, the sibling
-`BugTraceAI-CLI-refactor` checkout is preferred; standalone public installations
-also support a sibling `BugTraceAI-CLI` checkout. CLI 3.x checkouts cannot open
+saved routing. Standalone public installations also support a sibling
+`BugTraceAI-CLI` checkout. CLI 3.x checkouts cannot open
 this workspace; compatibility is checked before starting
 TUI services.
 
