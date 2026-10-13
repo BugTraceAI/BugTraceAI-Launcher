@@ -8,7 +8,7 @@
       "repository": "https://github.com/BugTraceAI/BugTraceAI-CLI.git",
       "ref": "refs/tags/v4.0.33-beta",
       "version": "4.0.33-beta",
-      "commit": "834a3a05c9dcaf947da463fa210f8cd3e39ba674"
+      "commit": "30cfa959e2bd9b6032fd6366bf63e6dc93d5e9bb"
     },
     "web": {
       "repository": "https://github.com/BugTraceAI/BugTraceAI-WEB.git",
