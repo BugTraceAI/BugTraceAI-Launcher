@@ -752,7 +752,7 @@ def _capture_host_command(argv, timeout=5):
     try:
         proc = subprocess.run(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as ex:
         return 1, str(ex)
@@ -766,7 +766,8 @@ def _capture_host_command(argv, timeout=5):
     try:
         privileged = subprocess.run(
             ["sudo", "-n", *argv], stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, timeout=timeout,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout,
         )
         return privileged.returncode, privileged.stdout or ""
     except (OSError, subprocess.TimeoutExpired) as ex:
@@ -1111,7 +1112,7 @@ patch_compose
             str(context.ports.mcp or ""),
             str(context.ports.recon or ""),
         ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=120)
+            text=True, encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"Could not prepare WEB/agent sources: {exc}"
     if proc.returncode != 0:
@@ -1764,7 +1765,8 @@ def _spawn_bash():
     return subprocess.Popen(
         ["/bin/bash", "-o", "pipefail"], env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, start_new_session=True)
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+        start_new_session=True)
 
 
 
@@ -1888,7 +1890,8 @@ def run_privileged_cmd(cmd, timeout=CMD_TIMEOUT_DEFAULT, spinner=None):
     def _run_once():
         try:
             proc = spawn_killable_process(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
             )
         except OSError as exc:
             return 1, str(exc)
