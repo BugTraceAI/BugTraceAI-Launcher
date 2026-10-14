@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "release": "2026.10.13-beta.2",
+  "release": "2026.10.15-beta.1",
   "channel": "beta",
-  "launcher_version": "3.3.34",
+  "launcher_version": "3.3.35",
   "components": {
     "cli": {
       "repository": "https://github.com/BugTraceAI/BugTraceAI-CLI.git",
-      "ref": "refs/tags/v4.0.34-beta",
-      "version": "4.0.34-beta",
-      "commit": "906e95fc8ae16cbb7a7c399dd3cc39ca551e6628"
+      "ref": "refs/tags/v4.0.35-beta",
+      "version": "4.0.35-beta",
+      "commit": "f67d627e66e3bb80399ea86821bf25b4cdfd46bc"
     },
     "web": {
       "repository": "https://github.com/BugTraceAI/BugTraceAI-WEB.git",
