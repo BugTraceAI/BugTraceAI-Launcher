@@ -5,14 +5,13 @@
 <h1 align="center">BugTraceAI Launcher</h1>
 
 <p align="center">
-  Guided installation and service management for the BugTraceAI suite.<br/>
-  Choose WEB, the CLI web engine, the API-target engine or a combination.
+  Universal installer for BugTraceAI: terminal, WEB and scanning servers.
 </p>
 
 <p align="center">
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
-  <img src="https://img.shields.io/badge/Version-3.3.35-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.38-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
@@ -20,7 +19,7 @@
 
 Launcher version source of truth: [VERSION](VERSION)
 
-The Launcher installs [BugTraceAI-WEB](https://github.com/BugTraceAI/BugTraceAI-WEB), [BugTraceAI-CLI](https://github.com/BugTraceAI/BugTraceAI-CLI) and [BugTraceAI-API](https://github.com/BugTraceAI/BugTraceAI-API) as
+The Launcher installs BugTraceAI-WEB, BugTraceAI-CLI and BugTraceAI-API as
 independent products or in any combination. Enter and verify a provider key,
 choose the standard Wizard or talk to the built-in AI assistant. The Wizard
 uses module checkboxes; the assistant asks what you want to install or repair.
@@ -28,11 +27,27 @@ Both review the plan before installing. Component `install.sh` entry
 points open this same TUI. Direct component installation remains available for
 scripts and coding agents.
 
+When the selected directory contains a registered installation, the Launcher
+opens **Installation detected** instead of asking for a new provider key.
+Choose **Update** to review the pinned release plan or **Repair**
+to rebuild and verify the saved selection without pulling new versions. Saved
+ports, provider settings and data are retained. Interrupted installations offer
+repair; missing or invalid state offers AI diagnosis, not a guessed update.
+Use **Check path** to select an installation in another directory. **New
+installation** requires a separate empty directory and does not erase the old one.
+
+An adopted installation can retain explicit component directories and Compose
+project names. After reviewing and restoring its saved state, use
+`./launcher.sh register /path/to/installation` once; subsequent commands find
+that installation without requiring `BUGTRACEAI_DIR` each time. Explicit
+`BUGTRACEAI_DIR` always takes precedence. Registration does not infer settings
+or start services. Reviewed local source fixes are reapplied as checksummed
+patches during updates; a changed or conflicting patch stops the update.
+
 [Install](#quick-start) · [Choose a profile](#universal-installation-profiles) ·
 [Manage services](#commands) · [Updates](#compatible-updates) ·
 [Install with your own agent](#installation-by-your-own-ai-agent) ·
-[Releases](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases) ·
-[Explore the suite](https://github.com/BugTraceAI/BugTraceAI)
+[Releases](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases)
 
 ## Quick Start
 
@@ -451,8 +466,9 @@ Switching interfaces does not automatically uninstall existing packages.
 
 `./launcher.sh tui` honors the saved runtime, including Docker in full-platform
 installations. `BUGTRACEAI_CLI_PATH` explicitly selects a local checkout before
-saved routing. Standalone public installations also support a sibling
-`BugTraceAI-CLI` checkout. CLI 3.x checkouts cannot open
+saved routing. In the development workspace, the sibling
+`BugTraceAI-CLI-refactor` checkout is preferred; standalone public installations
+also support a sibling `BugTraceAI-CLI` checkout. CLI 3.x checkouts cannot open
 this workspace; compatibility is checked before starting
 TUI services.
 

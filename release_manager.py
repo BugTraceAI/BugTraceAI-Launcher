@@ -30,7 +30,7 @@ DEFAULT_MANIFEST = ROOT / "release-manifest.json"
 NAMES = {"cli": "BugTraceAI-CLI", "web": "BugTraceAI-WEB", "api": "BugTraceAI-API"}
 _VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 CONFIG_FILES = {
-    "cli": (".env", ".bugtrace-install.env", "bugtraceaicli.conf", "bugtrace/data/waf_strategy_learning.json"),
+    "cli": (".env", ".bugtrace-install.env", "bugtraceaicli.conf", "bugtrace/data/waf_strategy_learning.json", "bugtrace/payloads/breakouts.json"),
     "web": (".env.docker", "backend/.env"),
     "api": (".env",),
 }
@@ -226,6 +226,12 @@ def normalize_state(state: dict) -> dict:
 
 def component_paths(state: dict, install_dir: Path) -> dict[str, Path]:
     paths = {key: install_dir / name for key, name in NAMES.items()}
+    if state.get('adopted') is True:
+        for key, field in (('cli', 'cli_checkout'), ('web', 'web_checkout'), ('api', 'btai_checkout')):
+            value = state.get(field)
+            if not isinstance(value, str) or not Path(value).is_absolute() or any(c in value for c in '\n\r\0'):
+                raise ReleaseError('Adopted component paths must be explicit absolute directories.')
+            paths[key] = Path(value).resolve()
     if state.get("cli_managed") in (True, "true") and state.get("cli_checkout"):
         paths["cli"] = Path(state["cli_checkout"]).expanduser().resolve()
     return paths
@@ -294,6 +300,36 @@ class SourceTransaction:
         self.journal: dict = {}
         self.job: Path | None = None
 
+    def registered_override(self, key: str, original: Path) -> dict | None:
+        """Only preserve source customizations explicitly recorded during adoption."""
+        overrides = self.state.get('source_overrides', {})
+        if not isinstance(overrides, dict):
+            raise ReleaseError('Invalid registered source overrides.')
+        record = overrides.get(key)
+        if record is None:
+            return None
+        if not isinstance(record, dict) or not isinstance(record.get('files'), dict) or not record['files']:
+            raise ReleaseError('Invalid registered source override.')
+        if not isinstance(record.get('patch'), str):
+            raise ReleaseError('Invalid registered source override patch.')
+        patch = (self.install_dir / record['patch']).resolve()
+        if not patch.is_relative_to((self.install_dir / '.launcher-overrides').resolve()) or not patch.is_file():
+            raise ReleaseError('Registered source override must remain inside .launcher-overrides.')
+        if fingerprint(patch) != record.get('sha256'):
+            raise ReleaseError('Registered source override changed; review it before updating.')
+        names = set(record['files'])
+        if any(not isinstance(name, str) or Path(name).is_absolute() or '..' in Path(name).parts or '.git' in Path(name).parts for name in names):
+            raise ReleaseError('Invalid registered override source path.')
+        if names & (set(runtime_config_paths(key, original)) | PATCH_FILES[key]):
+            raise ReleaseError('Source overrides cannot replace runtime configuration or generated patches.')
+        if any(fingerprint(original / name) != digest for name, digest in record['files'].items()):
+            raise ReleaseError('Adopted source files changed; review the customization before updating.')
+        summary = git(original, 'apply', '--numstat', str(patch))
+        changed = {line.split('\t', 2)[2] for line in summary.splitlines() if line.count('\t') >= 2}
+        if changed != names:
+            raise ReleaseError('Registered source override and its file list disagree.')
+        return dict(record, absolute_patch=str(patch))
+
     def preview(self) -> dict:
         self._reject_downgrades()
         ensure_release_tags_available(self.manifest, self.selected)
@@ -302,7 +338,7 @@ class SourceTransaction:
             path = self.paths[key]
             current = (path / "VERSION").read_text().strip() if (path / "VERSION").is_file() else "unknown"
             target = self.manifest.components[key]
-            components.append({"component": key, "current": current, "target": target.version, "ref": target.ref})
+            components.append({"component": key, "current": current, "target": target.version, "ref": target.ref, "path": str(path)})
         return {"release": self.manifest.release, "channel": self.manifest.channel,
                 "installed_release": self.state.get("release") or "unrecorded",
                 "launcher_minimum": self.manifest.launcher_version,
@@ -360,7 +396,9 @@ class SourceTransaction:
                 raise ReleaseError(f"{NAMES[key]} has staged changes; they were preserved. Commit them before updating.")
             dirty = git(original, "diff", "--name-only").splitlines()
             config_files = runtime_config_paths(key, original)
-            allowed = PATCH_FILES[key] | set(config_files)
+            override = self.registered_override(key, original)
+            override_names = set(override['files']) if override else set()
+            allowed = PATCH_FILES[key] | set(config_files) | override_names
             if set(dirty) - allowed:
                 raise ReleaseError(f"{NAMES[key]} has local source edits; they were preserved. Commit or move them before updating.")
             old_head = git(original, "rev-parse", "HEAD")
@@ -371,11 +409,23 @@ class SourceTransaction:
                 raise ReleaseError(f"{NAMES[key]} uses a different development repository. Use its direct update workflow; this checkout was preserved.")
             staged = self.job / "sources" / NAMES[key]
             staged.parent.mkdir(exist_ok=True)
-            run(["git", "clone", "--quiet", "--no-hardlinks", "--no-local", str(original), str(staged)])
+            try:
+                # Use Git's local object-copy path. A checkout can have a valid
+                # pinned commit but lack its historical parent objects (for
+                # example, after adopting a curated shallow source snapshot).
+                # Forcing upload-pack makes Git traverse that missing history
+                # and abort before the update can stage the other components.
+                run(["git", "clone", "--quiet", "--no-hardlinks", str(original), str(staged)])
+            except ReleaseError as error:
+                raise ReleaseError(
+                    f"Could not create a staging copy of {NAMES[key]}; the installed checkout was preserved."
+                ) from error
             # Validate generated launcher patches on a copy, never on the live checkout.
             for name in dirty:
                 copy_file(original / name, staged / name)
             self.runtime.validate_existing(key, staged, self.state)
+            if override_names:
+                git(staged, 'restore', '--source=HEAD', '--worktree', '--', *sorted(override_names))
             try:
                 git(staged, "fetch", "--quiet", "--depth", "1", "--no-tags", target.repository, target.ref)
             except ReleaseError as error:
@@ -384,6 +434,14 @@ class SourceTransaction:
             if target.commit and new_head != target.commit:
                 raise ReleaseError(f"{NAMES[key]} release commit does not match the manifest.")
             git(staged, "checkout", "--quiet", "--detach", new_head)
+            if override:
+                saved_patch = self.job / 'overrides' / f'{key}.patch'
+                copy_file(Path(override['absolute_patch']), saved_patch)
+                # Reapply onto the pinned release; conflicts stop before service changes.
+                git(staged, 'apply', '--check', str(saved_patch))
+                git(staged, 'apply', str(saved_patch))
+                if any(not (staged / name).is_file() for name in override_names):
+                    raise ReleaseError('Registered source overrides must retain their source files.')
             if not (staged / "VERSION").is_file() or (staged / "VERSION").read_text().strip() != target.version:
                 raise ReleaseError(f"{NAMES[key]} VERSION disagrees with its release tag.")
             candidate_files = set(git(staged, "ls-files").splitlines())
@@ -405,6 +463,8 @@ class SourceTransaction:
             entry = {"key": key, "original": str(original), "staged": str(staged), "old_head": old_head,
                      "old_branch": old_branch, "new_head": new_head, "version": target.version, "ref": target.ref,
                      "config_files": config_files, "saved_files": saved_files, "dirty": dirty, "digests": digests}
+            if override:
+                entry['source_override'] = override
             self.journal["components"].append(entry)
             self.checkpoint("preparing")
         self.runtime.prepare(self.journal, self.job)
@@ -415,6 +475,9 @@ class SourceTransaction:
             raise ReleaseError("Installation preferences changed during preparation; update was cancelled.")
         for entry in self.journal["components"]:
             original = Path(entry["original"])
+            override = entry.get('source_override')
+            if override and fingerprint(Path(override['absolute_patch'])) != override['sha256']:
+                raise ReleaseError('Registered source override changed during preparation.')
             if git(original, "rev-parse", "HEAD") != entry["old_head"]:
                 raise ReleaseError("A checkout changed during preparation; update was cancelled.")
             if git(original, "branch", "--show-current") != entry["old_branch"] or git(original, "diff", "--name-only", "--cached"):
@@ -429,6 +492,10 @@ class SourceTransaction:
 
     def activate(self) -> None:
         self.assert_unchanged()
+        recheck = getattr(self.runtime, 'before_activation', None)
+        if recheck:
+            recheck(self.journal, self.job)
+            self.assert_unchanged()
         # A fetch into the original object store does not change its files/branch.
         for entry in self.journal["components"]:
             git(Path(entry["original"]), "fetch", "--quiet", "--no-tags", entry["staged"], entry["new_head"])
@@ -452,15 +519,24 @@ class SourceTransaction:
                 saved = self.job / "configuration" / entry["key"] / name
                 if saved.is_file():
                     copy_file(saved, original / name)
+            for name in entry.get('source_override', {}).get('files', {}):
+                copy_file(Path(entry['staged']) / name, original / name)
         self.runtime.activate(self.journal, self.job)
         self.checkpoint("verifying")
         self.runtime.verify(self.journal, self.job)
-        updated = dict(self.state)
+        updated = json.loads(json.dumps(self.state))
+        for entry in self.journal['components']:
+            if entry.get('source_override'):
+                updated['source_overrides'][entry['key']]['files'] = {
+                    name: fingerprint(Path(entry['original']) / name)
+                    for name in entry['source_override']['files']}
         updated["version"] = self.launcher_version
         updated["release"] = self.manifest.release
         updated["release_components"] = {item["key"]: {"version": item["version"], "ref": item["ref"], "commit": item["new_head"]}
                                          for item in self.journal["components"]}
         updated["last_update"] = str(self.job)
+        if updated.get('adopted'):
+            updated.update(health_verified=True, adoption_status='verified')
         write_json(self.state_file, updated)
         self.checkpoint("complete")
 
@@ -474,7 +550,7 @@ class SourceTransaction:
             # Candidate generated patches are known; user files are never cleaned.
             dirty = git(original, "diff", "--name-only").splitlines()
             for name in dirty:
-                if name not in PATCH_FILES[entry["key"]] | set(entry["config_files"]):
+                if name not in PATCH_FILES[entry["key"]] | set(entry["config_files"]) | set(entry.get('source_override', {}).get('files', {})):
                     raise ReleaseError("Recovery found new user edits. Source backups were kept for manual recovery.")
                 content = subprocess.run(["git", "-C", str(original), "show", f"HEAD:{name}"], capture_output=True)
                 if content.returncode == 0:
@@ -512,7 +588,10 @@ def preview_text(value: dict) -> str:
              f"Selected release: {value['release']} ({value['channel']})",
              f"Launcher: {value['launcher_running']} (minimum for selected release: {value['launcher_minimum']})",
              f"Installed selection: {value['install_profile']}"]
-    lines.extend(f"  {NAMES[item['component']]}: {item['current']} -> {item['target']}" for item in value["components"])
+    for item in value['components']:
+        lines.append(f"  {NAMES[item['component']]}: {item['current']} -> {item['target']}")
+        if item.get('path'):
+            lines.append(f"    Directory: {item['path']}")
     return "\n".join(lines)
 
 

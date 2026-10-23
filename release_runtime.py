@@ -104,8 +104,9 @@ class Runtime:
         path = Path(entry["staged"] if staged else entry["original"])
         file = "docker-compose.tui.yml" if key == "cli" and state.get("cli_managed") and state.get("cli_interface") == "tui" else "docker-compose.yml"
         arguments = [*self.compose, "--project-directory", str(path)]
-        if entry.get("project"):
-            arguments += ["--project-name", entry["project"]]
+        project = entry.get("project") or state.get('compose_projects', {}).get(key)
+        if project:
+            arguments += ["--project-name", project]
         arguments += ["--env-file", str(path / (".env.docker" if key == "web" else ".env")), "-f", str(path / file)]
         if overlay:
             arguments += ["-f", overlay]
@@ -118,6 +119,8 @@ class Runtime:
 
     def preflight(self, state: dict, paths: dict[str, Path]) -> None:
         self.local = bool(state.get("cli_managed")) and state.get("cli_runtime") == "local"
+        if state.get('adopted') and 'cli' in selected_components(state) and active_local_processes(paths['cli']):
+            raise ReleaseError('Close the adopted installation\'s native CLI sessions before updating; they were not stopped.')
         if self.local:
             if active_local_processes(paths["cli"]):
                 raise ReleaseError("Close this installation's local TUI/API/MCP processes before updating; they were not stopped.")
@@ -220,7 +223,7 @@ class Runtime:
             destination = job / "sources/reconftw-mcp"
             shutil.copytree(source, destination, ignore=shutil.ignore_patterns(".git", ".env", "__pycache__", "node_modules", "reports", "logs"))
         self.shell_step("patch", journal, job)
-        runtime = {"kind": "docker", "components": []}
+        runtime = {"kind": "docker", "components": [], "quiesce_started": False}
         for entry in journal["components"]:
             arguments = self.compose_args(entry, state)
             old = json.loads(self.command([*arguments, "config", "--format", "json"]))
@@ -261,11 +264,21 @@ class Runtime:
             self.command([*new_arguments, "-f", str(candidate), "build", *services], capture=False, timeout=None)
         journal["runtime"] = runtime
 
+    def before_activation(self, journal: dict, job: Path) -> None:
+        # Image preparation can take minutes; recheck scans immediately before switching.
+        self.preflight(journal['state'], {entry['key']: Path(entry['original']) for entry in journal['components']})
+
     def quiesce(self, journal: dict, job: Path) -> None:
+        if journal['state'].get('adopted'):
+            cli = next((Path(entry['original']) for entry in journal['components'] if entry['key'] == 'cli'), None)
+            if cli is not None and active_local_processes(cli):
+                raise ReleaseError('A native CLI session started during preparation; it was preserved. Close it and retry.')
         if journal["runtime"]["kind"] == "local":
             if active_local_processes(Path(journal["components"][0]["original"])):
                 raise ReleaseError("A local CLI process started while preparing; close it and retry.")
             return
+        journal['runtime']['quiesce_started'] = True
+        write_json(job / 'journal.json', journal)
         # Stop application writers before the DB dump; database and sidecars stay up.
         for item in reversed(journal["runtime"]["components"]):
             entry = next(value for value in journal["components"] if value["key"] == item["key"])
@@ -378,6 +391,8 @@ class Runtime:
     def stop_candidate(self, journal: dict, job: Path) -> None:
         if journal.get("runtime", {}).get("kind") != "docker":
             return
+        if journal['runtime'].get('quiesce_started') is False and not journal.get('activated'):
+            return  # A native-session guard rejected activation; original services stayed up.
         for item in reversed(journal["runtime"]["components"]):
             entry = next(value for value in journal["components"] if value["key"] == item["key"])
             applications = [name for name in item["services"] if name != "postgres"]
@@ -385,6 +400,8 @@ class Runtime:
                 self.command([*self.compose_args(entry, journal["state"], overlay=item["candidate"]), "stop", *applications], capture=False, timeout=180)
 
     def rollback(self, journal: dict, job: Path) -> None:
+        if journal.get('runtime', {}).get('quiesce_started') is False and not journal.get('activated'):
+            return
         if journal.get("runtime", {}).get("kind") == "local":
             original = Path(journal["components"][0]["original"]) / ".venv"
             previous = job / "previous-venv"

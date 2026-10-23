@@ -26,6 +26,9 @@ VERSION="$(tr -d '[:space:]' < "$VERSION_FILE" 2>/dev/null || printf '3.3.2')"
 # (which would later flow into `rm -rf "$INSTALL_DIR"`).
 : "${HOME:?HOME must be set}"
 INSTALL_DIR="${BUGTRACEAI_DIR:-$HOME/bugtraceai}"
+if [[ -z "${BUGTRACEAI_DIR:-}" && -f "$SCRIPT_DIR/installation_registry.py" ]] && command -v python3 >/dev/null 2>&1; then
+    INSTALL_DIR="$(python3 "$SCRIPT_DIR/installation_registry.py" locate)" || return 1 2>/dev/null || exit 1
+fi
 STATE_FILE="$INSTALL_DIR/.launcher-state"
 WEB_DIR="$INSTALL_DIR/BugTraceAI-WEB"
 CLI_DIR="$INSTALL_DIR/BugTraceAI-CLI"
@@ -2368,7 +2371,6 @@ run_wizard() {
     if $resume_after_docker_reexec; then
         info "Resuming the selected installation after enabling Docker access."
     else
-        [[ -n "$INSTALL_PROFILE" ]] || offer_installer_mode
         cleanup_legacy_version_cache_dir
 
         # Detect existing installation
@@ -2376,46 +2378,42 @@ run_wizard() {
             warn "BugTraceAI is already installed at $INSTALL_DIR"
             echo ""
             select_option "What would you like to do?" \
-                "Reinstall (wipe and start fresh)" \
                 "Update (apply tested release versions)" \
+                "Repair (keep saved configuration and source versions)" \
                 "Cancel"
 
             case $MENU_SELECTION in
                 0)
-                    info "Removing existing installation..."
-                    _teardown_all
+                    cmd_update
+                    return $?
                     ;;
                 1)
-                    cmd_update
-                    exit 0
+                    cmd_repair
+                    return $?
                     ;;
                 2)
                     info "Cancelled."
-                    exit 0
+                    return 0
                     ;;
             esac
             echo ""
-        elif [[ -d "$INSTALL_DIR" ]]; then
-            warn "Directory $INSTALL_DIR already exists (no previous launcher state found)."
-            echo ""
-            select_option "What would you like to do?" \
-                "Replace (remove folder and install fresh)" \
-                "Cancel"
-
-            case $MENU_SELECTION in
-                0)
-                    info "Removing $INSTALL_DIR..."
-                    _assert_safe_install_dir "$INSTALL_DIR"
-                    rm -rf "$INSTALL_DIR"
-                    ;;
-                1)
-                    info "Cancelled."
-                    exit 0
-                    ;;
-            esac
-            echo ""
+        elif [[ -f "$INSTALL_DIR/.launcher-pending.json" ]]; then
+            warn "An incomplete BugTraceAI installation was detected at $INSTALL_DIR"
+            select_option "Keep the saved selection and configuration?" \
+                "Repair incomplete installation" "Cancel"
+            if [[ "$MENU_SELECTION" == 0 ]]; then
+                cmd_repair
+                return $?
+            fi
+            info "Cancelled. Existing files were kept."
+            return 0
+        elif [[ -e "$INSTALL_DIR" ]] && { [[ ! -d "$INSTALL_DIR" ]] || [[ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; }; then
+            error "Directory $INSTALL_DIR is not empty and has no completed Launcher state. Existing files were kept."
+            error "Restore the saved state or use AI diagnosis. For a new installation, choose a separate empty BUGTRACEAI_DIR."
+            return 1
         fi
 
+        [[ -n "$INSTALL_PROFILE" ]] || offer_installer_mode
         check_for_updates
         local selection_status
         wizard_select_components
@@ -3649,8 +3647,9 @@ load_state() {
         warn "Loading the incomplete installation selection; health has not been verified yet."
     fi
     if [[ ! -f "$STATE_FILE" ]]; then
-        error "BugTraceAI not installed. Run: ./launcher.sh"
-        exit 1
+        error "No Launcher state found at $INSTALL_DIR. Existing components may need registration; this does not mean they are absent."
+        error "Select the installation directory in ./launcher.sh, or use BUGTRACEAI_DIR=/path/to/installation."
+        return 1
     fi
     CLI_GLOBAL=$(awk -F'"' '/"cli_global"/{print $4}' "$STATE_FILE")
     [[ "$CLI_GLOBAL" == yes ]] || CLI_GLOBAL=no
@@ -3658,6 +3657,13 @@ load_state() {
     saved_interface=$(awk -F'"' '/"cli_interface"/{print $4}' "$STATE_FILE")
     saved_runtime=$(awk -F'"' '/"cli_runtime"/{print $4}' "$STATE_FILE")
     saved_checkout=$(awk -F'"' '/"cli_checkout"/{print $4}' "$STATE_FILE")
+    local saved_web saved_api
+    saved_web=$(awk -F'"' '/"web_checkout"/{print $4}' "$STATE_FILE")
+    saved_api=$(awk -F'"' '/"btai_checkout"/{print $4}' "$STATE_FILE")
+    if [[ -n "$saved_web" || -n "$saved_api" ]]; then
+        [[ "$saved_web" == /* && "$saved_api" == /* && "$saved_checkout" == /* ]] || { error "Registered component paths must be absolute."; return 1; }
+        WEB_DIR="$saved_web" BTAI_DIR="$saved_api" CLI_DIR="$saved_checkout"
+    fi
     CLI_PROFILE_SAVED=false
     case "$saved_interface/$saved_runtime" in tui/local|api/local|both/local|tui/docker|api/docker|both/docker) CLI_PROFILE_SAVED=true ;; esac
     saved_managed=$(awk '/"cli_managed"/ {gsub(/[, ]/, "", $2); print $2}' "$STATE_FILE")
@@ -4370,6 +4376,7 @@ show_help() {
     echo "  logs [web|api|cli|mcp] View logs"
     echo "  update          Apply and verify the tested release combination"
     echo "  update --plan   Preview installed and target component versions"
+    echo "  register PATH   Remember a reviewed installation with valid saved state"
     echo "  update --recover Recover an interrupted update from its journal"
     echo "  repair          Rebuild/verify the saved selection without pulling updates"
     echo "  uninstall       Remove everything"
@@ -4405,6 +4412,7 @@ main() {
         restart)    cmd_restart ;;
         logs)       cmd_logs "${2:-}" ;;
         update)     shift; cmd_update "$@" ;;
+        register)   shift; python3 "$SCRIPT_DIR/installation_registry.py" register "$@" ;;
         repair)     cmd_repair ;;
         uninstall)  cmd_uninstall ;;
         help|--help|-h) show_help ;;

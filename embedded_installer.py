@@ -144,6 +144,7 @@ class InstallerSession(ModalScreen[int]):
             success_titles={
                 'install':'Installation completed successfully',
                 'update':'Update completed successfully',
+                'repair':'Repair completed successfully',
                 'assistant':'Assistant session completed successfully',
             }
             operation=success_titles.get(self.kind,'Session completed successfully')

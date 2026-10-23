@@ -22,6 +22,8 @@ from installer_core import InstallProfile, parse_install_profiles
 from setup_form import SetupSelection
 from embedded_installer import InstallerSession
 from provider_validation import check_provider_key
+from installation_detection import inspect_installation
+from installation_registry import selected_install_dir
 
 
 ROOT = Path(__file__).resolve().parent
@@ -62,8 +64,9 @@ def install_command(profile: InstallProfile, runtime: str, global_command: bool)
 class UpdateReview(ModalScreen[bool]):
     CSS = """
     UpdateReview { align: center middle; background: #1A0F2EDD; }
-    #update-review { width: 76; height: auto; max-height: 90%; padding: 1 2;
+    #update-review { width: 76; height: 90%; max-height: 36; padding: 1 2;
         background: #211338; border: round #FF7F50; }
+    #update-body { height: 1fr; }
     #update-summary { height: auto; margin-bottom: 1; }
     #update-actions { height: 3; align-horizontal: right; }
     """
@@ -77,10 +80,11 @@ class UpdateReview(ModalScreen[bool]):
         from release_manager import preview_text
         with Vertical(id="update-review"):
             yield Static("[bold #FF7F50]UPDATE INSTALLATION[/]", classes="panel-title")
-            yield Static(preview_text(self.plan) + "\n\nYour saved profile, ports, provider settings and data are kept.\n"
-                         "All builds finish before switching. Services must pass health checks.\n"
-                         "Recovery backups stay in the installation's .updates directory.",
-                         id="update-summary", markup=False)
+            with VerticalScroll(id="update-body"):
+                yield Static(preview_text(self.plan) + "\n\nYour saved profile, ports, provider settings and data are kept.\n"
+                             "All builds finish before switching. Services must pass health checks.\n"
+                             "Recovery backups stay in the installation's .updates directory.",
+                             id="update-summary", markup=False)
             with Horizontal(id="update-actions"):
                 yield Button("Cancel", id="cancel-update")
                 yield Button("Apply update", id="apply-update", variant="primary")
@@ -129,7 +133,14 @@ class LauncherTUI(App[int]):
         min-height: 12;
         margin: 0 2;
     }
-    #provider-panel, #method-panel { height: 1fr; margin: 0 2; padding: 2 3; border: round #594477; background: #211338; }
+    #provider-panel, #method-panel, #existing-panel { height: 1fr; margin: 0 2; padding: 2 3; border: round #594477; background: #211338; }
+    #location-panel { height: auto; margin: 0 2; }
+    #location-row { height: 3; }
+    #install-path { width: 1fr; height: 3; }
+    #check-installation { width: 17; min-width: 17; }
+    #installation-summary, #installation-help { height: auto; margin-bottom: 1; }
+    #existing-panel { padding: 1 2; }
+    #new-installation { width: 18; min-width: 18; }
     #provider-panel Input { height: 3; margin: 1 0; }
     #credential-status, #credential-note { height: auto; margin: 1 0; }
     .method-description { height: auto; margin-bottom: 2; color: #B9A9D3; }
@@ -321,13 +332,22 @@ class LauncherTUI(App[int]):
         self._checking_key = False
         self.install_exit_code: int | None = None
         self._result_kind = "install"
-        self.install_dir = Path(os.environ.get("BUGTRACEAI_DIR", Path.home() / "bugtraceai"))
+        self.install_dir = selected_install_dir()
+        self.installation = inspect_installation(self.install_dir)
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="brand"):
             yield Static("◈  BugTraceAI", id="brand-name")
             yield Static("   LAUNCHER  /  UNIVERSAL SETUP", id="brand-caption")
         yield Static("Choose a workspace. Required engines are included and connected automatically.", id="intro")
+        with Vertical(id="location-panel"):
+            yield Static("Installation directory · change this to find a custom installation", markup=False)
+            with Horizontal(id="location-row"):
+                yield Input(value=str(self.install_dir), id="install-path")
+                yield Button("Check path", id="check-installation")
+        with VerticalScroll(id="existing-panel"):
+            yield Static("", id="installation-summary", markup=False)
+            yield Static("", id="installation-help", markup=False)
         with VerticalScroll(id="provider-panel"):
             yield Static("PROVIDER", classes="panel-title")
             yield Select([("OpenRouter", "openrouter"), ("Anthropic", "anthropic"), ("Z.ai", "zai")],
@@ -398,9 +418,11 @@ class LauncherTUI(App[int]):
             yield Static("", id="result-path")
         with Horizontal(id="setup-actions"):
             yield Button("Verify and continue", id="verify-button", variant="primary")
-            yield Button("Update installation", id="update-button")
+            yield Button("Update", id="update-button")
             yield Button("AI-assisted install", id="ai-button")
-            yield Button("Repair / diagnose", id="repair-button")
+            yield Button("Repair", id="repair-button")
+            yield Button("AI diagnosis", id="diagnose-button")
+            yield Button("New installation", id="new-installation")
             yield Button("Back", id="previous-button")
             yield Button("Review installation", id="next-button", variant="primary")
             yield Button("Quit", id="quit-button")
@@ -408,7 +430,7 @@ class LauncherTUI(App[int]):
         with Horizontal(id="result-actions"):
             yield Button("Open terminal workspace", id="open-tui-button", variant="primary")
             yield Button("Ask AI", id="result-ai-button")
-            yield Button("Back to profiles", id="back-button")
+            yield Button("Back to Launcher", id="back-button")
             yield Button("Quit", id="result-quit-button")
         yield Static("↑↓ profile  ·  Tab settings  ·  Enter focus Install  ·  q quit", id="footer")
 
@@ -419,7 +441,7 @@ class LauncherTUI(App[int]):
         self.query_one("#select-api", Checkbox).value = profile.install_api and profile.key != "web"
         self.query_one("#select-tui", Checkbox).value = has_tui(profile)
         self.refresh_form()
-        self.show_setup_step(-2)
+        self.show_setup_step(-3 if self.installation.status != "fresh" else -2)
         self.set_class(self.size.width < 104, "compact")
         self.set_class(self.size.height < 28, "short")
         self.set_class(self.size.width >= 120, "wide")
@@ -464,12 +486,39 @@ class LauncherTUI(App[int]):
     def credential_fingerprint(self):
         provider = str(self.query_one("#form-provider", Select).value)
         key = self.query_one("#form-key", Input).value.strip()
-        return hashlib.sha256((provider + "\0" + key).encode()).digest()
+        return hashlib.sha256((provider + "\0" + key + "\0" + str(self.install_dir)).encode()).digest()
 
     def credentials_verified(self):
         return self._validated_credentials == self.credential_fingerprint()
 
+    def check_installation_path(self) -> bool:
+        """Select a directory explicitly, without creating or changing its contents."""
+        value = self.query_one("#install-path", Input).value.strip()
+        if not value:
+            self.notify("Enter an installation directory.", severity="error")
+            return False
+        try:
+            path = Path(value).expanduser().resolve()
+            self.installation = inspect_installation(path)
+        except (OSError, ValueError, RuntimeError):
+            self.notify("Cannot inspect that installation directory.", severity="error")
+            return False
+        self.install_dir = path
+        self.query_one("#install-path", Input).value = str(path)
+        self.show_setup_step(-2 if self.installation.status == "fresh" else -3)
+        return self.installation.status == "fresh"
+
+    def fresh_installation_target(self) -> bool:
+        self.installation = inspect_installation(self.install_dir)
+        if self.installation.status != "fresh":
+            self.show_setup_step(-3)
+            self.notify("Existing files were kept. Update or repair, or choose a different empty directory.", severity="warning")
+            return False
+        return True
+
     async def verify_provider(self):
+        if not self.check_installation_path():
+            return
         if self._checking_key:
             return
         provider = str(self.query_one("#form-provider", Select).value)
@@ -521,19 +570,27 @@ class LauncherTUI(App[int]):
                 return
         self.setup_step = step
         self.set_class(step == 1, "review")
-        labels = {-2:"Provider credentials · verify access before installing", -1:"Choose Wizard or AI-assisted installation", 0:"Choose independent modules and ports", 1:"Review installation · " + self.install_method.upper()}
+        labels = {-3:"Manage an existing installation · no new provider key required", -2:"Provider credentials · verify access before installing", -1:"Choose Wizard or AI-assisted installation", 0:"Choose independent modules and ports", 1:"Review installation · " + self.install_method.upper()}
         self.query_one("#intro", Static).update(labels[step])
-        for panel, visible in (("provider-panel", step == -2), ("method-panel", step == -1), ("choice-panel", step == 0), ("workspace", step == 1)):
+        for panel, visible in (("existing-panel", step == -3), ("location-panel", step in (-3, -2)), ("provider-panel", step == -2), ("method-panel", step == -1), ("choice-panel", step == 0), ("workspace", step == 1)):
             self.query_one("#" + panel).display = visible
-        self.query_one("#previous-button").display = step > -2
+        self.query_one("#previous-button").display = step > -2 or (step == -2 and self.installation.status != "fresh")
         self.query_one("#verify-button").display = step == -2
         self.query_one("#next-button").display = step == 0
         self.query_one("#install-button").display = step == 1 and self.install_method == "wizard"
         self.query_one("#ai-button").display = step == 1 and self.install_method == "ai"
         self.query_one("#choose-ai", Button).disabled = self.query_one("#form-provider", Select).value == "zai"
-        existing = (self.install_dir / ".launcher-state").is_file()
-        self.query_one("#update-button").display = step == -2 and existing
-        self.query_one("#repair-button").display = step == -2 and (existing or any((self.install_dir / n).is_dir() for n in ("BugTraceAI-CLI","BugTraceAI-WEB","BugTraceAI-API")))
+        self.query_one("#installation-summary", Static).update(self.installation.summary())
+        self.query_one("#installation-help", Static).update(
+            ("Update or repair using the saved configuration; no new provider key is required.\n"
+             if self.installation.can_repair else
+             "Restore the saved state or use AI diagnosis (provider credentials and tokens may be required).\n")
+            + "To find another installation, enter its directory above and choose Check path.\n"
+            + "For a new installation, choose a different empty directory. Existing files are kept.")
+        self.query_one("#update-button").display = step == -3 and self.installation.can_update
+        self.query_one("#repair-button").display = step == -3 and self.installation.can_repair
+        self.query_one("#diagnose-button").display = step == -3 and not self.installation.can_repair and self.installation.status != "fresh"
+        self.query_one("#new-installation").display = step == -3
         if step == 1:
             self.query_one("#profile-name", Static).update(self.selected.label)
             self.query_one("#profile-description", Static).update("Selected independent modules:")
@@ -545,7 +602,7 @@ class LauncherTUI(App[int]):
                 + f"\nExtras: {', '.join(n for n,v in [('reconFTW',selection.recon),('Kali',selection.kali)] if v) or 'none'}\n"
                 + "Installation and AI conversation stay inside this TUI.")
         self.query_one("#footer", Static).update("Tab focus · Back preserves your choices · q quit")
-        target = {-2:"form-key", -1:"choose-wizard", 0:"select-web", 1:"ai-button" if self.install_method == "ai" else "install-button"}[step]
+        target = {-3:"update-button" if self.installation.can_update else "repair-button" if self.installation.can_repair else "install-path", -2:"form-key", -1:"choose-wizard", 0:"select-web", 1:"ai-button" if self.install_method == "ai" else "install-button"}[step]
         self.call_after_refresh(self.query_one("#" + target).focus)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -571,6 +628,8 @@ class LauncherTUI(App[int]):
         return Path(path)
 
     def run_install(self) -> None:
+        if not self.fresh_installation_target():
+            return
         if not self.credentials_verified():
             self.show_setup_step(-2); return
         try: selection = self.form_selection().validate(check_available=True)
@@ -578,10 +637,12 @@ class LauncherTUI(App[int]):
             self.notify(str(error),severity="error"); return
         config=self.configuration_file(selection)
         env=os.environ.copy()
-        env.update({"BTAI_SETUP_CONFIG":str(config),"BUGTRACEAI_LAUNCHER_TUI_CHILD":"1", "BUGTRACEAI_LAUNCHER_TUI_REVIEWED":"1", "BUGTRACEAI_LAUNCHER_SKIP_POST_INSTALL":"1", "BUGTRACEAI_MCP_SELECTION_PRESET":"1", "BUGTRACEAI_MCP_RECON":str(selection.recon).lower(),"BUGTRACEAI_MCP_KALI":str(selection.kali).lower()})
+        env.update({"BUGTRACEAI_DIR":str(self.install_dir),"BTAI_SETUP_CONFIG":str(config),"BUGTRACEAI_LAUNCHER_TUI_CHILD":"1", "BUGTRACEAI_LAUNCHER_TUI_REVIEWED":"1", "BUGTRACEAI_LAUNCHER_SKIP_POST_INSTALL":"1", "BUGTRACEAI_MCP_SELECTION_PRESET":"1", "BUGTRACEAI_MCP_RECON":str(selection.recon).lower(),"BUGTRACEAI_MCP_KALI":str(selection.kali).lower()})
         self._run_child(install_command(self.selected,selection.runtime,selection.global_command and selection.tui),env,"install",config=config,secrets=[selection.api_key])
 
     def run_ai_assistant(self, repair: bool = False) -> None:
+        if not repair and not self.fresh_installation_target():
+            return
         env=os.environ.copy(); config=None; secrets=[]
         for key in ("BUGTRACEAI_PROFILE","BTAI_INSTALLER_MODE","BTAI_INSTALLER_RUNTIME","BTAI_INSTALLER_GLOBAL","BTAI_INSTALLER_MCP_RECON","BTAI_INSTALLER_MCP_KALI","BTAI_SETUP_CONFIG","BTAI_ASSISTANT_CREDENTIALS"):
             env.pop(key,None)
@@ -613,6 +674,9 @@ class LauncherTUI(App[int]):
 
     def review_update(self) -> None:
         from release_manager import Manifest, SourceTransaction, ReleaseError
+        if self.query_one("#install-path", Input).value != str(self.install_dir):
+            self.notify("Choose Check path before updating a different installation.", severity="warning")
+            return
         try:
             manifest = Manifest.load(Path(os.environ.get("BUGTRACEAI_RELEASE_MANIFEST", ROOT / "release-manifest.json")))
             version = (self.launcher.parent / "VERSION").read_text().strip()
@@ -624,10 +688,22 @@ class LauncherTUI(App[int]):
 
     def _update_reviewed(self, accepted: bool) -> None:
         if accepted:
-            self._run_child(["update"], os.environ.copy(), "update")
+            self._run_child(["update"], dict(os.environ, BUGTRACEAI_DIR=str(self.install_dir)), "update")
+
+    def run_repair(self) -> None:
+        if self.query_one("#install-path", Input).value != str(self.install_dir):
+            self.notify("Choose Check path before repairing a different installation.", severity="warning")
+            return
+        self.installation = inspect_installation(self.install_dir)
+        if not self.installation.can_repair:
+            self.show_setup_step(-3)
+            self.notify("Valid saved state is required for automatic repair. Use AI diagnosis or restore the state file.", severity="error")
+            return
+        self._run_child(["repair"], dict(os.environ, BUGTRACEAI_DIR=str(self.install_dir)), "repair")
 
     def _run_child(self, arguments, env, kind, config=None, secrets=()) -> None:
         self._result_kind=kind
+        env = dict(env, BUGTRACEAI_DIR=str(self.install_dir))
         state=self.install_dir/'.launcher-state'
         before=state.stat().st_mtime_ns if state.exists() else None
         command=[sys.executable,str(ROOT/'ai_installer.py')] if arguments == ['ai'] else ['bash',str(self.launcher),*arguments]
@@ -642,7 +718,7 @@ class LauncherTUI(App[int]):
         self.push_screen(InstallerSession(command,env,secrets=secrets,cleanup=cleanup,kind=kind),completed)
 
     def show_result(self, kind: str, exit_code: int) -> None:
-        for name in ('provider-panel','method-panel','choice-panel','workspace','setup-actions'):
+        for name in ('existing-panel','location-panel','provider-panel','method-panel','choice-panel','workspace','setup-actions'):
             self.query_one('#'+name).display=False
         panel = self.query_one("#result-panel", Vertical)
         panel.display = True
@@ -651,15 +727,17 @@ class LauncherTUI(App[int]):
             message = "No verified installation success was recorded. Review the output; existing data was not removed by the UI."
             color = "#FF7F50"
         elif exit_code == 0:
-            title = {"install": "SETUP COMPLETE", "update": "UPDATE VERIFIED"}.get(kind, "ASSISTANT SESSION COMPLETE")
+            title = {"install": "SETUP COMPLETE", "update": "UPDATE VERIFIED", "repair": "REPAIR VERIFIED"}.get(kind, "ASSISTANT SESSION COMPLETE")
             message = "The Launcher finished without an installation error. Review the service URLs shown above the terminal prompt."
             if kind == "update":
                 message = "The selected release versions are active and all required runtime checks passed. Your existing settings and data were retained."
             elif kind == "assistant":
                 message = "The assistant session ended. Read its report for the diagnosis and any verified installation checks."
+            elif kind == "repair":
+                message = "The saved installation was repaired and verified. Existing settings and component choices were kept."
             color = "#2ECC71"
         else:
-            title = "SETUP NEEDS ATTENTION" if kind == "install" else "ASSISTANT SESSION ENDED WITH AN ERROR"
+            title = "SETUP NEEDS ATTENTION" if kind == "install" else "REPAIR NEEDS ATTENTION" if kind == "repair" else "ASSISTANT SESSION ENDED WITH AN ERROR"
             message = f"The process exited with code {exit_code}. Check the installer output and install.log, then retry or run ./launcher.sh repair."
             if kind == "update":
                 title = "UPDATE NEEDS ATTENTION"
@@ -668,26 +746,27 @@ class LauncherTUI(App[int]):
         self.query_one("#result-title", Static).update(title)
         self.query_one("#result-title", Static).styles.color = color
         self.query_one("#result-message", Static).update(message)
-        self.query_one("#result-path", Static).update(f"Install directory: {os.environ.get('BUGTRACEAI_DIR', str(Path.home() / 'bugtraceai'))}")
+        self.query_one("#result-path", Static).update(f"Install directory: {self.install_dir}")
         self.query_one("#result-actions", Horizontal).display = True
         self.query_one("#result-quit-button", Button).display = True
         self.query_one("#open-tui-button", Button).display = exit_code == 0 and kind == "install" and has_tui(self.selected)
-        self.query_one("#result-ai-button", Button).display = exit_code not in (0,130) and kind in {"install","update"}
-        self.query_one("#back-button", Button).display = kind in {"install", "update", "assistant"}
+        self.query_one("#result-ai-button", Button).display = exit_code not in (0,130) and kind in {"install","update","repair"}
+        self.query_one("#back-button", Button).display = kind in {"install", "update", "assistant", "repair"}
         self.query_one("#footer", Static).update("Review the report   ·   Ask AI for diagnosis   ·   Back to setup   ·   q quit")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         button = event.button.id
         if button == "open-tui-button":
             with self.suspend():
-                subprocess.run(["bash", str(self.launcher), "tui"], check=False)
+                subprocess.run(["bash", str(self.launcher), "tui"], check=False,
+                               env=dict(os.environ, BUGTRACEAI_DIR=str(self.install_dir)))
             return
         if button == "back-button":
             self.query_one("#result-panel", Vertical).display = False
-            self.show_setup_step(0)
+            self.installation = inspect_installation(self.install_dir)
+            self.show_setup_step(-3 if self.installation.status != "fresh" else 0)
             self.query_one("#setup-actions", Horizontal).display = True
             self.query_one("#result-actions", Horizontal).display = False
-            self.query_one("#footer", Static).update("↑↓ profile  ·  Tab settings  ·  Enter focus Install  ·  q quit")
             return
         if button in {"quit-button", "result-quit-button"}:
             self.exit(self.install_exit_code or 0)
@@ -696,11 +775,19 @@ class LauncherTUI(App[int]):
         elif button in {"choose-wizard", "choose-ai"}:
             self.choose_install_method("ai" if button == "choose-ai" else "wizard")
         elif button == "previous-button":
-            self.show_setup_step(max(-2, self.setup_step - 1))
+            self.show_setup_step(max(-3 if self.installation.status != "fresh" else -2, self.setup_step - 1))
         elif button == "next-button":
             self.show_setup_step(1)
         elif button == "repair-button":
+            self.run_repair()
+        elif button == "diagnose-button":
             self.run_ai_assistant(repair=True)
+        elif button == "check-installation":
+            self.check_installation_path()
+        elif button == "new-installation":
+            self.show_setup_step(-2)
+            self.query_one("#credential-status", Static).update("Choose a different empty installation directory above, then verify your provider key. The existing installation is kept.")
+            self.query_one("#install-path", Input).focus()
         elif button == "result-ai-button":
             self.run_ai_assistant(repair=True)
         elif button == "install-button":
