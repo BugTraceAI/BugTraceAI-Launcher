@@ -227,10 +227,13 @@ def normalize_state(state: dict) -> dict:
 def component_paths(state: dict, install_dir: Path) -> dict[str, Path]:
     paths = {key: install_dir / name for key, name in NAMES.items()}
     if state.get('adopted') is True:
+        selected = set(selected_components(state))
         for key, field in (('cli', 'cli_checkout'), ('web', 'web_checkout'), ('api', 'btai_checkout')):
+            if key not in selected:
+                continue
             value = state.get(field)
             if not isinstance(value, str) or not Path(value).is_absolute() or any(c in value for c in '\n\r\0'):
-                raise ReleaseError('Adopted component paths must be explicit absolute directories.')
+                raise ReleaseError(f'Adopted {NAMES[key]} path ({field}) must be an absolute directory.')
             paths[key] = Path(value).resolve()
     if state.get("cli_managed") in (True, "true") and state.get("cli_checkout"):
         paths["cli"] = Path(state["cli_checkout"]).expanduser().resolve()
@@ -425,7 +428,7 @@ class SourceTransaction:
                 copy_file(original / name, staged / name)
             self.runtime.validate_existing(key, staged, self.state)
             if override_names:
-                git(staged, 'restore', '--source=HEAD', '--worktree', '--', *sorted(override_names))
+                git(staged, 'checkout', 'HEAD', '--', *sorted(override_names))
             try:
                 git(staged, "fetch", "--quiet", "--depth", "1", "--no-tags", target.repository, target.ref)
             except ReleaseError as error:

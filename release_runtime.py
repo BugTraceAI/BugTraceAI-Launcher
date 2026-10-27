@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import socket
@@ -104,8 +105,13 @@ class Runtime:
         path = Path(entry["staged"] if staged else entry["original"])
         file = "docker-compose.tui.yml" if key == "cli" and state.get("cli_managed") and state.get("cli_interface") == "tui" else "docker-compose.yml"
         arguments = [*self.compose, "--project-directory", str(path)]
-        project = entry.get("project") or state.get('compose_projects', {}).get(key)
-        if project:
+        projects = state.get('compose_projects', {})
+        if not isinstance(projects, dict):
+            raise ReleaseError('Invalid saved Compose project names; repair the installation state first.')
+        project = entry.get("project") or projects.get(key)
+        if project is not None:
+            if not isinstance(project, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_.-]*', project):
+                raise ReleaseError(f'Invalid saved Compose project name for {key}; repair the installation state first.')
             arguments += ["--project-name", project]
         arguments += ["--env-file", str(path / (".env.docker" if key == "web" else ".env")), "-f", str(path / file)]
         if overlay:

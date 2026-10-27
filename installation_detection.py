@@ -20,6 +20,11 @@ class Installation:
     def can_repair(self) -> bool:
         return self.status in {"installed", "incomplete"}
 
+    @property
+    def can_diagnose(self) -> bool:
+        """Any non-empty directory can be opened in the AI diagnosis flow."""
+        return self.status != "fresh"
+
     def summary(self) -> str:
         headings = {
             "installed": "Installation detected",

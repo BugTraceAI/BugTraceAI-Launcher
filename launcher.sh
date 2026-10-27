@@ -148,6 +148,35 @@ _assert_safe_install_dir() {
     fi
 }
 
+_apply_component_dir() {
+    local field="$1" value="$2" label="$3" selected="$4" adopted="$5" scope="$6"
+    local resolved resolved_install resolved_home
+    if [[ -z "$value" ]]; then
+        if [[ "$adopted" == true && "$selected" == true ]]; then
+            error "The adopted $label directory is missing ($field)."
+            return 1
+        fi
+        return 0
+    fi
+    if [[ "$value" != /* ]]; then
+        error "The saved $label directory ($field) must be absolute."
+        return 1
+    fi
+    # Resolve both traversal and symlinks before trusting paths from state.
+    resolved=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$value") || return 1
+    resolved_install=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$INSTALL_DIR") || return 1
+    resolved_home=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME") || return 1
+    if [[ "$resolved" == "/" || "$resolved" == "$resolved_home" ]]; then
+        error "The saved $label directory ($field) is not a safe path."
+        return 1
+    fi
+    if [[ "$scope" == inside && "$adopted" != true && "$resolved" != "$resolved_install"/* ]]; then
+        error "The saved $label directory ($field) must stay inside $INSTALL_DIR unless the installation is adopted."
+        return 1
+    fi
+    printf '%s' "$resolved"
+}
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 # Empty until _init_install_log (real runs only). Tests that source this file
@@ -2979,6 +3008,11 @@ patch_compose() {
         local host_arch
         host_arch="$(uname -m)"
 
+        # WEB snapshots request host networking for builds. Recent Compose/
+        # Buildx reject that entitlement in unattended Bake builds. Use the
+        # normal build network instead; do not alter runtime service networks.
+        sed_inplace 's/^      network: host[[:space:]]*$/      network: default/' "$web_compose" || return 1
+
         # Launcher expects MCP agents over SSE; make SSE default for WEB-managed MCP services.
         if $MCP_RECON_ENABLED; then
             sed_inplace 's/SSE_MODE=${RECON_SSE_MODE:-false}/SSE_MODE=${RECON_SSE_MODE:-true}/' "$web_compose"
@@ -3660,9 +3694,41 @@ load_state() {
     local saved_web saved_api
     saved_web=$(awk -F'"' '/"web_checkout"/{print $4}' "$STATE_FILE")
     saved_api=$(awk -F'"' '/"btai_checkout"/{print $4}' "$STATE_FILE")
-    if [[ -n "$saved_web" || -n "$saved_api" ]]; then
-        [[ "$saved_web" == /* && "$saved_api" == /* && "$saved_checkout" == /* ]] || { error "Registered component paths must be absolute."; return 1; }
-        WEB_DIR="$saved_web" BTAI_DIR="$saved_api" CLI_DIR="$saved_checkout"
+    DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
+    INSTALL_PROFILE=$(awk -F'"' '/"install_profile"/{print $4}' "$STATE_FILE")
+
+    # Load explicit install flags; fallback for legacy state files.
+    local install_web install_cli install_btai
+    install_web=$(grep -o '"install_web": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    install_cli=$(grep -o '"install_cli": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    install_btai=$(grep -o '"install_btai": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
+    if [[ -n "$install_web" || -n "$install_cli" ]]; then
+        [[ "$install_web" == "true" ]] && INSTALL_WEB=true || INSTALL_WEB=false
+        [[ "$install_cli" == "true" ]] && INSTALL_CLI=true || INSTALL_CLI=false
+        [[ "$install_btai" == "true" ]] && INSTALL_BTAI=true || INSTALL_BTAI=false
+    else
+        INSTALL_WEB=false
+        INSTALL_CLI=false
+        [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]] && INSTALL_WEB=true
+        [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] && INSTALL_CLI=true
+        INSTALL_BTAI=false
+    fi
+
+    local adopted=false component_dir
+    [[ "$(grep -o '"adopted": *[^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')" == "true" ]] && adopted=true
+    # Component directories stay inside this installation unless it was
+    # explicitly adopted; only selected components are required.
+    if [[ -n "$saved_web" || ( "$adopted" == true && "$INSTALL_WEB" == true ) ]]; then
+        component_dir="$(_apply_component_dir web_checkout "$saved_web" WEB "$INSTALL_WEB" "$adopted" inside)" || return 1
+        [[ -z "$component_dir" ]] || WEB_DIR="$component_dir"
+    fi
+    if [[ -n "$saved_api" || ( "$adopted" == true && "$INSTALL_BTAI" == true ) ]]; then
+        component_dir="$(_apply_component_dir btai_checkout "$saved_api" API "$INSTALL_BTAI" "$adopted" inside)" || return 1
+        [[ -z "$component_dir" ]] || BTAI_DIR="$component_dir"
+    fi
+    if [[ -n "$saved_checkout" || ( "$adopted" == true && "$INSTALL_CLI" == true ) ]]; then
+        component_dir="$(_apply_component_dir cli_checkout "$saved_checkout" CLI "$INSTALL_CLI" "$adopted" any)" || return 1
+        if [[ "$adopted" == true && -n "$component_dir" ]]; then CLI_DIR="$component_dir"; fi
     fi
     CLI_PROFILE_SAVED=false
     case "$saved_interface/$saved_runtime" in tui/local|api/local|both/local|tui/docker|api/docker|both/docker) CLI_PROFILE_SAVED=true ;; esac
@@ -3671,8 +3737,6 @@ load_state() {
     case "$saved_runtime" in local|docker) CLI_RUNTIME="$saved_runtime" ;; *) CLI_RUNTIME=docker ;; esac
     [[ "$saved_managed" == true ]] && CLI_MANAGED=true || CLI_MANAGED=false
     if $CLI_MANAGED && [[ -n "$saved_checkout" ]]; then CLI_DIR="$saved_checkout"; fi
-    DEPLOY_MODE=$(awk -F'"' '/"mode"/{print $4}' "$STATE_FILE")
-    INSTALL_PROFILE=$(awk -F'"' '/"install_profile"/{print $4}' "$STATE_FILE")
     WEB_PORT=$(awk -F'"' '/"web_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     CLI_PORT=$(awk -F'"' '/"cli_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
     BTAI_PORT=$(awk -F'"' '/"btai_port"/{print $4}' "$STATE_FILE" 2>/dev/null || echo "")
@@ -3694,23 +3758,6 @@ load_state() {
     [[ "$mcp_cli" == "true" ]] && MCP_CLI_ENABLED=true || MCP_CLI_ENABLED=false
     [[ "$mcp_recon" == "true" ]] && MCP_RECON_ENABLED=true || MCP_RECON_ENABLED=false
     [[ "$mcp_kali" == "true" ]] && MCP_KALI_ENABLED=true || MCP_KALI_ENABLED=false
-
-    # Load explicit install flags; fallback for legacy state files.
-    local install_web install_cli install_btai
-    install_web=$(grep -o '"install_web": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
-    install_cli=$(grep -o '"install_cli": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
-    install_btai=$(grep -o '"install_btai": [^,}]*' "$STATE_FILE" 2>/dev/null | grep -oE '(true|false)')
-    if [[ -n "$install_web" || -n "$install_cli" ]]; then
-        [[ "$install_web" == "true" ]] && INSTALL_WEB=true || INSTALL_WEB=false
-        [[ "$install_cli" == "true" ]] && INSTALL_CLI=true || INSTALL_CLI=false
-        [[ "$install_btai" == "true" ]] && INSTALL_BTAI=true || INSTALL_BTAI=false
-    else
-        INSTALL_WEB=false
-        INSTALL_CLI=false
-        [[ "$DEPLOY_MODE" == "web" || "$DEPLOY_MODE" == "full" || "$DEPLOY_MODE" == "custom" || "$DEPLOY_MODE" == "recon" ]] && INSTALL_WEB=true
-        [[ "$DEPLOY_MODE" == "cli" || "$DEPLOY_MODE" == "full" ]] && INSTALL_CLI=true
-        INSTALL_BTAI=false
-    fi
 
     # The CLI installer can reconfigure a standalone install independently.
     # Read its validated profile without executing configuration as shell code.

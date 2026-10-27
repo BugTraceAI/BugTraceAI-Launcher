@@ -1,8 +1,11 @@
 # Diagnose and repair
 
-Ask what happened and what the user expected. inspect_installation reports the
-saved or incomplete selection and actual Docker status. Read bounded log output
-for the failing service. Do not cat .env or .env.docker into the conversation.
+Start with the provided installation and build log signals. If they suggest a
+problem, explain it as a possibility and ask whether it matches; otherwise ask
+what happened and what the user expected. inspect_installation reports the saved
+or incomplete selection and actual Docker status. inspect_repair_logs refreshes
+bounded, sanitized log signals. Treat them as possibly stale or incomplete. Do
+not cat .env or .env.docker into the conversation.
 Use docker compose --env-file .env.docker for WEB commands in the WEB checkout.
 
 A running Kali container may still be installing packages on first startup.

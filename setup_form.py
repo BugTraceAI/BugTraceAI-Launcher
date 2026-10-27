@@ -13,6 +13,7 @@ class SetupSelection:
     cli: bool = True
     api: bool = False
     tui: bool = True
+    server: bool = True
     runtime: str = 'docker'
     global_command: bool = False
     recon: bool = False
@@ -23,6 +24,10 @@ class SetupSelection:
 
     @property
     def profile(self):
+        if self.cli and not self.server and (self.web or self.api):
+            raise ValueError('WEB and API combinations require the CLI server. Enable it or deselect CLI.')
+        if self.cli and not self.tui and not self.server:
+            raise ValueError('Select the CLI terminal, the CLI server, or both.')
         if self.web:
             if self.cli and self.api: return 'full' if self.tui else 'web'
             if self.cli: return 'web-cli-tui' if self.tui else 'web-cli'
@@ -31,7 +36,9 @@ class SetupSelection:
         if self.cli and self.api:
             return 'engines-tui' if self.tui else 'engines'
         if self.cli:
-            return 'terminal-server' if self.tui else 'server'
+            if not self.tui:
+                return 'server'
+            return 'terminal-server' if self.server else 'terminal'
         if self.api:
             return 'api'
         raise ValueError('Select WEB, CLI or API before continuing.')
@@ -39,18 +46,20 @@ class SetupSelection:
     def active_ports(self):
         keys = []
         if self.web: keys.append('web')
-        if self.cli: keys.extend(('cli', 'cli_mcp'))
+        if self.cli and self.server: keys.extend(('cli', 'cli_mcp'))
         if self.api: keys.extend(('api', 'api_mcp'))
         if self.recon: keys.append('recon')
         return {k: self.ports.get(k, 8002 if k == 'recon' else None) for k in keys}
 
     def validate(self, check_available=False):
         self.profile
+        if not isinstance(self.server, bool):
+            raise ValueError('Invalid CLI server selection.')
         if not isinstance(self.api_key, str) or not self.api_key.strip():
             raise ValueError("Enter the selected provider's API key before continuing.")
         if any(c in self.api_key for c in ('\0','\r','\n')):
             raise ValueError('API key must be a single line.')
-        if self.runtime == 'local' and (self.ports.get('cli') != 8000 or self.ports.get('cli_mcp') != 8001):
+        if self.runtime == 'local' and self.cli and self.server and (self.ports.get('cli') != 8000 or self.ports.get('cli_mcp') != 8001):
             raise ValueError('Local CLI uses ports 8000/8001. Choose Docker for custom ports.')
         if self.provider not in ('openrouter','anthropic','zai'):
             raise ValueError('Choose a supported provider.')
@@ -101,7 +110,7 @@ def load_config(path):
     if not isinstance(ports,dict) or set(ports)-set(PORT_KEYS.values()): raise ValueError('Invalid port names')
     required=set()
     if profile.install_web: required.add('WEB_PORT')
-    if profile.install_cli: required.update(('CLI_PORT','MCP_PORT'))
+    if profile.install_cli and profile.cli_interface in ('api', 'both'): required.update(('CLI_PORT','MCP_PORT'))
     if profile.install_api: required.update(('BTAI_PORT','BTAI_MCP_PORT'))
     if data['recon']:
         required.add('RECON_PORT')

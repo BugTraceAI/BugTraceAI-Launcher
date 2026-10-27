@@ -21,7 +21,62 @@ from textual.widgets import Button, Input, RichLog, Static
 ROOT=Path(__file__).resolve().parent
 ANSI=re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)')
 
+def session_text(chunk, decoder):
+    """Decode one PTY chunk, keeping progress rewrites readable."""
+    return ANSI.sub('', decoder.decode(chunk)).replace('\r\n','\n').replace('\r','\n')
+
+
+class StreamingRedactor:
+    """Hide secrets even when the PTY splits them across separate reads."""
+    def __init__(self, secrets):
+        self.secrets = secrets
+        self.pending = ''
+
+    def feed(self, text, final=False):
+        data = self.pending + text
+        self.pending = ''
+        secrets = sorted((s for s in self.secrets if s), key=len, reverse=True)
+        output = []
+        while data:
+            match = next((secret for secret in secrets if data.startswith(secret)), None)
+            if match:
+                output.append('[REDACTED]')
+                data = data[len(match):]
+            elif not final and any(secret.startswith(data) for secret in secrets):
+                self.pending = data
+                break
+            else:
+                output.append(data[0])
+                data = data[1:]
+        return ''.join(output)
+
+
+class StopConfirmation(ModalScreen[bool]):
+    BINDINGS=[('escape','cancel','')]
+    CSS='''
+    StopConfirmation { align: center middle; background: #1A0F2EDD; }
+    #stop-confirm { width: 90%; max-width: 66; height: auto; padding: 1 2; background: #211338; border: round #FF7F50; }
+    #stop-title { height: 1; color: #FF7F50; text-style: bold; margin-bottom: 1; }
+    #stop-message { height: auto; margin-bottom: 1; }
+    #stop-actions { height: 3; align-horizontal: right; }
+    '''
+    def compose(self):
+        with Vertical(id='stop-confirm'):
+            yield Static('STOP THIS SESSION?',id='stop-title')
+            yield Static('The running installer will be terminated. Files already written are kept; a partial installation may need repair.',id='stop-message',markup=False)
+            with Horizontal(id='stop-actions'):
+                yield Button('Keep running',id='keep-session')
+                yield Button('Stop install',id='confirm-stop',variant='error')
+
+    def on_button_pressed(self,event):
+        self.dismiss(event.button.id=='confirm-stop')
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
 class InstallerSession(ModalScreen[int]):
+    BINDINGS=[('escape','ignore_key',''),('q','ignore_key','')]
     CSS='''
     InstallerSession { background: #1A0F2E; padding: 1 2; }
     #session-title { height: 2; color: #FF7F50; text-style: bold; }
@@ -37,6 +92,8 @@ class InstallerSession(ModalScreen[int]):
         self.kind=kind
         self.process=None; self.master=None; self.exit_code=None; self.cancelled=False
         self.stop_requested=threading.Event()
+        self.last_output=''
+        self.prompt_sensitive=False
 
     def compose(self):
         yield Static('BugTraceAI · Installer conversation',id='session-title')
@@ -68,6 +125,7 @@ class InstallerSession(ModalScreen[int]):
     @work(thread=True,exclusive=True)
     def start_session(self):
         decoder=codecs.getincrementaldecoder('utf-8')('replace')
+        redactor=StreamingRedactor(self.secrets)
         master,slave=pty.openpty()
         self.master=master
         try:
@@ -76,6 +134,7 @@ class InstallerSession(ModalScreen[int]):
             self.process=subprocess.Popen([sys.executable,str(ROOT/'pty_child.py'),*self.command],
                 stdin=slave,stdout=slave,stderr=slave,env=self.env,close_fds=True)
             os.close(slave); slave=None
+            last_hidden = None
             while self.process.poll() is None or select.select([master],[],[],0)[0]:
                 if self.stop_requested.is_set():
                     try: os.killpg(self.process.pid,signal.SIGTERM)
@@ -85,16 +144,21 @@ class InstallerSession(ModalScreen[int]):
                         try: os.killpg(self.process.pid,signal.SIGKILL)
                         except ProcessLookupError: self.process.kill()
                     break
-                if not select.select([master],[],[],.15)[0]: continue
+                hidden=not bool(termios.tcgetattr(master)[3]&termios.ECHO)
+                if hidden != last_hidden:
+                    self.dispatch(self.set_hidden, hidden)
+                    last_hidden=hidden
+                if not select.select([master],[],[],.05)[0]: continue
                 try: chunk=os.read(master,8192)
                 except OSError as exc:
                     if exc.errno == errno.EIO: break
                     raise
                 if not chunk: break
-                text=ANSI.sub('',decoder.decode(chunk)).replace('\r','')
-                for secret in self.secrets: text=text.replace(secret,'[REDACTED]')
+                text=redactor.feed(session_text(chunk,decoder))
                 hidden=not bool(termios.tcgetattr(master)[3]&termios.ECHO)
                 self.dispatch(self.render_output,text,hidden)
+            remaining=redactor.feed(decoder.decode(b'',final=True), final=True)
+            if remaining: self.dispatch(self.render_output,remaining,True)
             code=self.process.wait()
         except Exception as exc:
             self.dispatch(self.render_output,f'Session could not run: {type(exc).__name__}',True)
@@ -111,23 +175,44 @@ class InstallerSession(ModalScreen[int]):
         except RuntimeError: pass  # app shutdown; child cleanup still runs
 
     def render_output(self,text,hidden):
-        self.query_one('#session-log',RichLog).write(text)
+        if text:
+            self.last_output=(self.last_output+text)[-512:]
+            self.query_one('#session-log',RichLog).write(text)
+            if re.search(r'(?:password|passphrase|api[ _-]?key|token|credential|secret)[^\n]{0,80}:[ \t]*\Z', self.last_output, re.I):
+                self.prompt_sensitive=True
+        self.set_hidden(hidden)
+
+    def set_hidden(self,hidden):
+        hidden = hidden or self.prompt_sensitive
         self.query_one('#session-reply',Input).password=hidden
         self.query_one('#reply-label',Static).update('Hidden input · credentials are not added to the conversation' if hidden else 'Reply to the installer or AI assistant below')
 
     def send_reply(self):
         field=self.query_one('#session-reply',Input)
         if self.master is None or self.exit_code is not None: return
-        if field.password and field.value: self.secrets.append(field.value)
+        try:
+            hidden=not bool(termios.tcgetattr(self.master)[3]&termios.ECHO)
+        except OSError:
+            return
+        # Readline and confirmation prompts can temporarily disable echo too;
+        # a yes/no response is not a password and must not redact every letter.
+        approval = re.search(r'(?:\[[yYnN/ ]+\]|\(y/n\)|run this command\?)\s*:?\s*$', self.last_output, re.I)
+        if (hidden or self.prompt_sensitive) and field.value and not approval: self.secrets.append(field.value)
         try: os.write(self.master,(field.value+'\n').encode())
         except OSError: return
         field.value=''
+        self.prompt_sensitive=False
 
     def on_input_submitted(self,event): self.send_reply()
+    def action_ignore_key(self): pass
+    def _stop_confirmed(self,confirmed):
+        if confirmed and self.exit_code is None:
+            self.cancelled=True
+            self.stop_requested.set()
     def on_button_pressed(self,event):
         if event.button.id=='send-reply': self.send_reply()
         elif event.button.id=='stop-session':
-            self.cancelled=True; self.stop_requested.set()
+            if self.exit_code is None: self.app.push_screen(StopConfirmation(),self._stop_confirmed)
         elif event.button.id=='close-session': self.dismiss(130 if self.cancelled else self.exit_code)
 
     def finished(self,code):

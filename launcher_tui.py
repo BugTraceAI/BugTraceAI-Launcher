@@ -332,6 +332,7 @@ class LauncherTUI(App[int]):
         self._checking_key = False
         self.install_exit_code: int | None = None
         self._result_kind = "install"
+        self._install_unverified = False
         self.install_dir = selected_install_dir()
         self.installation = inspect_installation(self.install_dir)
 
@@ -358,9 +359,9 @@ class LauncherTUI(App[int]):
         with VerticalScroll(id="method-panel"):
             yield Static("HOW WOULD YOU LIKE TO INSTALL?", classes="panel-title")
             yield Button("Install with Wizard", id="choose-wizard", variant="primary")
-            yield Static("Guided setup. Choose modules, ports and runtime, then review the installation.", classes="method-description")
             yield Button("Talk to AI · install or repair", id="choose-ai")
-            yield Static("Tell the assistant what you want to install or what went wrong. It asks questions, reviews your choices and stays in this TUI. Uses OpenRouter/Anthropic provider tokens.", classes="method-description")
+            yield Button("Repair with AI", id="choose-repair")
+            yield Static("Wizard reviews modules and ports. AI can help install or diagnose logs before changes; it uses provider tokens.", classes="method-description")
         with VerticalScroll(id="choice-panel"):
             with Vertical(id="modules-form"):
                 with Vertical(classes="module-card",id="web-card"):
@@ -380,6 +381,7 @@ class LauncherTUI(App[int]):
                     yield Static("Independent web-scanning engine · REST / MCP and optional terminal")
                     yield Checkbox("Install CLI", value=True, id="select-cli")
                     yield Checkbox("Enable terminal TUI", value=True, id="select-tui")
+                    yield Checkbox("Expose REST / MCP server", value=True, id="select-server")
                     yield Checkbox("Register global btai", id="global-toggle")
                     with Horizontal(classes="form-row"):
                         with Vertical(classes="port-field"):
@@ -411,7 +413,7 @@ class LauncherTUI(App[int]):
                 yield Static("", id="profile-description")
                 yield Static("INSTALLED COMPONENTS", classes="panel-title", id="products-title")
                 yield Static("", id="products")
-                yield Static("", id="requirements")
+                yield Static("", id="requirements", markup=False)
         with Vertical(id="result-panel"):
             yield Static("", id="result-title")
             yield Static("", id="result-message")
@@ -420,8 +422,7 @@ class LauncherTUI(App[int]):
             yield Button("Verify and continue", id="verify-button", variant="primary")
             yield Button("Update", id="update-button")
             yield Button("AI-assisted install", id="ai-button")
-            yield Button("Repair", id="repair-button")
-            yield Button("AI diagnosis", id="diagnose-button")
+            yield Button("Repair with AI", id="repair-button")
             yield Button("New installation", id="new-installation")
             yield Button("Back", id="previous-button")
             yield Button("Review installation", id="next-button", variant="primary")
@@ -437,9 +438,10 @@ class LauncherTUI(App[int]):
     def on_mount(self) -> None:
         profile = self.selected
         self.query_one("#select-web", Checkbox).value = profile.install_web
-        self.query_one("#select-cli", Checkbox).value = profile.install_cli and profile.key != "web"
-        self.query_one("#select-api", Checkbox).value = profile.install_api and profile.key != "web"
+        self.query_one("#select-cli", Checkbox).value = profile.install_cli
+        self.query_one("#select-api", Checkbox).value = profile.install_api
         self.query_one("#select-tui", Checkbox).value = has_tui(profile)
+        self.query_one("#select-server", Checkbox).value = profile.cli_interface in {"api", "both"}
         self.refresh_form()
         self.show_setup_step(-3 if self.installation.status != "fresh" else -2)
         self.set_class(self.size.width < 104, "compact")
@@ -460,6 +462,7 @@ class LauncherTUI(App[int]):
         return SetupSelection(
             web=checked("#select-web"), cli=checked("#select-cli"), api=checked("#select-api"),
             tui=checked("#select-tui") and checked("#select-cli"),
+            server=checked("#select-server") and checked("#select-cli"),
             runtime=str(self.query_one("#runtime", Select).value),
             global_command=checked("#global-toggle"), recon=checked("#recon-toggle") and checked("#select-web"), kali=checked("#kali-toggle") and checked("#select-web"),
             provider=str(self.query_one("#form-provider", Select).value),
@@ -473,40 +476,57 @@ class LauncherTUI(App[int]):
             self.query_one(name).disabled = not selection.web
         for name in ("#port-recon", "#recon-port-label"):
             self.query_one(name).display = selection.recon
-        for name in ("#select-tui", "#port-cli", "#port-cli_mcp"):
+        for name in ("#select-tui", "#select-server"):
             self.query_one(name).disabled = not effective_cli
+        for name in ("#port-cli", "#port-cli_mcp"):
+            self.query_one(name).disabled = not (effective_cli and selection.server)
         for name in ("#port-api", "#port-api_mcp"):
             self.query_one(name).disabled = not effective_api
         self.query_one("#runtime", Select).disabled = selection.web or selection.api
         if selection.web or selection.api: self.query_one("#runtime", Select).value = "docker"
         self.query_one("#global-toggle", Checkbox).disabled = not selection.tui
         self.query_one("#form-note", Static).update(
-            "Each module is independent. Only checked modules are installed. WEB can connect to local or external scanning engines later.")
+            "Each module is independent. WEB can connect to external engines. When CLI is combined with WEB or API, enable its server; CLI alone needs terminal or server.")
 
     def credential_fingerprint(self):
         provider = str(self.query_one("#form-provider", Select).value)
         key = self.query_one("#form-key", Input).value.strip()
-        return hashlib.sha256((provider + "\0" + key + "\0" + str(self.install_dir)).encode()).digest()
+        return hashlib.sha256((provider + "\0" + key).encode()).digest()
 
     def credentials_verified(self):
         return self._validated_credentials == self.credential_fingerprint()
 
     def check_installation_path(self) -> bool:
         """Select a directory explicitly, without creating or changing its contents."""
+        if not self.apply_installation_path():
+            return False
+        self.show_setup_step(-2 if self.installation.status == "fresh" else -3)
+        return self.installation.status == "fresh"
+
+    def apply_installation_path(self) -> bool:
+        """Adopt the path currently typed in the location field."""
         value = self.query_one("#install-path", Input).value.strip()
         if not value:
             self.notify("Enter an installation directory.", severity="error")
             return False
         try:
             path = Path(value).expanduser().resolve()
-            self.installation = inspect_installation(path)
+            installation = inspect_installation(path)
         except (OSError, ValueError, RuntimeError):
             self.notify("Cannot inspect that installation directory.", severity="error")
             return False
+        self.installation = installation
         self.install_dir = path
         self.query_one("#install-path", Input).value = str(path)
-        self.show_setup_step(-2 if self.installation.status == "fresh" else -3)
-        return self.installation.status == "fresh"
+        return True
+
+    def installation_path_matches_input(self) -> bool:
+        """Maintenance must target the directory the operator explicitly checked."""
+        value = self.query_one("#install-path", Input).value.strip()
+        try:
+            return Path(value).expanduser().resolve() == self.install_dir
+        except (OSError, RuntimeError):
+            return False
 
     def fresh_installation_target(self) -> bool:
         self.installation = inspect_installation(self.install_dir)
@@ -570,7 +590,7 @@ class LauncherTUI(App[int]):
                 return
         self.setup_step = step
         self.set_class(step == 1, "review")
-        labels = {-3:"Manage an existing installation · no new provider key required", -2:"Provider credentials · verify access before installing", -1:"Choose Wizard or AI-assisted installation", 0:"Choose independent modules and ports", 1:"Review installation · " + self.install_method.upper()}
+        labels = {-3:"Manage an existing installation · update or repair with AI", -2:"Provider credentials · verify access before installing", -1:"Choose installation or AI repair", 0:"Choose independent modules and ports", 1:"Review installation · " + self.install_method.upper()}
         self.query_one("#intro", Static).update(labels[step])
         for panel, visible in (("existing-panel", step == -3), ("location-panel", step in (-3, -2)), ("provider-panel", step == -2), ("method-panel", step == -1), ("choice-panel", step == 0), ("workspace", step == 1)):
             self.query_one("#" + panel).display = visible
@@ -582,14 +602,12 @@ class LauncherTUI(App[int]):
         self.query_one("#choose-ai", Button).disabled = self.query_one("#form-provider", Select).value == "zai"
         self.query_one("#installation-summary", Static).update(self.installation.summary())
         self.query_one("#installation-help", Static).update(
-            ("Update or repair using the saved configuration; no new provider key is required.\n"
-             if self.installation.can_repair else
-             "Restore the saved state or use AI diagnosis (provider credentials and tokens may be required).\n")
+            ("Repair opens the AI assistant to review installation logs before suggesting changes. "
+             "Provider credentials and tokens may be required.\n")
             + "To find another installation, enter its directory above and choose Check path.\n"
             + "For a new installation, choose a different empty directory. Existing files are kept.")
         self.query_one("#update-button").display = step == -3 and self.installation.can_update
-        self.query_one("#repair-button").display = step == -3 and self.installation.can_repair
-        self.query_one("#diagnose-button").display = step == -3 and not self.installation.can_repair and self.installation.status != "fresh"
+        self.query_one("#repair-button").display = step == -3 and self.installation.can_diagnose
         self.query_one("#new-installation").display = step == -3
         if step == 1:
             self.query_one("#profile-name", Static).update(self.selected.label)
@@ -600,9 +618,10 @@ class LauncherTUI(App[int]):
                 f"Provider: {selection.provider} · Access verified · Key hidden\n"
                 + "\n".join(f"{k}: {v}" for k,v in selection.active_ports().items())
                 + f"\nExtras: {', '.join(n for n,v in [('reconFTW',selection.recon),('Kali',selection.kali)] if v) or 'none'}\n"
+                + f"Install at: {self.install_dir}\n"
                 + "Installation and AI conversation stay inside this TUI.")
         self.query_one("#footer", Static).update("Tab focus · Back preserves your choices · q quit")
-        target = {-3:"update-button" if self.installation.can_update else "repair-button" if self.installation.can_repair else "install-path", -2:"form-key", -1:"choose-wizard", 0:"select-web", 1:"ai-button" if self.install_method == "ai" else "install-button"}[step]
+        target = {-3:"update-button" if self.installation.can_update else "repair-button", -2:"form-key", -1:"choose-wizard", 0:"select-web", 1:"ai-button" if self.install_method == "ai" else "install-button"}[step]
         self.call_after_refresh(self.query_one("#" + target).focus)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -628,6 +647,8 @@ class LauncherTUI(App[int]):
         return Path(path)
 
     def run_install(self) -> None:
+        if not self.apply_installation_path():
+            return
         if not self.fresh_installation_target():
             return
         if not self.credentials_verified():
@@ -641,8 +662,11 @@ class LauncherTUI(App[int]):
         self._run_child(install_command(self.selected,selection.runtime,selection.global_command and selection.tui),env,"install",config=config,secrets=[selection.api_key])
 
     def run_ai_assistant(self, repair: bool = False) -> None:
-        if not repair and not self.fresh_installation_target():
-            return
+        if not repair:
+            if not self.apply_installation_path():
+                return
+            if not self.fresh_installation_target():
+                return
         env=os.environ.copy(); config=None; secrets=[]
         for key in ("BUGTRACEAI_PROFILE","BTAI_INSTALLER_MODE","BTAI_INSTALLER_RUNTIME","BTAI_INSTALLER_GLOBAL","BTAI_INSTALLER_MCP_RECON","BTAI_INSTALLER_MCP_KALI","BTAI_SETUP_CONFIG","BTAI_ASSISTANT_CREDENTIALS"):
             env.pop(key,None)
@@ -651,9 +675,13 @@ class LauncherTUI(App[int]):
             if not self.credentials_verified():
                 self.show_setup_step(-2); return
         provider=str(self.query_one('#form-provider',Select).value)
+        key=self.query_one('#form-key',Input).value.strip()
+        if repair and not key and self.installation.state:
+            saved_provider = self.installation.state.get('provider')
+            if saved_provider in ('openrouter', 'anthropic'):
+                provider = saved_provider
         if provider == 'zai':
             self.notify("Choose OpenRouter/Anthropic for AI conversation, or use Wizard for Z.ai.",severity="error"); return
-        key=self.query_one('#form-key',Input).value.strip()
         # A reviewed Wizard selection is useful repair context. Occupied ports
         # are discussed by the assistant instead of preventing the chat opening.
         if self.setup_step == 1 and key:
@@ -670,39 +698,54 @@ class LauncherTUI(App[int]):
         env.update({'BTAI_INSTALLER_CONVERSATION':'1','BTAI_ASSISTANT_CREDENTIALS':str(config),
                     'BUGTRACEAI_LAUNCHER_TUI_CHILD':'1','BUGTRACEAI_DIR':str(self.install_dir)})
         secrets=[key] if key else []
+        # A successful conversation is not proof that a repair was performed.
+        # The assistant reports any separately verified repair in its output.
         self._run_child(['ai'],env,'assistant',config=config,secrets=secrets)
 
-    def review_update(self) -> None:
+    async def review_update(self) -> None:
         from release_manager import Manifest, SourceTransaction, ReleaseError
-        if self.query_one("#install-path", Input).value != str(self.install_dir):
+        if not self.installation_path_matches_input():
             self.notify("Choose Check path before updating a different installation.", severity="warning")
             return
+        reviewed_dir = self.install_dir
+        button = self.query_one("#update-button", Button)
+        button.disabled = True
+        self.notify("Checking the pinned release plan…")
         try:
-            manifest = Manifest.load(Path(os.environ.get("BUGTRACEAI_RELEASE_MANIFEST", ROOT / "release-manifest.json")))
-            version = (self.launcher.parent / "VERSION").read_text().strip()
-            plan = SourceTransaction(manifest, self.install_dir, None, version).preview()
+            plan = await asyncio.to_thread(self._preview_update_plan, reviewed_dir)
         except (ReleaseError, OSError, ValueError) as error:
             self.notify(str(error), title="Cannot preview update", severity="error")
             return
-        self.push_screen(UpdateReview(plan), self._update_reviewed)
+        finally:
+            button.disabled = False
+        if self.install_dir != reviewed_dir or not self.installation_path_matches_input():
+            self.notify("The installation path changed. Review the update again.", severity="warning")
+            return
+        self.push_screen(UpdateReview(plan), lambda accepted: self._update_reviewed(accepted, reviewed_dir))
 
-    def _update_reviewed(self, accepted: bool) -> None:
+    def _preview_update_plan(self, install_dir):
+        from release_manager import Manifest, SourceTransaction
+        manifest = Manifest.load(Path(os.environ.get("BUGTRACEAI_RELEASE_MANIFEST", ROOT / "release-manifest.json")))
+        version = (self.launcher.parent / "VERSION").read_text().strip()
+        return SourceTransaction(manifest, install_dir, None, version).preview()
+
+    def _update_reviewed(self, accepted: bool, reviewed_dir) -> None:
         if accepted:
-            self._run_child(["update"], dict(os.environ, BUGTRACEAI_DIR=str(self.install_dir)), "update")
+            if self.install_dir != reviewed_dir or not self.installation_path_matches_input():
+                self.notify("The installation path changed. Review the update again.", severity="warning")
+                return
+            self._run_child(["update"], dict(os.environ, BUGTRACEAI_DIR=str(reviewed_dir)), "update")
 
     def run_repair(self) -> None:
-        if self.query_one("#install-path", Input).value != str(self.install_dir):
+        if not self.installation_path_matches_input():
             self.notify("Choose Check path before repairing a different installation.", severity="warning")
             return
         self.installation = inspect_installation(self.install_dir)
-        if not self.installation.can_repair:
-            self.show_setup_step(-3)
-            self.notify("Valid saved state is required for automatic repair. Use AI diagnosis or restore the state file.", severity="error")
-            return
-        self._run_child(["repair"], dict(os.environ, BUGTRACEAI_DIR=str(self.install_dir)), "repair")
+        self.run_ai_assistant(repair=True)
 
     def _run_child(self, arguments, env, kind, config=None, secrets=()) -> None:
         self._result_kind=kind
+        self._install_unverified=False
         env = dict(env, BUGTRACEAI_DIR=str(self.install_dir))
         state=self.install_dir/'.launcher-state'
         before=state.stat().st_mtime_ns if state.exists() else None
@@ -710,19 +753,30 @@ class LauncherTUI(App[int]):
         def cleanup():
             if config: config.unlink(missing_ok=True)
         def completed(code):
-            if kind == 'install' and code == 0:
-                after=state.stat().st_mtime_ns if state.exists() else None
-                if after is None or after == before: code=130
-            self.install_exit_code=code
-            self.show_result(kind,code)
+            self._complete_child(kind, before, code)
         self.push_screen(InstallerSession(command,env,secrets=secrets,cleanup=cleanup,kind=kind),completed)
+
+    def _complete_child(self, kind: str, before, code: int) -> None:
+        if kind == 'install' and code == 0:
+            state = self.install_dir / '.launcher-state'
+            after = state.stat().st_mtime_ns if state.exists() else None
+            if after is None or after == before:
+                code = 130
+                self._install_unverified = True
+        self.install_exit_code = code
+        self.show_result(kind, code)
 
     def show_result(self, kind: str, exit_code: int) -> None:
         for name in ('existing-panel','location-panel','provider-panel','method-panel','choice-panel','workspace','setup-actions'):
             self.query_one('#'+name).display=False
         panel = self.query_one("#result-panel", Vertical)
         panel.display = True
-        if exit_code == 130:
+        if self._install_unverified:
+            title = "SETUP NEEDS ATTENTION"
+            message = "The installer exited successfully but did not record an installation. Review the output and install.log."
+            color = "#FF7F50"
+            self._install_unverified = False
+        elif exit_code == 130:
             title = "SESSION STOPPED"
             message = "No verified installation success was recorded. Review the output; existing data was not removed by the UI."
             color = "#FF7F50"
@@ -753,6 +807,9 @@ class LauncherTUI(App[int]):
         self.query_one("#result-ai-button", Button).display = exit_code not in (0,130) and kind in {"install","update","repair"}
         self.query_one("#back-button", Button).display = kind in {"install", "update", "assistant", "repair"}
         self.query_one("#footer", Static).update("Review the report   ·   Ask AI for diagnosis   ·   Back to setup   ·   q quit")
+        back = self.query_one("#back-button", Button)
+        target = back if back.display else self.query_one("#result-quit-button", Button)
+        self.call_after_refresh(target.focus)
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:  # type: ignore[override]
         button = event.button.id
@@ -780,8 +837,8 @@ class LauncherTUI(App[int]):
             self.show_setup_step(1)
         elif button == "repair-button":
             self.run_repair()
-        elif button == "diagnose-button":
-            self.run_ai_assistant(repair=True)
+        elif button == "choose-repair":
+            self.run_repair()
         elif button == "check-installation":
             self.check_installation_path()
         elif button == "new-installation":
@@ -795,7 +852,7 @@ class LauncherTUI(App[int]):
         elif button == "ai-button":
             self.run_ai_assistant()
         elif button == "update-button":
-            self.review_update()
+            await self.review_update()
 
     def action_quit_launcher(self) -> None:
         self.exit(self.install_exit_code if self.install_exit_code is not None else 0)

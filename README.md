@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://bugtraceai.com"><img src="https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white" /></a>
   <a href="https://deepwiki.com/BugTraceAI/BugTraceAI-Launcher"><img src="https://img.shields.io/badge/Wiki-DeepWiki-000?logo=wikipedia&logoColor=white" /></a>
-  <img src="https://img.shields.io/badge/Version-3.3.38-blue" />
+  <img src="https://img.shields.io/badge/Version-3.3.39-blue" />
   <img src="https://img.shields.io/badge/License-Apache--2.0-blue.svg" />
   <img src="https://img.shields.io/badge/Bash-3.2+-4EAA25?logo=gnu-bash&logoColor=white" />
   <img src="https://img.shields.io/badge/Runtime-Local%20or%20Docker-2496ED?logo=docker&logoColor=white" />
@@ -29,10 +29,11 @@ scripts and coding agents.
 
 When the selected directory contains a registered installation, the Launcher
 opens **Installation detected** instead of asking for a new provider key.
-Choose **Update** to review the pinned release plan or **Repair**
-to rebuild and verify the saved selection without pulling new versions. Saved
-ports, provider settings and data are retained. Interrupted installations offer
-repair; missing or invalid state offers AI diagnosis, not a guessed update.
+Choose **Update** to review the pinned release plan or **Repair with AI** to
+review installation log signals and discuss a possible cause before making
+changes. Interrupted installations and missing or invalid state can also be
+diagnosed this way. The direct `./launcher.sh repair` command remains available
+to rebuild and verify a saved selection without pulling new versions.
 Use **Check path** to select an installation in another directory. **New
 installation** requires a separate empty directory and does not erase the old one.
 
@@ -72,9 +73,9 @@ Anthropic checks verify access without generating text; Z.ai uses a short test
 request, so provider usage may apply. A successful access check does not
 guarantee sufficient balance or model access for a complete scan.
 
-Next choose **Install with Wizard** for module checkboxes or **Talk to AI**
-for a conversation. The assistant asks whether you want to install, diagnose
-or repair, then asks about modules, runtime and ports. Both stay inside the TUI.
+Next choose **Install with Wizard** for module checkboxes, **Talk to AI** for a
+general conversation, or **Repair with AI** for a log-based diagnosis. Both
+installation methods and the assistant stay inside the TUI.
 WEB, CLI and the API-target engine are independent. Only the modules you
 select are installed; WEB-only can connect to external engines later.
 
@@ -103,7 +104,9 @@ remains available with `BUGTRACEAI_CLASSIC=1 ./launcher.sh`.
 Component entry points suggest their own starting selection: `terminal` for
 CLI, `web` for WEB, `api` for the API-target engine and `full` for all
 modules. In the TUI these are starting checkboxes, not separate installation
-questions. You can change the modules before review.
+questions. You can change the modules before review. The CLI card also chooses
+whether to expose the REST/MCP server, so `terminal` stays terminal-only until
+you enable it.
 `BUGTRACEAI_LAUNCHER_INITIAL_PROFILE` changes only the initial selection; it
 does not approve or start installation. The compatibility bootstrap has one
 source in [component-bootstrap.sh](component-bootstrap.sh).
@@ -113,6 +116,7 @@ source in [component-bootstrap.sh](component-bootstrap.sh).
 | Requirement            | Details                                                                                                   |
 | ---------------------- | --------------------------------------------------------------------------------------------------------- |
 | **OS** | Linux amd64; Launcher startup checked on a clean Lubuntu VM. macOS and ARM remain unvalidated |
+| **Terminal** | 80×24 or larger recommended; the visual Launcher scrolls at 70×20 |
 | **Runtime** | Python 3.10+ for the Launcher TUI and local terminal/CLI-server installs; Docker + Compose for container profiles |
 | **Git**                | Any recent version                                                                                        |
 | **curl**               | For the one-liner installer                                                                               |
@@ -520,6 +524,17 @@ asks what you want to do before making system changes. It can install any
 independent module combination, diagnose an error or repair an existing
 installation. It asks about conflicting ports and reviews the final selection
 with you before the host runs the standard Launcher.
+
+Selecting **Repair with AI** first checks bounded installation and build logs
+for recognized error signals. It presents a possible cause and asks whether it
+matches, or asks you to describe the issue if the evidence is inconclusive.
+Only fixed, non-secret signal descriptions are sent for this initial check;
+model usage may apply.
+
+> **Beta limitation:** AI repair is experimental and has known edge cases around
+> invalid installation state and approval of model tool calls. Do not rely on
+> its success message as the sole verification, and avoid unattended use.
+> Review proposed actions, keep backups and check service health independently.
 
 The system instructions live in [assistant/AGENT.md](assistant/AGENT.md).
 The assistant loads focused guidance for [installation](assistant/skills/install.md),

@@ -15,10 +15,18 @@ def selected_install_dir() -> Path:
         return Path(os.environ['BUGTRACEAI_DIR']).expanduser().resolve()
     registry = registry_path()
     if registry.exists():
-        value = json.loads(registry.read_text())
-        directory = value.get('install_dir') if isinstance(value, dict) else None
+        from release_manager import read_json
+        try:
+            value = read_json(registry)
+        except RuntimeError as error:
+            raise ValueError(
+                f'Invalid installation registry at {registry}: {error} '
+                'Fix or delete this file, or set BUGTRACEAI_DIR.') from error
+        directory = value.get('install_dir')
         if not isinstance(directory, str) or not Path(directory).is_absolute() or any(c in directory for c in '\n\r\0'):
-            raise ValueError('Invalid installation registry; use an explicit BUGTRACEAI_DIR.')
+            raise ValueError(
+                f'Invalid installation registry at {registry}: install_dir must be an absolute path. '
+                'Fix or delete this file, or set BUGTRACEAI_DIR.')
         return Path(directory).resolve()
     return Path.home() / 'bugtraceai'
 

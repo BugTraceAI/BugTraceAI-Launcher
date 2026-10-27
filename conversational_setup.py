@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 
 from setup_form import SetupSelection
 
@@ -21,10 +23,29 @@ STATE_FIELDS = ('install_profile', 'mode', 'cli_interface', 'cli_runtime',
                 'web_port', 'cli_port', 'mcp_port', 'btai_port',
                 'btai_mcp_port', 'recon_port', 'provider')
 
+# Keep model input to recognized, fixed descriptions: logs may contain secrets,
+# user messages, or instructions from untrusted build output.
+REPAIR_LOG_SIGNALS = (
+    ('build_network_host', r'additional privileges requested:[^\n]*--allow(?:=|\s+)network\.host',
+     'Buildx rejected the host-network permission requested by a build.'),
+    ('disk_full', r'no space left on device', 'A build or installation ran out of disk space.'),
+    ('port_in_use', r'port is already allocated|address already in use', 'A required network port was already in use.'),
+    ('dns_failure', r'temporary failure in name resolution|could not resolve host|name or service not known',
+     'A network name could not be resolved.'),
+    ('docker_permission', r'permission denied[^\n]*docker daemon socket|permission denied while trying to connect to the docker daemon',
+     'Access to the Docker daemon was denied.'),
+    ('docker_unavailable', r'cannot connect to the docker daemon|is the docker daemon running',
+     'The Docker daemon could not be reached.'),
+    ('npm_failure', r'npm (?:err!|error)', 'An npm dependency installation reported an error.'),
+    ('web_start_failed', r'failed to start web services', 'The Launcher reported that WEB services did not start.'),
+    ('cli_start_failed', r'failed to start cli service', 'The Launcher reported that the CLI service did not start.'),
+    ('api_start_failed', r'failed to start bugtraceai-api', 'The Launcher reported that BugTraceAI-API did not start.'),
+)
+
 
 class ConversationSetup:
     def __init__(self, root, install_dir, provider, api_key, *,
-                 ask, emit, runner=subprocess.run):
+                 ask, emit, runner=subprocess.run, install_log=None):
         self.root = Path(root)
         self.install_dir = Path(install_dir)
         self.provider = provider
@@ -32,8 +53,39 @@ class ConversationSetup:
         self.ask = ask
         self.emit = emit
         self.runner = runner
+        self.install_log = Path(install_log) if install_log else self.root / 'install.log'
         self.plan = None
         self.verified = False
+
+    def repair_log_evidence(self):
+        """Extract bounded, non-secret signals without sending raw logs to the model."""
+        logs, signals = [], []
+        for source, path in (('build', self.install_dir / '.build.log'),
+                             ('installer', self.install_log)):
+            try:
+                with path.open('rb') as stream:
+                    size = os.fstat(stream.fileno()).st_size
+                    stream.seek(max(0, size - 65536))
+                    tail = stream.read(65536).decode('utf-8', 'replace')
+                    modified = datetime.fromtimestamp(os.fstat(stream.fileno()).st_mtime, timezone.utc).isoformat()
+            except FileNotFoundError:
+                logs.append({'source': source, 'status': 'missing'})
+                continue
+            except OSError:
+                logs.append({'source': source, 'status': 'unavailable'})
+                continue
+            if source == 'installer':
+                # install.log is append-only; an old failure must not become
+                # evidence about a later successful installation attempt.
+                sessions = re.split(r'(?m)^===== BugTraceAI Launcher v[^\n]*=====$', tail)
+                if len(sessions) > 1:
+                    tail = sessions[-1]
+            logs.append({'source': source, 'status': 'read', 'modified_utc': modified,
+                         'tail_truncated': size > 65536})
+            for code, pattern, description in REPAIR_LOG_SIGNALS:
+                if re.search(pattern, tail, re.IGNORECASE):
+                    signals.append({'source': source, 'code': code, 'description': description})
+        return {'logs': logs, 'signals': signals}
 
     def read_skill(self, name):
         if name not in {'install', 'repair', 'ports'}:
@@ -55,7 +107,13 @@ class ConversationSetup:
                            ('.launcher-pending.json', 'incomplete')]:
             path = self.install_dir / name
             if path.is_file():
-                data = json.loads(path.read_text())
+                try:
+                    data = json.loads(path.read_text())
+                    if not isinstance(data, dict):
+                        raise ValueError('state is not an object')
+                except (OSError, ValueError):
+                    state_kind = 'invalid'
+                    break
                 state = {k: data[k] for k in STATE_FIELDS if k in data}
                 state_kind = kind
                 break
@@ -167,6 +225,7 @@ def tool_definitions(existing):
         ('read_skill', 'Read host-provided install, repair or ports guidance.',
          {'name': {'type': 'string', 'enum': ['install', 'repair', 'ports']}}, ['name']),
         ('inspect_installation', 'Read the real saved/pending inventory and Docker status without modifying services.', {}, []),
+        ('inspect_repair_logs', 'Review bounded, sanitized installation and build log signals without exposing raw logs or credentials.', {}, []),
         ('prepare_installation', 'Validate the exact requested independent modules and ports. Occupied ports require a user decision. Nothing is installed.',
          {'modules': {'type': 'array', 'items': {'type': 'string', 'enum': ['web', 'cli', 'api']}},
           'runtime': {'type': 'string', 'enum': ['docker', 'local']},
